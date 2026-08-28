@@ -50,6 +50,7 @@ public class OnlineGameController {
             UserAccount user = lobby.requireUser((String) session.getAttribute(AuthController.SESSION_USER));
             RollAssignment assignment = assignment(user);
             if (!assignment.eligible()) return ResponseEntity.status(403).body(Map.of("error", "你不在本局五人出战阵容中"));
+            ensurePreparationSession(assignment);
             return ResponseEntity.ok(service.join(assignment.teamId(), assignment.slot(), user.getDisplayName(), "u" + user.getId()));
         }
         catch (IllegalArgumentException e) { return ResponseEntity.badRequest().body(Map.of("error", e.getMessage())); }
@@ -96,6 +97,7 @@ public class OnlineGameController {
             RollAssignment assignment = assignment(user);
             if (!assignment.eligible() || !service.matchesAssignment(body.token(), assignment.teamId(), assignment.slot()))
                 return ResponseEntity.status(403).body(Map.of("error", "当前账号没有本局备战席位"));
+            ensurePreparationSession(assignment);
             service.ready(body.token(), body.ready());
             return ResponseEntity.ok(Map.of("ok", true, "ready", body.ready()));
         } catch (SecurityException e) { return ResponseEntity.status(401).body(Map.of("error", e.getMessage())); }
@@ -178,6 +180,14 @@ public class OnlineGameController {
         for (JsonNode team : root.path("teams")) if (teamId.equals(team.path("id").asText()))
             for (JsonNode player : team.path("players")) if (playerId.equals(player.path("id").asText())) return player;
         return mapper.createObjectNode().put("name", playerId);
+    }
+
+    private void ensurePreparationSession(RollAssignment assignment) {
+        if (!assignment.phase().startsWith("PREPARING_")) return;
+        List<String> lineupIds = assignment.lineup().stream()
+                .map(player -> String.valueOf(player.get("id")))
+                .toList();
+        service.ensurePrepared(assignment.teamId(), lineupIds);
     }
 
     public record PingBody(String token, Double c0) {}

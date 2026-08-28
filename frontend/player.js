@@ -47,8 +47,14 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {})
     }).then(function (r) {
-      if (!r.ok) { var e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
-      return r.json().catch(function () { return {}; });
+      return r.json().catch(function () { return {}; }).then(function (responseBody) {
+        if (!r.ok) {
+          var e = new Error(responseBody.error || ('HTTP ' + r.status));
+          e.status = r.status;
+          throw e;
+        }
+        return responseBody;
+      });
     });
   }
 
@@ -75,6 +81,7 @@
     name: '',
     devices: [],
     armedTeam: null,
+    goStarted: false,
     calibText: '',
     calibWarn: false,
     reveal: null,
@@ -155,6 +162,7 @@
         break;
       case 'go':
         if (msg.teamId && my && msg.teamId !== my.teamId) break;
+        ui.goStarted = true;
         if (ui.screen === 'main' && (ui.sub === 'countdown' || ui.sub === 'standby' || ui.sub === 'rolled')) {
           ui.sub = 'go';
           render();
@@ -190,8 +198,10 @@
     getState().then(function (st) {
       ui.devices = st.devices || [];
       ui.armedTeam = st.armedTeams && my && st.armedTeams.indexOf(my.teamId) >= 0 ? my.teamId : (st.armedTeam || null);
+      ui.goStarted = !!(st.armedTeams && my && st.armedTeams.indexOf(my.teamId) >= 0);
       ui.countdownAt = st.countdowns && my ? st.countdowns[my.teamId] : null;
       if (ui.countdownAt && ui.countdownAt > Date.now() && ui.sub !== 'go' && ui.sub !== 'rolled') ui.sub = 'countdown';
+      if (ui.goStarted && ui.sub === 'standby') ui.sub = 'go';
       if (ui.screen === 'main') render();
     }).catch(function () { });
   }
@@ -240,6 +250,29 @@
   function calibOkText() {
     return '✓ 已校准 · 延迟 ' + (ui.lastRtt != null ? ui.lastRtt : '?') + ' ms' +
       (ui.calibWarn ? '（网络较差，建议切换网络/靠近路由器）' : '');
+  }
+
+  function finishCalibration(est) {
+    if (ui.sub !== 'calibrating') return;
+    if (!est) {
+      ui.sub = 'calibration-error';
+      render();
+      return;
+    }
+    var phase = rollAssignment && rollAssignment.phase || '';
+    ui.sub = ui.goStarted || phase.indexOf('ROLL_') === 0
+      ? 'go'
+      : ui.countdownAt && ui.countdownAt > Date.now() ? 'countdown' : 'standby';
+    ui.calibText = calibOkText();
+    render();
+  }
+
+  function retryCalibration() {
+    ui.sub = 'calibrating';
+    ui.calibText = '正在重新校准设备时钟…';
+    ui.calibWarn = false;
+    render();
+    calibrate(5, finishCalibration);
   }
 
   function handleAuthError(err) {
@@ -416,6 +449,9 @@
     var h = '';
     if (ui.sub === 'calibrating') {
       h = '<div class="pl-wait"><span class="big-ico">⏱️</span>正在自动校准设备时钟…<br><small>无需任何操作</small></div>';
+    } else if (ui.sub === 'calibration-error') {
+      h = '<div class="pl-status err">' + esc(ui.calibText || '设备时钟校准失败，暂时不能准备') + '</div>' +
+        '<div class="pl-foot"><button id="pl-retry-calibration" class="btn btn-primary btn-xl">重新校准</button></div>';
     } else if (ui.sub === 'standby') {
       var mineDevice=ui.devices.find(function(device){return my&&device.teamId===my.teamId&&device.slot===my.slot;}),isReady=!!(mineDevice&&mineDevice.ready),readyCount=ui.devices.filter(function(device){return my&&device.teamId===my.teamId&&device.ready;}).length;
       h = '<div class="pl-wait"><span class="big-ico">🪑</span>'+(isReady?'你已准备':'你已进入备战席')+'<br><small>本队 '+readyCount+' / 5 人已准备；全部准备后由队长发号施令</small></div><div class="pl-foot"><button id="pl-ready" class="btn '+(isReady?'btn-ghost':'btn-primary')+' btn-xl">'+(isReady?'取消准备':'准备')+'</button>'+(rollAssignment&&rollAssignment.captain?'<button id="pl-command" class="btn btn-primary btn-xl" '+(readyCount===5?'':'disabled')+'>队长发号施令</button>':'')+'</div>';
@@ -440,7 +476,9 @@
     var rollBtn = $('#pl-roll');
     if (rollBtn) rollBtn.onclick = doRoll;
     var readyBtn=$('#pl-ready');
-    if(readyBtn)readyBtn.onclick=function(){var mineDevice=ui.devices.find(function(device){return my&&device.teamId===my.teamId&&device.slot===my.slot;}),next=!(mineDevice&&mineDevice.ready);readyBtn.disabled=true;api('/api/player-ready',{token:my.token,ready:next}).then(refreshState).catch(function(){readyBtn.disabled=false;});};
+    if(readyBtn)readyBtn.onclick=function(){var mineDevice=ui.devices.find(function(device){return my&&device.teamId===my.teamId&&device.slot===my.slot;}),next=!(mineDevice&&mineDevice.ready);readyBtn.disabled=true;api('/api/player-ready',{token:my.token,ready:next}).then(refreshState).catch(function(err){if(err&&err.status===409){boot();return;}readyBtn.disabled=false;});};
+    var retryCalibrationBtn = $('#pl-retry-calibration');
+    if (retryCalibrationBtn) retryCalibrationBtn.onclick = retryCalibration;
     var commandBtn=$('#pl-command');
     if(commandBtn)commandBtn.onclick=function(){commandBtn.disabled=true;fetch('/api/lobby/player-action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'captain-command',selections:[]})}).then(function(r){if(!r.ok)throw new Error();}).catch(function(){commandBtn.disabled=false;});};
     var rejoin = $('#pl-rejoin');
@@ -540,6 +578,7 @@
       if (userEl) userEl.textContent = '👤 ' + loginUser.displayName;
       ui.devices = st.devices || [];
       ui.armedTeam = st.armedTeams && assignedTeam && st.armedTeams.indexOf(assignedTeam) >= 0 ? assignedTeam : (st.armedTeam || null);
+      ui.goStarted = !!(st.armedTeams && assignedTeam && st.armedTeams.indexOf(assignedTeam) >= 0);
       ui.countdownAt = st.countdowns && assignedTeam ? st.countdowns[assignedTeam] : null;
       setNet('已连接服务器', false);
       if (!rollAssignment.eligible) {
@@ -555,18 +594,13 @@
         ui.sub = 'calibrating';
         ui.calibText = '正在自动校准时钟…';
         render();
-        calibrate(5, function (est) {
-          if (ui.sub !== 'calibrating') return;
-          ui.sub = ui.countdownAt&&ui.countdownAt>Date.now()?'countdown':'standby';
-          ui.calibText = est ? calibOkText() : ui.calibText;
-          render();
-        });
+        calibrate(5, finishCalibration);
       } else {
         ui.teamId = assignedTeam; ui.slot = rollAssignment.slot;
         api('/api/join', { teamId: assignedTeam, slot: rollAssignment.slot, name: loginUser.displayName }).then(function (res) {
           my = { teamId: assignedTeam, slot: res.slot, name: loginUser.displayName, username: loginUser.username, token: res.token };
           saveMy(); connectSSE(); ui.screen = 'main'; ui.sub = 'calibrating'; ui.calibText = '正在自动校准时钟（5 次 ping）…'; render();
-          calibrate(5, function (est) { if (ui.sub !== 'calibrating') return; ui.sub = ui.countdownAt&&ui.countdownAt>Date.now()?'countdown':'standby'; ui.calibText = est ? calibOkText() : ui.calibText; render(); });
+          calibrate(5, finishCalibration);
         }).catch(function (error) { ui.errText = error.message || '无法加入本局投骰席位'; ui.screen = 'error'; render(); });
       }
     }).catch(function () {

@@ -136,6 +136,14 @@ public class OnlineGameService {
         broadcast(Map.of("type", "prepare", "teamId", teamId));
     }
 
+    /**
+     * 恢复数据库中仍处于备战阶段、但因应用重启而丢失的内存会话。
+     * 已存在的会话绝不能重建，否则会清空其他队员的准备状态。
+     */
+    public synchronized void ensurePrepared(String teamId, List<String> lineup) {
+        if (!sessions.containsKey(teamId)) prepare(teamId, lineup);
+    }
+
     public synchronized boolean isTeamReady(String teamId) {
         TeamRollSession session = sessions.get(teamId);
         if (session == null || session.lineup.size() != SLOT_COUNT) return false;
@@ -279,7 +287,7 @@ public class OnlineGameService {
         sessions.forEach((team, session) -> {
             if (session.countdownAt == null) snapshot.add(Map.of("type", "prepare", "teamId", team));
             else if (session.goTs == null) snapshot.add(Map.of("type", "countdown", "teamId", team, "goTs", session.countdownAt));
-            else snapshot.add(Map.of("type", "arm", "teamId", team));
+            else snapshot.add(Map.of("type", "go", "teamId", team, "goTs", session.goTs));
         });
         sessions.forEach((team, session) -> {
             if (session.timingReady) snapshot.add(Map.of("type", "timing-ready", "teamId", team,

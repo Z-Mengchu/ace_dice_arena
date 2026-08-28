@@ -1,13 +1,18 @@
 /**
  * 「王牌攻守擂·骰子大亨」纯逻辑引擎
- * 不依赖任何 DOM / 浏览器 API。
- *
- * 必须是 ES 模块：这里一旦出现 module.exports，Vite 会把整个文件按 CommonJS
- * 处理并塞进惰性包装器，而 entries/player.js 用的是只为副作用的裸 import，
- * 没有任何地方去触发那个包装器，结果整段代码永远不执行、window.GameEngine
- * 永远是 undefined，/player 页面直接报「engine.js 未加载」。
+ * 不依赖任何 DOM / 浏览器 API，可在 node 中直接 require
+ * UMD 风格：浏览器挂到 window.GameEngine，node 下 module.exports = GameEngine
  */
-const GameEngine = (function () {
+(function (root, factory) {
+  const GameEngine = factory();
+  // Vite 会把这个 UMD 文件转换为 CommonJS 包装；此时即使在浏览器中，
+  // `module.exports` 分支也会成立。始终挂载全局变量，兼容仍通过
+  // `window.GameEngine` 访问引擎的非模块脚本。
+  root.GameEngine = GameEngine;
+  if (typeof module === 'object' && module.exports) {
+    module.exports = GameEngine; // node 环境
+  }
+})(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
   /** 默认配置 */
@@ -267,9 +272,4 @@ const GameEngine = (function () {
     computeSpread,
     checkSync
   };
-})();
-
-// player.js 通过 window.GameEngine 取用，保留这个全局赋值。
-if (typeof window !== 'undefined') window.GameEngine = GameEngine;
-
-export default GameEngine;
+});

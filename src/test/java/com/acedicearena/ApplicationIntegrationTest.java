@@ -240,6 +240,47 @@ class ApplicationIntegrationTest {
     }
 
     @Test
+    void playerReadyRecoversPreparationSessionAfterApplicationRestart() throws Exception {
+        onlineGameService.reset();
+        MockHttpSession session = registerAssignedPlayer("restarted_ready_player", "t1");
+        var user = userAccountRepository.findByUsername("restarted_ready_player").orElseThrow();
+        String playerId = "u" + user.getId();
+
+        var root = objectMapper.createObjectNode();
+        root.put("mode", "parallel");
+        var teams = root.putArray("teams");
+        var teamA = teams.addObject(); teamA.put("id", "t1");
+        teamA.putArray("players").addObject().put("id", playerId).put("name", user.getDisplayName());
+        teams.addObject().put("id", "t2").putArray("players");
+        var lineup = objectMapper.createArrayNode();
+        lineup.add(playerId).add("u-dummy-2").add("u-dummy-3").add("u-dummy-4").add("u-dummy-5");
+        var match = root.putObject("matches").putObject("restart-match");
+        match.put("id", "restart-match"); match.put("a", "t1"); match.put("b", "t2");
+        match.put("status", "active"); match.put("phase", "ATTACKING");
+        match.putObject("lineups").set("A", lineup);
+        match.putObject("sidePhases").put("A", "PREPARING").put("B", "PREPARING");
+        GameStateRecord state = gameStateRepository.findById(1L).orElse(null);
+        if (state == null) state = new GameStateRecord(1L, root.toString(), "test");
+        else state.update(root.toString(), "test");
+        gameStateRepository.saveAndFlush(state);
+
+        String joined = mockMvc.perform(post("/api/join").session(session)
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        String token = objectMapper.readTree(joined).path("token").asText();
+        mockMvc.perform(post("/api/ping").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"c0\":" + System.currentTimeMillis() + "}"))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/calibrate").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"rtt\":20}"))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/player-ready").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"ready\":true}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.ready").value(true));
+    }
+
+    @Test
     void fiveCalibratedPlayersCanCompleteAnOnlineRoll() throws Exception {
         onlineGameService.reset();
         MockHttpSession admin = login();

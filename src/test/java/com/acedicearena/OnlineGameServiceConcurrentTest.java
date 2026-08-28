@@ -11,6 +11,23 @@ import static org.mockito.Mockito.*;
 
 class OnlineGameServiceConcurrentTest {
     @Test
+    void missingPreparationSessionCanBeRecoveredWithoutResettingAnExistingSession() {
+        ApplicationEventPublisher publisher = mock(ApplicationEventPublisher.class);
+        OnlineGameService service = new OnlineGameService(publisher);
+        var lineup = java.util.List.of("u1", "u2", "u3", "u4", "u5");
+        String token = service.join("t1", 1, "队员1", "u1").token();
+        calibrate(service, token);
+
+        assertThatThrownBy(() -> service.ready(token, true)).hasMessage("当前不在备战准备阶段");
+
+        service.ensurePrepared("t1", lineup);
+        service.ready(token, true);
+        service.ensurePrepared("t1", lineup);
+
+        assertThat(service.stateView().get("devices").toString()).contains("ready=true");
+    }
+
+    @Test
     void fivePlayersMustPrepareBeforeCaptainStartsThreeSecondCountdown() {
         ApplicationEventPublisher publisher = mock(ApplicationEventPublisher.class);
         OnlineGameService service = new OnlineGameService(publisher);
