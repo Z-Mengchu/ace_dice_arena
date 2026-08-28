@@ -1,0 +1,13 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:ace-dice-test;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+app:
+  cache:
+    roster-ttl-ms: 0
+    game-state-ttl-ms: 0

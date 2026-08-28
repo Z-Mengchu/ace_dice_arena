@@ -1,0 +1,29 @@
+(function(){'use strict';
+var phaseNames={PROPHET:'军师预言',LINEUP:'队长选择阵容',CONFIRM_A:'A 队进攻确认',ROLL_A:'A 队五人同步点击',PITCHER_ROLL_A:'A 队王牌投手最终投骰',CONFIRM_B:'B 队进攻确认',ROLL_B:'B 队五人同步点击',PITCHER_ROLL_B:'B 队王牌投手最终投骰',RESULT:'本局结果',FINISHED:'比赛结束'};
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function team(state,id){return(state.teams||[]).find(function(t){return t.id===id;})||{name:id};}
+function rollHtml(match,side){var roll=match.rolls&&match.rolls[side];if(!roll)return'<span class="feed-empty">等待投骰</span>';var attack=roll.finalAttack==null?roll.attack:roll.finalAttack;return'<span class="feed-dice">'+(roll.dice||[]).map(function(v){return'<i>'+v+'</i>';}).join('')+'</span><small>攻击 '+attack+(roll.syncOk?' · 同步加成':'')+'</small>';}
+function prophetHtml(state,match,side){var guess=match.prophet&&match.prophet[side],opponent=team(state,side==='A'?match.b:match.a),hit=match.prophetResults&&match.prophetResults[side];if(!Array.isArray(guess)||!guess.length)return'<span>未预言</span>';return'<span>'+guess.map(function(id){var player=(opponent.players||[]).find(function(item){return item.id===id;});return esc(player?player.name:id);}).join('、')+' · '+(hit?'命中 +2':'未命中')+'</span>';}
+function accumulationCard(item,index){var quota=item.accumulationQuota||0,rolled=item.accumulationRolled||0,done=rolled>=quota;return'<article class="accumulation-watch '+(done?'complete':'')+'"><header><span>TEAM 0'+(index+1)+'</span><b>'+esc(item.name)+'</b></header><div class="accumulation-watch-gmv">¥'+Number(item.gmv||0).toLocaleString('zh-CN')+'</div><div class="accumulation-watch-progress"><i style="width:'+(quota?Math.min(100,rolled/quota*100):100)+'%"></i></div><div class="feed-meta"><span>'+rolled+' / '+quota+' 次</span><span>累计 '+(item.accumulationPoints||0)+' 点</span><span>'+(done?'已完成':'投骰中')+'</span></div><div class="feed-dice">'+(item.accumulationDice||[]).slice(-12).map(function(value){return'<i>'+value+'</i>';}).join('')+'</div></article>';}
+function card(state,match,index){var a=team(state,match.a),b=team(state,match.b),done=match.status==='done',result=match.phase==='RESULT',voting=!done&&(!(a.roles&&a.roles.strategist)||!(b.roles&&b.roles.strategist)),stage=TournamentUI.stage(match);var roundWinner=team(state,match[match.roundWinner==='A'?'a':'b']).name+' 拿下本场';return'<article class="live-feed '+(done?'finished ':'')+(result?'showing-result':'')+'"><header><span>'+esc(stage.label)+' · '+(match.status==='active'?'LIVE':'ARCHIVE')+'</span><b>'+esc(voting?'队内角色投票':phaseNames[match.phase]||match.phase)+'</b></header><div class="feed-score"><div><strong>'+esc(a.name)+'</strong><em>'+match.winsA+'</em></div><span>:</span><div><em>'+match.winsB+'</em><strong>'+esc(b.name)+'</strong></div></div><div class="feed-meta"><span>积累攻击 '+(a.accumulationPoints||0)+' / '+(b.accumulationPoints||0)+'</span><span>系数 ×'+Number(a.growthCoefficient||1).toFixed(4)+' / ×'+Number(b.growthCoefficient||1).toFixed(4)+'</span><span>'+(done?'已完赛':voting?'等待全员投票':result?'结果展示中':'一轮定胜负')+'</span></div><div class="feed-rolls"><div><b>'+esc(a.name)+'</b>'+rollHtml(match,'A')+'</div><div><b>'+esc(b.name)+'</b>'+rollHtml(match,'B')+'</div></div>'+((result||done)?'<div class="feed-prophet"><b>'+esc(a.name)+'预言</b>'+prophetHtml(state,match,'A')+'<b>'+esc(b.name)+'预言</b>'+prophetHtml(state,match,'B')+'</div>':'')+(result?'<div class="feed-round-result">'+esc(roundWinner)+' · 本场胜负已定</div>':'')+(done?'<div class="feed-winner">胜者 · '+esc(team(state,match.winner).name)+'</div>':'')+'</article>';}
+function render(state){
+  var root=document.getElementById('spectator-root');
+  if(!state||state.mode!=='parallel'){root.innerHTML='<section class="spectator-empty"><b>等待管理员开始游戏</b><p>开赛后先选出三名核心角色，再进入积累期和攻擂战。</p></section>';return;}
+  if(state.stage==='ROLE_VOTE'){
+    document.getElementById('tb-status').textContent='核心角色投票';
+    root.innerHTML='<section class="wall-head"><div><small>PHASE ONE · ROLE ELECTION</small><h1>八队核心角色投票</h1></div><p>各队依次选出队长、军师和王牌投手，三项投票全部完成后进入积累期。</p></section>';
+    return;
+  }
+  if(state.stage==='ACCUMULATION'){
+    var quota=(state.teams||[]).reduce(function(sum,item){return sum+(item.accumulationQuota||0);},0),rolled=(state.teams||[]).reduce(function(sum,item){return sum+(item.accumulationRolled||0);},0);
+    document.getElementById('tb-status').textContent='积累期 · '+rolled+'/'+quota;
+    root.innerHTML='<section class="wall-head"><div><small>PHASE TWO · ACCUMULATION</small><h1>八队积累投骰</h1></div><p>赛前一日每 10 万元 GMV 兑换 1 次机会。所有队伍必须投完全部次数，系统才会进入攻擂战。</p></section><section class="accumulation-watch-grid">'+state.teams.map(accumulationCard).join('')+'</section>';
+    return;
+  }
+  var matches=TournamentUI.matches(state),finished=matches.filter(function(m){return m.status==='done';}).length;
+  document.getElementById('tb-status').textContent=TournamentUI.currentStage(state)+' · '+finished+' 场已完赛';
+  root.innerHTML='<section class="wall-head"><div><small>PHASE THREE · LIVE BRACKET</small><h1>当前赛程 · '+esc(TournamentUI.currentStage(state))+'</h1></div><p>当前对阵优先显示，下方保留半决赛与首轮历史。每两支队伍只完成一轮攻擂，本轮结果直接决定本场胜负。</p></section><section class="feed-grid">'+matches.map(function(m,i){return card(state,m,i);}).join('')+'</section>';
+}
+function load(){fetch('/api/game-state').then(function(r){if(r.status===401){location.replace('/login');throw new Error();}return r.status===204?null:r.json();}).then(function(d){render(d&&d.state);}).catch(function(){});}
+document.getElementById('btn-logout').onclick=function(){fetch('/api/auth/logout',{method:'POST'}).finally(function(){location.replace('/login');});};load();setInterval(load,1000);
+})();

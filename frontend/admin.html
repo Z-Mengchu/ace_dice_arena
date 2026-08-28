@@ -1,0 +1,72 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>赛事总控台</title></head>
+<body class="hub-body"><header class="hub-top"><div><b>🎲 赛事总控台</b><span id="hub-phase"></span></div><nav><a class="tb-btn" href="/">进入主持台</a><button id="hub-logout" class="tb-btn">退出</button></nav></header>
+<main class="admin-layout">
+  <dialog id="next-day-dialog" class="next-day-dialog">
+    <div class="next-day-dialog-copy"><small>DAY 2 SETUP</small><h2>第二天是否重新分组？</h2><p>第一天战况会继续保留，只调整第二天的参赛队伍。</p></div>
+    <div class="next-day-dialog-actions"><button id="next-day-regroup" class="btn btn-primary" type="button">重新随机分组</button><button id="next-day-keep" class="btn btn-subtle" type="button">保留第一天分组</button><button id="next-day-cancel" class="btn btn-ghost" type="button">暂不进入第二天</button></div>
+  </dialog>
+  <dialog id="ready-all-dialog" class="next-day-dialog">
+    <div class="next-day-dialog-copy"><small>READY ALL PLAYERS</small><h2>如何处理未准备玩家？</h2><p>两种方式都会将已分组玩家设为准备，请根据现场到场情况选择。</p></div>
+    <div class="next-day-dialog-actions"><button id="ready-all-afk" class="btn btn-primary" type="button">设为准备并标记挂机</button><button id="ready-all-only" class="btn btn-subtle" type="button">仅设为准备</button><button id="ready-all-cancel" class="btn btn-ghost" type="button">取消</button></div>
+  </dialog>
+  <section class="hub-card control-deck"><p class="hub-eyebrow">GAME CONTROL</p><h1>八队就位<br><em>一键开擂</em></h1><div id="phase-lights" class="phase-lights"></div><div id="ready-summary"></div><button id="ready-all" class="btn btn-subtle" title="可选择是否将未准备玩家标记为挂机托管">一键全员准备</button><button id="start-game" class="btn btn-primary btn-xl">开始第 1 天比赛</button><button id="reset-ready" class="btn btn-ghost">进入下一天准备</button><button id="reset-tournament" class="btn btn-danger-quiet">重置两天赛事与战况</button><p id="admin-error" class="login-error hidden"></p></section>
+  <div class="admin-main-stack">
+    <section id="test-mode-deck" class="hub-card test-mode-deck hidden">
+      <div class="test-mode-copy">
+        <p class="hub-eyebrow">PRIVATE SANDBOX</p>
+        <h2>管理员双人沙盘</h2>
+        <p>建立 240 个临时席位并直接开始比赛。指定两名真实玩家加入同队测试队内频道，或加入同一对战组的相对队伍测试完整对局。</p>
+      </div>
+      <div class="test-mode-status">
+        <small>沙盘状态</small>
+        <strong id="test-mode-phase">未建立</strong>
+        <span id="test-mode-meta">仅测试环境可用</span>
+      </div>
+      <div class="test-mode-actions">
+        <button id="test-mode-prepare" class="btn btn-subtle">建立沙盘</button>
+        <button id="test-mode-advance" class="btn btn-primary" disabled>推进入下一阶段</button>
+        <a id="test-mode-player-view" class="btn btn-subtle is-disabled" href="/sandbox-player?team=t1" target="_blank">管理员只读监视器</a>
+        <button id="test-mode-cleanup" class="btn btn-ghost" disabled>清理沙盘</button>
+      </div>
+      <div id="sandbox-player-console" class="solo-runner-console dual-runner-console is-waiting">
+        <div><small>DUAL PLAYER LINK</small><b id="sandbox-player-title">指定两名真实玩家</b><span id="sandbox-player-hint">两人替换对应队伍的虚拟席位；同队共享频道，相对队伍分别控制双方。</span></div>
+        <div class="dual-runner-grid">
+          <label><span>玩家 A</span><select id="sandbox-player-a" disabled><option>请先建立沙盘</option></select></label>
+          <label><span>A 加入队伍</span><select id="sandbox-team-a"></select></label>
+          <label><span>A 游戏身份</span><select id="sandbox-identity-a"><option value="front">前端</option><option value="back">后端</option></select></label>
+          <i class="dual-link-mark">A ⇄ B</i>
+          <label><span>玩家 B</span><select id="sandbox-player-b" disabled><option>请先建立沙盘</option></select></label>
+          <label><span>B 加入队伍</span><select id="sandbox-team-b"></select></label>
+          <label><span>B 游戏身份</span><select id="sandbox-identity-b"><option value="front">前端</option><option value="back">后端</option></select></label>
+          <button id="sandbox-players-bind" class="btn btn-primary" disabled>锁定双人沙盘</button>
+        </div>
+        <div id="formal-player-entry" class="formal-player-entry hidden">
+          <div><small>REAL PLAYER ENTRY</small><b>使用正式比赛页面登录</b><span>分别用无痕窗口或两个独立浏览器打开链接；登录后直接进入正式大厅，不进入沙盘监视器。</span></div>
+          <button id="copy-player-a-login" class="btn btn-subtle" type="button">复制玩家 A 登录链接</button>
+          <button id="copy-player-b-login" class="btn btn-subtle" type="button">复制玩家 B 登录链接</button>
+        </div>
+      </div>
+    </section>
+    <section class="hub-card performance-deck">
+      <div class="hub-section-title"><div><small>赛前数据作业台</small><h2>载入 GMV，均衡八队</h2></div><span id="performance-state" class="performance-state">尚未载入</span></div>
+      <div class="import-steps">
+        <div><i>1</i><b>取得标准模板</b><p>空白模板用于正式导入，截图数据文件用于立即测试。</p><a class="btn btn-ghost" href="/api/admin/performance/template">下载空白模板</a><a class="btn btn-subtle sample-download" href="/api/admin/performance/sample">下载截图测试数据</a></div>
+        <div><i>2</i><b>载入本轮业绩</b><p>负责人按组织库姓名匹配，销售额作为个人 GMV。</p><label class="btn btn-ghost file-trigger" for="performance-file">选择并导入 Excel</label><input id="performance-file" class="hidden" type="file" accept=".xlsx,.xls"></div>
+        <div><i>3</i><b>生成均衡分组</b><p>前端 GMV 尽量接近，每队补足 30 人且后端不少于 5 人。</p><button id="random-group" class="btn btn-primary" disabled>按 GMV 随机分组</button></div>
+      </div>
+      <div id="performance-summary" class="performance-summary"></div>
+    </section>
+    <section class="hub-card two-day-deck">
+      <div class="hub-section-title"><div><small>TWO-DAY RECORD</small><h2>两日战况带</h2></div><span id="two-day-progress">0 / 2 天</span></div>
+      <p class="two-day-rule">每日可重新载入业绩并重新分组。单场由一轮总攻击直接定胜负；历史只有“重置两天赛事与战况”才会清除。</p>
+      <div id="two-day-records" class="two-day-records"></div>
+    </section>
+    <section class="hub-card game-flow-monitor">
+      <div class="hub-section-title"><div><small>LIVE PROCESS MONITOR</small><h2>八队游戏流程总览</h2></div><span id="flow-monitor-stage">等待开赛</span></div>
+      <p class="game-flow-note">实时展示角色计票、积累骰点数、预言与阵容，以及攻擂骰子和攻击力。</p>
+      <div id="team-flow-grid" class="team-flow-grid"></div>
+    </section>
+    <section><div class="hub-section-title"><div><small id="admin-stage-kicker">4 个对战组 · 每组 60 人</small><h2 id="admin-stage-title">分组与观战</h2></div></div><div id="match-grid" class="match-watch-grid"></div></section>
+  </div>
+  <section class="hub-card roster-deck"><div class="hub-section-title"><div><small>手动分队</small><h2>用户准备情况</h2></div><span id="roster-count"></span></div><div id="admin-roster" class="admin-roster"></div></section>
+</main><script type="module" src="/entries/admin.js"></script></body></html>

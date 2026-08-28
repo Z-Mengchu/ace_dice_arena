@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · 王牌攻守擂</title>
+</head>
+<body class="login-body">
+  <main class="login-shell">
+    <section class="login-arena" aria-label="游戏介绍">
+      <div class="login-mark" aria-hidden="true"><span>⚄</span></div>
+      <p class="login-kicker">ACE DICE ARENA · ONLINE</p>
+      <h1>王牌攻守擂<br><em>骰子大亨</em></h1>
+      <p class="login-lead">管理员掌控赛程，玩家完成本队限时投票、预言与投骰。比赛进度、战报与操作记录由服务器统一保存。</p>
+      <div class="login-route"><span>核心角色投票</span><b>→</b><span>GMV 积累期</span><b>→</b><span>冠军擂台</span></div>
+    </section>
+    <section class="login-panel">
+      <div class="login-panel-head">
+        <span class="login-step">入场凭证</span>
+        <h2 id="login-title">登录擂台</h2>
+        <p id="login-hint">已有账户，输入凭证直接入场。</p>
+      </div>
+      <form id="login-form" novalidate>
+        <label>用户名<input id="login-username" class="login-input" autocomplete="username" maxlength="32" placeholder="例如：leiting_01" required></label>
+        <label id="display-name-row" class="hidden">显示名称<input id="login-display-name" class="login-input" maxlength="32" placeholder="例如：雷霆队员 01"></label>
+        <label id="department-row" class="hidden">所在部门<input id="login-department" class="login-input" maxlength="64" placeholder="例如：技术部"></label>
+        <label>密码<input id="login-password" class="login-input" type="password" autocomplete="current-password" maxlength="64" placeholder="至少 6 位" required></label>
+        <div id="login-error" class="login-error hidden" role="alert"></div>
+        <button id="login-submit" class="btn btn-primary login-submit" type="submit">登录并入场</button>
+      </form>
+      <button id="login-mode" class="login-mode" type="button">第一次来？创建账户</button>
+    </section>
+  </main>
+  <script type="module" src="/entries/login.js"></script>
+</body>
+</html>

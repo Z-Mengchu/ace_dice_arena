@@ -1,0 +1,66 @@
+server:
+  port: ${PORT:8082}
+  tomcat:
+    threads:
+      max: ${TOMCAT_MAX_THREADS:300}
+      min-spare: ${TOMCAT_MIN_SPARE_THREADS:20}
+    accept-count: ${TOMCAT_ACCEPT_COUNT:500}
+    max-connections: ${TOMCAT_MAX_CONNECTIONS:2000}
+  compression:
+    enabled: true
+    mime-types: text/html,text/css,application/javascript,application/json
+    min-response-size: 1024
+  servlet:
+    session:
+      timeout: 12h
+      cookie:
+        http-only: true
+        same-site: lax
+
+spring:
+  datasource:
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:ace_dice_arena}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: ${DB_USER:ace_dice_arena}
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:30}
+      minimum-idle: ${DB_POOL_MIN_IDLE:5}
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:10000}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+logging:
+  level:
+    root: INFO
+    com.acedicearena: INFO
+
+app:
+  admin-password: ${ADMIN_PASSWORD:admin123}
+  login:
+    max-concurrent: ${LOGIN_MAX_CONCURRENT:24}
+  audit:
+    queue-capacity: ${AUDIT_QUEUE_CAPACITY:50000}
+  game:
+    # 双方投骰完成后，本局结果在所有比赛视角中的展示时长。
+    result-display-ms: ${RESULT_DISPLAY_MS:6000}
+    result-scan-ms: ${RESULT_SCAN_MS:500}
+  # 当前开发版本默认开启；正式环境可设置 GAME_TEST_MODE=false 隐藏管理员沙盘。
+  test-mode:
+    enabled: ${GAME_TEST_MODE:false}
+  grouping:
+    # 仅服务端读取，使用英文或中文逗号分隔；名单账号只进入观众席。
+    test-account-display-names: ${GROUPING_TEST_ACCOUNT_NAMES:测试账号,test,AD部门账号,AD运营账号,TD欧洲部门账号,TD欧洲运营账号,TD俄罗斯部门账号,TD俄罗斯运营账号,ND部门账号,ND运营账号,DD部门账号,DD运营账号}
+  organization-datasource:
+    enabled: ${ORG_DB_ENABLED:false}
+    jdbc-url: jdbc:mysql://${ORG_DB_HOST:localhost}:${ORG_DB_PORT:3306}/${ORG_DB_NAME:data-visual-manage}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+    username: ${ORG_DB_USER:}
+    password: ${ORG_DB_PASSWORD:}

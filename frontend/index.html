@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>王牌攻守擂 · 骰子大亨 · 主持人台</title>
+</head>
+<body>
+
+<header id="topbar" class="spectator-topbar">
+  <div class="tb-left">
+    <span class="tb-logo">🎲</span>
+    <div class="tb-titles">
+      <div class="tb-title">王牌攻守擂 · 骰子大亨</div>
+      <div class="tb-sub">四路赛事监看中心</div>
+    </div>
+  </div>
+  <div class="tb-center" id="tb-status">系统流程运行中</div>
+  <div class="tb-right">
+    <a href="/admin" class="tb-btn host-exit">← 返回中控台</a>
+    <span id="login-user" class="login-user"></span>
+    <span id="net-badge" class="net-badge online">● 实时同步</span>
+    <button id="btn-logout" class="tb-btn">退出登录</button>
+  </div>
+</header>
+
+<main id="spectator-root" class="spectator-wall"></main>
+<script type="module" src="/entries/spectator.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>沙盘玩家视角</title></head>
+<body class="hub-body sandbox-player-body">
+<header class="hub-top sandbox-monitor-top"><div><b>◉ 玩家视角监视器</b><span id="sandbox-signal">正在接入沙盘信号…</span></div><nav><a class="tb-btn" href="/admin">返回总控台</a></nav></header>
+<main class="sandbox-player-shell">
+  <section class="sandbox-channel-bar"><div><small>PLAYER CHANNEL</small><strong>切换观察队伍</strong></div><div id="sandbox-team-tabs" class="sandbox-team-tabs"></div></section>
+  <section id="sandbox-player-hero" class="hub-card sandbox-player-hero"></section>
+  <section id="sandbox-action-view" class="hub-card sandbox-action-view"></section>
+  <section class="hub-card sandbox-roster-view"><div class="hub-section-title"><div><small>LOCKER ROOM</small><h2 id="sandbox-roster-title">队伍成员</h2></div><span id="sandbox-roster-meta"></span></div><div id="sandbox-roster" class="teammate-grid"></div></section>
+  <section class="sandbox-scoreboard"><div class="hub-section-title"><div><small>LIVE SCORE</small><h2>玩家能看到的实时赛况</h2></div></div><div id="sandbox-matches" class="match-watch-grid"></div></section>
+  <p id="sandbox-error" class="login-error hidden"></p>
+</main>
+<script type="module" src="/entries/sandbox-player.js"></script></body></html>

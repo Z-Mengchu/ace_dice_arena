@@ -1,0 +1,16 @@
+target/
+node_modules/
+.npm-cache/
+.frontend-toolchain/
+frontend/dist/
+*.log
+.idea/
+ai/
+.env
+.env.*
+!.env.example
+application-local.yml
+src/main/resources/gmv-sample-data.csv
+*.jks
+*.p12
+*.pem
