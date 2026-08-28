@@ -16,7 +16,7 @@
     return;
   }
 
-  /** 时钟偏移估算：优先用引擎实现（契约保证存在），缺失时用同规格本地实现兜底 */
+  /** 往返延迟估算：偏移改由服务端计算，这里只取 rtt 最小的样本上报给服务端做单程延迟补偿 */
   var estimateOffset = GE.estimateClockOffset
     ? function (samples) { return GE.estimateClockOffset(samples); }
     : function (samples) {
@@ -196,19 +196,28 @@
     }).catch(function () { });
   }
 
-  /** 连续 n 次 ping（间隔约 120ms）→ 估算 offset/rtt → 上报 /api/calibrate */
+  /**
+   * 连续 n 次 ping（间隔约 120ms）→ 上报往返延迟 → 由服务端计算并返回时钟偏移。
+   * 偏移不再由本页面决定：ping 时服务端已记录自己的收包时刻，这里只提供 rtt 供其补偿单程延迟。
+   */
   function calibrate(n, done) {
     var samples = [];
     (function one(i) {
       if (i >= n) {
         var est = estimateOffset(samples);
         if (samples.length) {
-          api('/api/calibrate', { token: my.token, offset: est.offset, rtt: est.rtt })
-            .catch(function (err) { handleAuthError(err); })
-            .then(function () {
-              ui.calibWarn = est.rtt > 300;
-              ui.lastRtt = est.rtt;
+          api('/api/calibrate', { token: my.token, rtt: est.rtt })
+            .then(function (res) {
+              ui.lastRtt = res && res.rtt != null ? Math.round(res.rtt) : est.rtt;
+              ui.calibWarn = ui.lastRtt > 300;
               if (done) done(est);
+            })
+            .catch(function (err) {
+              handleAuthError(err);
+              ui.calibText = '校准失败，请稍后重试';
+              ui.calibWarn = true;
+              renderStatus();
+              if (done) done(null);
             });
         } else {
           ui.calibText = '校准失败：无法连接服务器';
@@ -219,7 +228,7 @@
         return;
       }
       var c0 = Date.now();
-      api('/api/ping', { c0: c0 }).then(function (res) {
+      api('/api/ping', { token: my.token, c0: c0 }).then(function (res) {
         var c1 = Date.now();
         samples.push({ c0: c0, s: res.s, c1: c1 });
       }).catch(function () { /* 丢样本，继续 */ }).then(function () {

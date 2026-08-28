@@ -8,6 +8,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class OnlineGameService {
@@ -16,8 +17,15 @@ public class OnlineGameService {
     private static final long SYNC_WINDOW_MS = 500;
     private static final long RECONNECT_TIME_MS = 3_000L;
     private static final long HEARTBEAT_INTERVAL_SECONDS = 25L;
+    /** 客户端上报的往返延迟只作为偏移的半程修正，且必须落在这个上限内，避免用超大 rtt 撬动偏移。 */
+    private static final long MAX_RTT_HINT_MS = 300L;
+    /** 归一化点击时刻允许早于服务端收包时刻的最大值：覆盖真实网络单程延迟，同时限制伪造空间。 */
+    private static final long ROLL_TOLERANCE_MS = 250L;
+    private static final int SSE_QUEUE_CAPACITY = 20_000;
 
     private final Map<String, Device> devices = new LinkedHashMap<>();
+    /** 每个设备的时钟探测记录，全部由服务端时间写入，客户端无法直接指定偏移。 */
+    private final Map<String, ClockProbe> probes = new LinkedHashMap<>();
     private final Map<String, TeamRollSession> sessions = new LinkedHashMap<>();
     private final Set<SseEmitter> emitters = ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -25,6 +33,14 @@ public class OnlineGameService {
         thread.setDaemon(true);
         return thread;
     });
+    /** SSE 写出线程：与游戏状态锁解耦，队列打满时丢事件而不是拖垮比赛推进。 */
+    private final ThreadPoolExecutor dispatcher = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(SSE_QUEUE_CAPACITY), r -> {
+        Thread thread = new Thread(r, "dice-sse-dispatcher");
+        thread.setDaemon(true);
+        return thread;
+    }, new ThreadPoolExecutor.DiscardPolicy());
+    private final AtomicLong droppedEvents = new AtomicLong();
 
     private String lastArmedTeam;
     private final ApplicationEventPublisher publisher;
@@ -46,6 +62,7 @@ public class OnlineGameService {
         result.put("countdowns", countdowns);
         result.put("rolling", sessions.values().stream().anyMatch(s -> !s.timingReady));
         result.put("timingReadyTeams", sessions.entrySet().stream().filter(e -> e.getValue().timingReady).map(Map.Entry::getKey).toList());
+        result.put("droppedEvents", droppedEvents.get());
         return result;
     }
 
@@ -58,19 +75,39 @@ public class OnlineGameService {
             throw new IllegalArgumentException("invalid teamId or slot");
         }
         devices.entrySet().removeIf(e -> e.getValue().teamId().equals(teamId) && e.getValue().slot() == slot);
+        pruneProbes();
         String token = UUID.randomUUID().toString();
         devices.put(token, new Device(teamId, slot, limit(name, 32), playerId, 0, null, false, false));
         broadcast(Map.of("type", "roster", "devices", deviceViews()));
         return new JoinResult(token, teamId, slot);
     }
 
-    public synchronized void calibrate(String token, Double offset, Double rtt) {
-        Device old = requireDevice(token);
-        if (offset == null || rtt == null || !Double.isFinite(offset) || !Double.isFinite(rtt)) {
-            throw new IllegalArgumentException("invalid offset or rtt");
+    /**
+     * 时钟探测：服务端记录本次请求到达时的服务器时刻与客户端声称的发送时刻之差。
+     * 单程延迟非负，因此真实偏移 <= min(收包时刻 - c0)，取多次探测的最小值作为上界。
+     * 返回服务器时刻供客户端估算往返延迟。
+     */
+    public synchronized long ping(String token, Double clientSendTs) {
+        long serverTs = System.currentTimeMillis();
+        if (token != null && clientSendTs != null && Double.isFinite(clientSendTs) && devices.containsKey(token)) {
+            probes.computeIfAbsent(token, ignored -> new ClockProbe()).record(serverTs - clientSendTs);
         }
+        return serverTs;
+    }
+
+    /**
+     * 完成校准：偏移由服务端根据自己记录的探测样本算出，客户端只能提供一个被限幅的往返延迟，
+     * 用于补偿单程延迟带来的固定偏差（offset = min(收包时刻 - c0) - rtt/2）。
+     */
+    public synchronized Calibration calibrate(String token, Double rttHint) {
+        Device old = requireDevice(token);
+        ClockProbe probe = probes.get(token);
+        if (probe == null || !probe.hasSample()) throw new IllegalStateException("时钟探测样本不足，请重新校准");
+        double rtt = rttHint == null || !Double.isFinite(rttHint) ? 0d : Math.min(Math.max(rttHint, 0d), MAX_RTT_HINT_MS);
+        double offset = probe.minDelta() - rtt / 2;
         devices.put(token, new Device(old.teamId(), old.slot(), old.name(), old.playerId(), offset, rtt, true, old.ready()));
         broadcast(Map.of("type", "roster", "devices", deviceViews()));
+        return new Calibration(offset, rtt);
     }
 
     public synchronized void ready(String token, boolean ready) {
@@ -94,6 +131,7 @@ public class OnlineGameService {
         devices.replaceAll((token, device) -> teamId.equals(device.teamId())
                 ? new Device(device.teamId(), device.slot(), device.name(), device.playerId(), device.offset(), device.rtt(), device.calibrated(), false)
                 : device);
+        pruneProbes();
         sessions.put(teamId, new TeamRollSession(List.copyOf(lineup)));
         broadcast(Map.of("type", "prepare", "teamId", teamId));
     }
@@ -162,6 +200,7 @@ public class OnlineGameService {
             return teamId.equals(device.teamId())
                     && (device.playerId() == null || !device.playerId().equals(lineup.get(device.slot() - 1)));
         });
+        pruneProbes();
         armAndGo(teamId);
     }
 
@@ -174,11 +213,13 @@ public class OnlineGameService {
     }
 
     public synchronized void roll(String token, Double clientTs) {
+        long serverTs = System.currentTimeMillis();
         Device device = requireDevice(token);
         TeamRollSession session = sessions.get(device.teamId());
         if (session == null || session.timingReady || session.goTs == null) throw new IllegalStateException("not armed");
         if (clientTs == null || !Double.isFinite(clientTs)) throw new IllegalArgumentException("invalid clientTs");
-        boolean recorded = session.rolls.putIfAbsent(device.slot(), new Roll(device.slot(), clientTs)) == null;
+        boolean recorded = session.rolls.putIfAbsent(device.slot(),
+                new Roll(device.slot(), clientTs, normalizedClick(clientTs, device, serverTs))) == null;
         if (recorded) {
             List<Integer> rolledSlots = session.rolls.keySet().stream().sorted().toList();
             broadcast(Map.of("type", "timing-progress", "teamId", device.teamId(), "rolledSlots", rolledSlots));
@@ -198,8 +239,7 @@ public class OnlineGameService {
         List<DiceResult> dice = new ArrayList<>();
         for (int slot = 1; slot <= SLOT_COUNT; slot++) {
             Roll roll = session.rolls.get(slot);
-            Device device = findDevice(teamId, slot);
-            Double normalized = roll == null ? null : roll.clientTs() + (device == null ? 0 : device.offset());
+            Double normalized = roll == null ? null : roll.normalizedTs();
             boolean early = normalized != null && session.goTs != null && normalized < session.goTs;
             dice.add(new DiceResult(slot, ThreadLocalRandom.current().nextInt(1, 7), normalized, early));
         }
@@ -209,6 +249,12 @@ public class OnlineGameService {
         broadcast(event);
         publisher.publishEvent(new DiceRevealEvent(teamId, dice, session.syncOk, session.spreadMs));
         sessions.remove(teamId);
+    }
+
+    /** 校准前的席位归属校验：设备一旦绑定了玩家，就只有该玩家本人可以继续校准它。 */
+    public synchronized boolean ownsDevice(String token, String playerId) {
+        Device device = devices.get(token);
+        return device != null && (device.playerId() == null || device.playerId().equals(playerId));
     }
 
     public synchronized boolean matchesAssignment(String token, String teamId, int slot) {
@@ -228,16 +274,20 @@ public class OnlineGameService {
         emitter.onCompletion(() -> emitters.remove(emitter));
         emitter.onTimeout(() -> emitters.remove(emitter));
         emitter.onError(e -> emitters.remove(emitter));
-        send(emitter, SseEmitter.event().reconnectTime(RECONNECT_TIME_MS).comment("connected"));
-        send(emitter, Map.of("type", "roster", "devices", deviceViews()));
+        List<Object> snapshot = new ArrayList<>();
+        snapshot.add(Map.of("type", "roster", "devices", deviceViews()));
         sessions.forEach((team, session) -> {
-            if (session.countdownAt == null) send(emitter, Map.of("type", "prepare", "teamId", team));
-            else if (session.goTs == null) send(emitter, Map.of("type", "countdown", "teamId", team, "goTs", session.countdownAt));
-            else send(emitter, Map.of("type", "arm", "teamId", team));
+            if (session.countdownAt == null) snapshot.add(Map.of("type", "prepare", "teamId", team));
+            else if (session.goTs == null) snapshot.add(Map.of("type", "countdown", "teamId", team, "goTs", session.countdownAt));
+            else snapshot.add(Map.of("type", "arm", "teamId", team));
         });
         sessions.forEach((team, session) -> {
-            if (session.timingReady) send(emitter, Map.of("type", "timing-ready", "teamId", team,
+            if (session.timingReady) snapshot.add(Map.of("type", "timing-ready", "teamId", team,
                     "spreadMs", session.spreadMs, "syncOk", session.syncOk));
+        });
+        dispatch(() -> {
+            write(emitter, SseEmitter.event().reconnectTime(RECONNECT_TIME_MS).comment("connected"));
+            for (Object event : snapshot) write(emitter, event);
         });
         return emitter;
     }
@@ -250,10 +300,8 @@ public class OnlineGameService {
         for (int slot = 1; slot <= SLOT_COUNT; slot++) {
             Roll roll = session.rolls.get(slot);
             if (roll != null) {
-                Device device = findDevice(teamId, slot);
-                double normalized = roll.clientTs() + (device == null ? 0 : device.offset());
-                if (session.goTs != null && normalized < session.goTs) earlyCount++;
-                timestamps.add(normalized);
+                if (session.goTs != null && roll.normalizedTs() < session.goTs) earlyCount++;
+                timestamps.add(roll.normalizedTs());
             }
         }
         Double spread = timestamps.isEmpty() ? null : Collections.max(timestamps) - Collections.min(timestamps);
@@ -263,11 +311,25 @@ public class OnlineGameService {
         publisher.publishEvent(new DiceTimingReadyEvent(teamId, syncOk, spread));
     }
 
+    /**
+     * 归一化点击时刻并夹到服务端可验证的区间内。
+     * 点击不可能发生在服务端收包之后，也不可能早于一个网络单程延迟之前，
+     * 因此任何伪造的 clientTs / 时钟偏移最多只能在本机真实网络延迟范围内移动，无法凭空制造同步。
+     */
+    private double normalizedClick(double clientTs, Device device, long serverTs) {
+        double normalized = clientTs + device.offset();
+        double earliest = serverTs - ROLL_TOLERANCE_MS;
+        if (normalized > serverTs) return serverTs;
+        return Math.max(normalized, earliest);
+    }
+
     private Device requireDevice(String token) {
         Device device = devices.get(token);
         if (device == null) throw new SecurityException("invalid token");
         return device;
     }
+
+    private void pruneProbes() { probes.keySet().retainAll(devices.keySet()); }
 
     private Device findDevice(String teamId, int slot) {
         return devices.values().stream().filter(d -> d.teamId().equals(teamId) && d.slot() == slot).findFirst().orElse(null);
@@ -277,24 +339,41 @@ public class OnlineGameService {
         return devices.values().stream().map(d -> new DeviceView(d.teamId(), d.slot(), d.name(), d.playerId(), d.rtt(), d.calibrated(), d.ready())).toList();
     }
 
+    /**
+     * 广播只在调用方的锁内拍一张订阅者快照，真正的 SSE 写出交给单线程分发器。
+     * 这样一个写不动的慢客户端只会拖慢事件分发，不会再握着本服务的全局锁把整场比赛卡住。
+     * 单线程 + FIFO 队列同时保证事件顺序，以及同一个 emitter 不会被两个线程并发写入。
+     */
     private void broadcast(Object event) {
-        for (SseEmitter emitter : List.copyOf(emitters)) send(emitter, event);
+        List<SseEmitter> targets = List.copyOf(emitters);
+        if (targets.isEmpty()) return;
+        dispatch(() -> { for (SseEmitter emitter : targets) write(emitter, event); });
     }
 
-    private void send(SseEmitter emitter, Object event) {
+    private void dispatch(Runnable task) {
+        try { dispatcher.execute(task); }
+        catch (RejectedExecutionException dropped) { droppedEvents.incrementAndGet(); }
+    }
+
+    /** 被丢弃的 SSE 事件数：队列打满或服务停止时累加，客户端会通过下一次全量状态拉取自愈。 */
+    public long droppedEventCount() { return droppedEvents.get(); }
+
+    private void write(SseEmitter emitter, Object event) {
         try { emitter.send(SseEmitter.event().data(event)); }
         catch (IOException | IllegalStateException e) { emitters.remove(emitter); emitter.complete(); }
     }
 
-    private void send(SseEmitter emitter, SseEmitter.SseEventBuilder event) {
+    private void write(SseEmitter emitter, SseEmitter.SseEventBuilder event) {
         try { emitter.send(event); }
         catch (IOException | IllegalStateException e) { emitters.remove(emitter); emitter.complete(); }
     }
 
     private void heartbeat() {
-        for (SseEmitter emitter : List.copyOf(emitters)) {
-            send(emitter, SseEmitter.event().comment("keepalive"));
-        }
+        List<SseEmitter> targets = List.copyOf(emitters);
+        if (targets.isEmpty()) return;
+        dispatch(() -> {
+            for (SseEmitter emitter : targets) write(emitter, SseEmitter.event().comment("keepalive"));
+        });
     }
 
     private String limit(String value, int max) {
@@ -303,10 +382,18 @@ public class OnlineGameService {
     }
 
     @PreDestroy
-    void close() { scheduler.shutdownNow(); }
+    void close() { scheduler.shutdownNow(); dispatcher.shutdownNow(); }
 
     private record Device(String teamId, int slot, String name, String playerId, double offset, Double rtt, boolean calibrated, boolean ready) {}
-    private record Roll(int slot, double clientTs) {}
+    private record Roll(int slot, double clientTs, double normalizedTs) {}
+    /** 服务端侧时钟探测：只保留 (收包时刻 - c0) 的最小值，即真实时钟偏移的上界。 */
+    private static final class ClockProbe {
+        private Double minDelta;
+        private void record(double delta) { if (minDelta == null || delta < minDelta) minDelta = delta; }
+        private boolean hasSample() { return minDelta != null; }
+        private double minDelta() { return minDelta; }
+    }
+    public record Calibration(double offset, double rtt) {}
     private static class TeamRollSession {
         private final List<String> lineup;
         private final Map<Integer, Roll> rolls = new HashMap<>();

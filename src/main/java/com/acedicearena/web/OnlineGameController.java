@@ -40,7 +40,8 @@ public class OnlineGameController {
 
     @PostMapping("/ping")
     public Map<String, Object> ping(@RequestBody(required = false) PingBody body) {
-        return Map.of("c0", body == null || body.c0() == null ? 0 : body.c0(), "s", System.currentTimeMillis());
+        long serverTs = service.ping(body == null ? null : body.token(), body == null ? null : body.c0());
+        return Map.of("c0", body == null || body.c0() == null ? 0 : body.c0(), "s", serverTs);
     }
 
     @PostMapping("/join")
@@ -73,11 +74,19 @@ public class OnlineGameController {
         }
     }
 
+    /** 偏移一律由服务端根据 /api/ping 的探测样本计算，请求体中的 offset 只为兼容旧客户端，不参与运算。 */
     @PostMapping("/calibrate")
-    public ResponseEntity<?> calibrate(@RequestBody CalibrateBody body) {
-        try { service.calibrate(body.token(), body.offset(), body.rtt()); return ResponseEntity.ok(Map.of("ok", true)); }
+    public ResponseEntity<?> calibrate(@RequestBody CalibrateBody body, HttpSession session) {
+        try {
+            UserAccount user = lobby.requireUser((String) session.getAttribute(AuthController.SESSION_USER));
+            if (!service.ownsDevice(body.token(), "u" + user.getId()))
+                return ResponseEntity.status(403).body(Map.of("error", "当前账号没有这个掷骰席位"));
+            OnlineGameService.Calibration calibration = service.calibrate(body.token(), body.rtt());
+            return ResponseEntity.ok(Map.of("ok", true, "offset", calibration.offset(), "rtt", calibration.rtt()));
+        }
         catch (SecurityException e) { return ResponseEntity.status(401).body(Map.of("error", e.getMessage())); }
         catch (IllegalArgumentException e) { return ResponseEntity.badRequest().body(Map.of("error", e.getMessage())); }
+        catch (IllegalStateException e) { return ResponseEntity.status(409).body(Map.of("error", e.getMessage())); }
     }
 
     @PostMapping("/player-ready")
@@ -171,7 +180,7 @@ public class OnlineGameController {
         return mapper.createObjectNode().put("name", playerId);
     }
 
-    public record PingBody(Double c0) {}
+    public record PingBody(String token, Double c0) {}
     public record JoinBody(String teamId, Integer slot, String name) {}
     public record CalibrateBody(String token, Double offset, Double rtt) {}
     public record PlayerReadyBody(String token, boolean ready) {}

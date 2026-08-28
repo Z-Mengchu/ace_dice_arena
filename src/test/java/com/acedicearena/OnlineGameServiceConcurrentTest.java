@@ -19,7 +19,7 @@ class OnlineGameServiceConcurrentTest {
         String[] tokens = new String[5];
         for (int i = 0; i < 5; i++) {
             tokens[i] = service.join("t1", i + 1, "队员" + (i + 1), lineup.get(i)).token();
-            service.calibrate(tokens[i], 0d, 20d);
+            calibrate(service, tokens[i]);
             if (i < 4) service.ready(tokens[i], true);
         }
 
@@ -61,8 +61,14 @@ class OnlineGameServiceConcurrentTest {
         String[] tokens = new String[5];
         for (int i = 0; i < 5; i++) {
             tokens[i] = service.join(team, i + 1, team + "-" + (i + 1)).token();
-            service.calibrate(tokens[i], 0d, 20d);
+            calibrate(service, tokens[i]);
         }
         return tokens;
+    }
+
+    /** 走真实流程：先探测再校准，偏移由服务端根据自己的收包时刻算出。 */
+    private void calibrate(OnlineGameService service, String token) {
+        service.ping(token, (double) System.currentTimeMillis());
+        service.calibrate(token, 20d);
     }
 }

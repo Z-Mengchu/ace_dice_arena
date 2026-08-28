@@ -269,6 +269,10 @@ class ApplicationIntegrationTest {
                     .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
             assertThat(objectMapper.readTree(joined).get("slot").asInt()).isEqualTo(slot);
             tokens[slot - 1] = objectMapper.readTree(joined).get("token").asText();
+            mockMvc.perform(post("/api/ping").session(sessions[slot - 1])
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"token\":\"" + tokens[slot - 1] + "\",\"c0\":" + System.currentTimeMillis() + "}"))
+                    .andExpect(status().isOk());
             mockMvc.perform(post("/api/calibrate").session(sessions[slot - 1])
                             .contentType(MediaType.APPLICATION_JSON)
                             .content("{\"token\":\"" + tokens[slot - 1] + "\",\"offset\":0,\"rtt\":20}"))
