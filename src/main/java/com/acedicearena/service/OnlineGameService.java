@@ -292,7 +292,29 @@ public class OnlineGameService {
         return emitter;
     }
 
-    private synchronized void completeTiming(String teamId) {
+    /**
+     * 超时兜底：不再等五人准备齐，直接开放点击。已到场的队员照常抢同步，
+     * 缺席位置最终由 finalRoll 自动补掷。
+     */
+    public synchronized void forceStart(String teamId) {
+        TeamRollSession session = sessions.computeIfAbsent(teamId, ignored -> new TeamRollSession(List.of()));
+        if (session.timingReady || session.goTs != null) return;
+        session.goTs = System.currentTimeMillis();
+        session.countdownAt = session.goTs;
+        broadcast(Map.of("type", "go", "teamId", teamId, "goTs", session.goTs));
+    }
+
+    /** 超时兜底：用已经到位的点击完成计时判定，人不齐一律判为未同步（同步增益失效）。 */
+    public synchronized void forceTiming(String teamId) {
+        TeamRollSession session = sessions.get(teamId);
+        if (session == null || session.timingReady) return;
+        if (session.goTs == null) session.goTs = System.currentTimeMillis();
+        completeTiming(teamId, true);
+    }
+
+    private synchronized void completeTiming(String teamId) { completeTiming(teamId, false); }
+
+    private synchronized void completeTiming(String teamId, boolean forced) {
         TeamRollSession session = sessions.get(teamId);
         if (session == null || session.timingReady) return;
         List<Double> timestamps = new ArrayList<>();
@@ -305,7 +327,8 @@ public class OnlineGameService {
             }
         }
         Double spread = timestamps.isEmpty() ? null : Collections.max(timestamps) - Collections.min(timestamps);
-        boolean syncOk = timestamps.size() >= SLOT_COUNT && spread != null && spread <= SYNC_WINDOW_MS && earlyCount == 0;
+        boolean syncOk = !forced && timestamps.size() >= SLOT_COUNT && spread != null
+                && spread <= SYNC_WINDOW_MS && earlyCount == 0;
         session.timingReady = true; session.spreadMs = spread; session.syncOk = syncOk;
         broadcast(Map.of("type", "timing-ready", "teamId", teamId, "spreadMs", spread, "syncOk", syncOk));
         publisher.publishEvent(new DiceTimingReadyEvent(teamId, syncOk, spread));

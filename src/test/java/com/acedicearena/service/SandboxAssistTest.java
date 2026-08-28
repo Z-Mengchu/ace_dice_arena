@@ -91,6 +91,6 @@ class SandboxAssistTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
                 org.mockito.Mockito.mock(LobbyEventService.class), 6_000L,
-                org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
+                org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class), org.mockito.Mockito.mock(com.acedicearena.service.OnlineGameService.class));
     }
 }

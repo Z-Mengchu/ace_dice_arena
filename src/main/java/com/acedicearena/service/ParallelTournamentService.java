@@ -17,6 +17,8 @@ import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.Comparator;
 import java.util.ArrayList;
@@ -35,6 +37,14 @@ public class ParallelTournamentService {
     private static final BigDecimal GMV_PER_ACCUMULATION_ROLL = BigDecimal.valueOf(100_000L);
     private static final long VOTE_DURATION_MS = 19_500L;
     private static final long PROPHET_DURATION_MS = 30_000L;
+    /** 队长选阵容的时限；超时由系统按在场队员自动补齐。 */
+    private static final long LINEUP_DURATION_MS = 60_000L;
+    /** 五人备战准备的时限；超时直接开放点击，不再等不到场的人。 */
+    private static final long PREPARE_DURATION_MS = 60_000L;
+    /** 口令下达后五人同步点击的时限；超时按已到位的点击判定，同步增益失效。 */
+    private static final long ROLL_DURATION_MS = 30_000L;
+    /** 王牌投手最终投骰的时限；超时由服务端代投。 */
+    private static final long PITCHER_DURATION_MS = 30_000L;
     private static final List<String> ROLE_VOTE_ORDER = List.of("captain", "strategist", "pitcher");
     private final GameStateRepository states;
     private final UserAccountRepository users;
@@ -44,16 +54,25 @@ public class ParallelTournamentService {
     private final LobbyEventService events;
     private final long resultDisplayMs;
     private final BattleReportRepository reports;
+    private final OnlineGameService online;
+    /** 单线程保证兜底动作按触发顺序执行，同时把它们移出定时扫描的事务。 */
+    private final java.util.concurrent.ExecutorService timeoutExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "arena-timeout-dispatcher");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     public ParallelTournamentService(GameStateRepository states, UserAccountRepository users,
                                      PerformanceRecordRepository performances,
                                      GameControlRepository controls, ObjectMapper mapper, LobbyEventService events,
                                      @Value("${app.game.result-display-ms:6000}") long resultDisplayMs,
-                                     BattleReportRepository reports) {
+                                     BattleReportRepository reports, OnlineGameService online) {
         this.states = states; this.users = users; this.performances = performances;
         this.controls = controls; this.mapper = mapper; this.events = events;
         this.resultDisplayMs = Math.max(0, resultDisplayMs);
         this.reports = reports;
+        this.online = online;
     }
 
     @Transactional
@@ -913,14 +932,20 @@ public class ParallelTournamentService {
     public void startLineupVoting(ObjectNode match) {
         match.put("phase", "LINEUP");
         match.remove("prophetDeadlineAt");
+        match.put("lineupDeadlineAt", System.currentTimeMillis() + LINEUP_DURATION_MS);
     }
 
     public void startParallelAttack(ObjectNode match) {
+        long displayUntil = System.currentTimeMillis() + 5_000L;
         match.put("phase", "ATTACKING");
-        match.put("lineupDisplayUntil", System.currentTimeMillis() + 5_000L);
+        match.remove("lineupDeadlineAt");
+        match.put("lineupDisplayUntil", displayUntil);
         ObjectNode sidePhases = match.putObject("sidePhases");
         sidePhases.put("A", "PREPARING");
         sidePhases.put("B", "PREPARING");
+        // 备战时限从阵容展示结束后才开始计，避免展示的 5 秒被算进准备时间。
+        armSideDeadline(match, "A", "PREPARING", displayUntil);
+        armSideDeadline(match, "B", "PREPARING", displayUntil);
     }
 
     public String attackSidePhase(ObjectNode match, String side) {
@@ -948,8 +973,21 @@ public class ParallelTournamentService {
             throw new IllegalStateException("当前不是本队的" + expected + "阶段");
     }
 
+    /** 切换本方阶段时同步维护截止时间：等人的阶段自动上时限，不等人的阶段撤掉。 */
     public void setAttackSidePhase(ObjectNode match, String side, String phase) {
         match.withObject("/sidePhases").put(side, phase);
+        armSideDeadline(match, side, phase, System.currentTimeMillis());
+    }
+
+    private void armSideDeadline(ObjectNode match, String side, String phase, long from) {
+        long duration = switch (phase) {
+            case "PREPARING" -> PREPARE_DURATION_MS;
+            case "ROLL" -> ROLL_DURATION_MS;
+            case "PITCHER_ROLL" -> PITCHER_DURATION_MS;
+            default -> 0L;
+        };
+        ObjectNode deadlines = match.withObject("/sideDeadlines");
+        if (duration > 0) deadlines.put(side, from + duration); else deadlines.remove(side);
     }
 
     private boolean contains(JsonNode values, String expected) {
@@ -1259,6 +1297,9 @@ public class ParallelTournamentService {
             boolean votingChanged = expireVoting(root, now);
             boolean prophetChanged = expireProphets(root, now);
             boolean countdownChanged = expireAttackCountdowns(root, now);
+            List<Runnable> onlineActions = new ArrayList<>();
+            boolean lineupChanged = expireLineups(root, now, onlineActions);
+            boolean sideChanged = expireAttackSides(root, now, onlineActions);
             boolean resultChanged = false;
             var iterator = root.path("matches").elements();
             while (iterator.hasNext()) {
@@ -1270,15 +1311,19 @@ public class ParallelTournamentService {
                     resultChanged = true;
                 }
             }
-            boolean changed = accumulationChanged || votingChanged || prophetChanged || countdownChanged || resultChanged;
+            boolean changed = accumulationChanged || votingChanged || prophetChanged || countdownChanged
+                    || lineupChanged || sideChanged || resultChanged;
             if (!changed) return;
             advance(root);
             driveSandboxAfterAdvance(root);
             record.update(root.toString(), "system");
             states.save(record);
+            // 联机侧的动作要等本次状态提交后再执行，否则它们触发的事件监听会读到旧状态并互相覆盖。
+            dispatchAfterCommit(onlineActions);
             if (root.hasNonNull("champion")) {
                 events.stateChanged();
             } else if (accumulationChanged || prophetChanged || countdownChanged || resultChanged
+                    || lineupChanged || sideChanged
                     || !stageBefore.equals(root.path("stage").asText())) {
                 events.gameChanged();
             } else if (votingChanged) {
@@ -1332,6 +1377,86 @@ public class ParallelTournamentService {
         return changed;
     }
 
+    /** 队长迟迟不交阵容：按在场且非托管的队员自动补齐 5 人（含 ≥1 后端），本局照常开打。 */
+    boolean expireLineups(ObjectNode root, long now, List<Runnable> onlineActions) {
+        if (!"ATTACK".equals(root.path("stage").asText())) return false;
+        boolean changed = false;
+        for (JsonNode matchNode : root.path("matches")) {
+            ObjectNode match = (ObjectNode) matchNode;
+            if (!"active".equals(match.path("status").asText())
+                    || !"LINEUP".equals(match.path("phase").asText())) continue;
+            if (!match.has("lineupDeadlineAt")) {
+                match.put("lineupDeadlineAt", now + LINEUP_DURATION_MS);
+                changed = true;
+                continue;
+            }
+            if (match.path("lineupDeadlineAt").asLong() > now) continue;
+            ObjectNode submitted = match.withObject("/submitted");
+            for (String side : List.of("A", "B")) {
+                if (submitted.path("lineup" + side).asBoolean()) continue;
+                match.withObject("/lineups").set(side, simulatedLineup(root, teamForSide(match, side)));
+                submitted.put("lineup" + side, true);
+                match.withObject("/lineupTimedOut").put(side, true);
+            }
+            startParallelAttack(match);
+            String teamA = match.path("a").asText(), teamB = match.path("b").asText();
+            List<String> lineupA = lineupOf(match, "A"), lineupB = lineupOf(match, "B");
+            onlineActions.add(() -> { online.prepare(teamA, lineupA); online.prepare(teamB, lineupB); });
+            changed = true;
+        }
+        return changed;
+    }
+
+    /**
+     * 攻擂阶段等不到人时的兜底。规则与手册一致：缺席位置的骰子由系统自动补掷，
+     * 但该队本局的同步增益失效，点数仍然有效。
+     */
+    boolean expireAttackSides(ObjectNode root, long now, List<Runnable> onlineActions) {
+        if (!"ATTACK".equals(root.path("stage").asText())) return false;
+        boolean changed = false;
+        for (JsonNode matchNode : root.path("matches")) {
+            ObjectNode match = (ObjectNode) matchNode;
+            if (!"active".equals(match.path("status").asText())
+                    || !"ATTACKING".equals(match.path("phase").asText())) continue;
+            for (String side : List.of("A", "B")) {
+                if (match.at("/sideDeadlines/" + side).asLong(Long.MAX_VALUE) > now) continue;
+                String teamId = teamForSide(match, side);
+                switch (attackSidePhase(match, side)) {
+                    case "PREPARING" -> {
+                        // 不再等不到场的队员准备，直接下达口令；在场的人照常点击。
+                        match.withObject("/sideTimedOut").put(side, "prepare");
+                        setAttackSidePhase(match, side, "ROLL");
+                        onlineActions.add(() -> online.forceStart(teamId));
+                        changed = true;
+                    }
+                    case "ROLL" -> {
+                        // 直接在本次事务里推进，不依赖联机事件回传：事件监听器有自己的事务，
+                        // 由本方法触发时无法保证写回，状态与联机会话会就此分叉。
+                        match.withObject("/sideTimedOut").put(side, "roll");
+                        match.withObject("/timing").put("syncOk" + side, false);   // 人不齐，同步增益失效
+                        setAttackSidePhase(match, side, "PITCHER_ROLL");
+                        onlineActions.add(() -> online.forceTiming(teamId));
+                        changed = true;
+                    }
+                    case "PITCHER_ROLL" -> {
+                        match.withObject("/sideTimedOut").put(side, "pitcher");
+                        armSideDeadline(match, side, "PITCHER_ROLL", now);
+                        onlineActions.add(() -> { online.forceTiming(teamId); online.finalRoll(teamId); });
+                        changed = true;
+                    }
+                    default -> { }
+                }
+            }
+        }
+        return changed;
+    }
+
+    private List<String> lineupOf(ObjectNode match, String side) {
+        List<String> lineup = new ArrayList<>();
+        match.at("/lineups/" + side).forEach(id -> lineup.add(id.asText()));
+        return lineup;
+    }
+
     boolean expireAttackCountdowns(ObjectNode root, long now) {
         boolean changed = false;
         for (JsonNode matchNode : root.path("matches")) {
@@ -1345,6 +1470,64 @@ public class ParallelTournamentService {
             }
         }
         return changed;
+    }
+
+    /**
+     * 兜底动作必须在本次事务提交后、且在另一个线程上执行。
+     * 这些动作会触发 onDiceReveal 等 @Transactional 监听器，若仍在提交完成的事务上下文里调用，
+     * 监听器会加入那个已结束的事务，它的 states.save() 不会真正落库。
+     */
+    private void dispatchAfterCommit(List<Runnable> actions) {
+        if (actions.isEmpty()) return;
+        Runnable batch = () -> actions.forEach(ParallelTournamentService::runQuietly);
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override public void afterCommit() { timeoutExecutor.execute(batch); }
+            });
+        } else timeoutExecutor.execute(batch);
+    }
+
+    /** 单个兜底动作失败不应该影响其它场次，也不应该让定时扫描中断。 */
+    private static void runQuietly(Runnable action) {
+        try { action.run(); } catch (RuntimeException ignored) { }
+    }
+
+    /**
+     * 管理员强制推进某一场：把该场所有等待中的截止时间提前到现在，
+     * 由同一套超时逻辑在下一次扫描（500ms 内）完成推进，不另开一条代码路径。
+     */
+    @Transactional
+    public ForceResult forceMatch(String matchId) {
+        GameStateRecord record = states.findLockedById(1L)
+                .orElseThrow(() -> new IllegalStateException("比赛尚未开始"));
+        ObjectNode root = readState(record);
+        if (root == null || !root.path("matches").has(matchId)) throw new IllegalArgumentException("场次不存在");
+        ObjectNode match = (ObjectNode) root.path("matches").path(matchId);
+        if (!"active".equals(match.path("status").asText())) throw new IllegalStateException("该场次已经结束");
+        long past = System.currentTimeMillis() - 1;
+        List<String> forced = new ArrayList<>();
+        String phase = match.path("phase").asText();
+        if ("PROPHET".equals(phase)) { match.put("prophetDeadlineAt", past); forced.add("军师预言"); }
+        if ("LINEUP".equals(phase)) { match.put("lineupDeadlineAt", past); forced.add("队长选阵容"); }
+        if ("ATTACKING".equals(phase)) {
+            for (String side : List.of("A", "B")) {
+                String sidePhase = attackSidePhase(match, side);
+                if (List.of("PREPARING", "ROLL", "PITCHER_ROLL").contains(sidePhase)) {
+                    match.withObject("/sideDeadlines").put(side, past);
+                    forced.add(side + " 方" + switch (sidePhase) {
+                        case "PREPARING" -> "备战准备";
+                        case "ROLL" -> "同步点击";
+                        default -> "最终投骰";
+                    });
+                } else if ("COUNTDOWN".equals(sidePhase)) {
+                    match.withObject("/countdownUntil").put(side, past);
+                    forced.add(side + " 方倒计时");
+                }
+            }
+        }
+        if (forced.isEmpty()) throw new IllegalStateException("该场次当前没有可强制推进的环节");
+        record.update(root.toString(), "admin"); states.save(record); events.gameChanged();
+        return new ForceResult(matchId, phase, forced);
     }
 
     private void driveSandboxAfterAdvance(ObjectNode root) {
@@ -1493,6 +1676,9 @@ public class ParallelTournamentService {
         root.put("overallChampion", ranking.get(0).path("id").asText());
     }
 
+    @jakarta.annotation.PreDestroy
+    void shutdownTimeoutExecutor() { timeoutExecutor.shutdownNow(); }
+
     @Transactional
     public void resetTwoDayTournament() {
         if (states.existsById(1L)) states.deleteById(1L);
@@ -1516,4 +1702,5 @@ public class ParallelTournamentService {
     public record TestStep(int advancedMatches, String champion, String phase) {}
     public record AdminAccumulationResult(String teamId, int rolledCount, int accumulationPoints, String stage) {}
     public record AdminRoleAssignment(String teamId, String role, String playerId, String nextRole, String stage) {}
+    public record ForceResult(String matchId, String phase, List<String> forced) {}
 }

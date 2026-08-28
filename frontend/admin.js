@@ -53,6 +53,7 @@
     document.getElementById('match-grid').innerHTML = gameState&&gameState.stage==='ACCUMULATION'
       ? gameState.teams.map(accumulationAdminHtml).join('') : gameState&&gameState.matches
         ? TournamentUI.matches(gameState).map(tournamentMatchHtml).join('') : data.matches.map(matchHtml).join('');
+    bindForceButtons();
     renderFlowMonitor();
     document.getElementById('roster-count').textContent = participants.length + ' 名已分组 · ' + (users.length - participants.length) + ' 名观战';
     document.getElementById('admin-roster').innerHTML = data.teams.map(teamRoster).join('');
@@ -185,11 +186,33 @@
       ? '<p class="match-attack-line">积累攻击 ' + (stateA.accumulationPoints || 0) + ' × ' + Number(stateA.growthCoefficient || 1).toFixed(4) + ' / ' + (stateB.accumulationPoints || 0) + ' × ' + Number(stateB.growthCoefficient || 1).toFixed(4) + '</p>' : '';
     return '<article class="watch-card"><small>GROUP ' + match.number + ' · ' + ((a ? a.members.length : 0) + (b ? b.members.length : 0)) + '/60 人</small><div><b>' + esc(match.nameA) + '</b><strong>' + match.scoreA + ' : ' + match.scoreB + '</strong><b>' + esc(match.nameB) + '</b></div><p>' + (a ? a.readyCount : 0) + '/' + (a ? a.members.length : 0) + ' 准备 · ' + (b ? b.readyCount : 0) + '/' + (b ? b.members.length : 0) + ' 准备</p>' + attackLine + '</article>';
   }
+  var forceBound = false;
+  /** 现场兜底：某一环节等不到人时，管理员可以立刻推进本局。 */
+  function bindForceButtons() {
+    if (forceBound) return;
+    forceBound = true;
+    document.getElementById('match-grid').addEventListener('click', function (event) {
+      var button = event.target.closest ? event.target.closest('[data-force-match]') : null;
+      if (!button) return;
+      var matchId = button.getAttribute('data-force-match');
+      if (!window.confirm('确认强制推进本局？系统会立即按超时规则处理当前等待中的环节。')) return;
+      button.disabled = true;
+      api('/api/admin/matches/' + encodeURIComponent(matchId) + '/force', 'POST')
+        .then(function (result) {
+          button.textContent = '已推进：' + (result && result.forced ? result.forced.join('、') : matchId);
+        })
+        .catch(function (error) {
+          button.disabled = false;
+          window.alert(error && error.message ? error.message : '推进失败');
+        });
+    });
+  }
+
   function tournamentMatchHtml(match) {
     var stage=TournamentUI.stage(match),teams=gameState.teams||[],a=teams.find(function(team){return team.id===match.a;}),b=teams.find(function(team){return team.id===match.b;}),rollA=match.rolls&&match.rolls.A,rollB=match.rolls&&match.rolls.B;
     var detail=match.status==='done'?'胜者 · '+esc((teams.find(function(team){return team.id===match.winner;})||{}).name||match.winner):match.phase==='RESULT'?'本场结果展示中':'单轮攻擂进行中';
     var attack=rollA&&rollA.finalAttack!=null||rollB&&rollB.finalAttack!=null?'<p class="match-attack-line">最终攻击 '+(rollA&&rollA.finalAttack!=null?Number(rollA.finalAttack).toFixed(2):'--')+' / '+(rollB&&rollB.finalAttack!=null?Number(rollB.finalAttack).toFixed(2):'--')+'</p>':'';
-    return '<article class="watch-card tournament-card '+(match.status==='active'?'is-live':'is-history')+'"><small><span>'+esc(stage.label)+'</span><i>'+TournamentUI.status(match)+'</i></small><div><b>'+esc(a?a.name:match.a)+'</b><strong>'+Number(match.winsA||0)+' : '+Number(match.winsB||0)+'</strong><b>'+esc(b?b.name:match.b)+'</b></div><p>'+detail+'</p>'+attack+'</article>';
+    return '<article class="watch-card tournament-card '+(match.status==='active'?'is-live':'is-history')+'"><small><span>'+esc(stage.label)+'</span><i>'+TournamentUI.status(match)+'</i></small><div><b>'+esc(a?a.name:match.a)+'</b><strong>'+Number(match.winsA||0)+' : '+Number(match.winsB||0)+'</strong><b>'+esc(b?b.name:match.b)+'</b></div><p>'+detail+'</p>'+attack+(match.status==='active'?'<button class="btn btn-ghost btn-force" data-force-match="'+esc(match.id)+'">强制推进本局</button>':'')+'</article>';
   }
   function accumulationAdminHtml(team) {
     var quota=team.accumulationQuota||0,rolled=team.accumulationRolled||0,done=rolled>=quota,rolling=team.accumulationRolling;

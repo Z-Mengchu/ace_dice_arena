@@ -158,6 +158,12 @@ public class LobbyController {
     @PostMapping("/admin/random-group")
     public ResponseEntity<?> randomGroup(HttpSession s) { return adminOnly(s, performance::randomGroup); }
 
+    /** 现场兜底：把该场次当前等待环节的截止时间提前，由定时扫描按同一套超时逻辑推进。 */
+    @PostMapping("/admin/matches/{matchId}/force")
+    public ResponseEntity<?> forceMatch(@PathVariable String matchId, HttpSession s) {
+        return adminOnly(s, () -> tournament.forceMatch(matchId));
+    }
+
     @GetMapping("/admin/test-mode/status")
     public ResponseEntity<?> testModeStatus(HttpSession s) { return adminOnly(s, testMode::status); }
 
