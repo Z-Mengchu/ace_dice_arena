@@ -141,8 +141,13 @@ java -jar target/ace-dice-arena-1.0.0.jar --server.port=9000
 ## 500 人同时入场部署
 
 不要让登录页、CSS 和 JavaScript 与游戏接口共同占用 Spring Boot 请求线程。项目已提供
-`deploy/nginx-ace-dice-arena.conf`：它会从 `/home/app/game/frontend/dist` 直接返回构建后的页面和静态资源，
-仅把 `/api/` 请求转发到 8082 端口，并为两个 SSE 地址关闭代理缓冲。
+`deploy/nginx-ace-dice-arena.conf`：它会从 `/home/app/game/frontend/dist` 直接返回登录页和全部静态资源
+（`/assets/` 是流量大头），把 `/api/` 请求转发到 8082 端口，并为两个 SSE 地址关闭代理缓冲。
+
+**注意：`/lobby`、`/admin`、`/player`、`/sandbox-player` 必须交给后端，不要配成 Nginx 直发静态文件。**
+这些页面需要登录态，一旦由 Nginx 直接返回，后端的 `LoginFilter` 就看不到请求，未登录的人也能打开页面，
+随后页面里的 `/api/*` 全部返回 401，界面上表现为"未连接到联机服务器"这种与真实原因无关的报错。
+它们只是几 KB 的 HTML，占用的请求线程可以忽略。
 
 ```bash
 sudo cp deploy/nginx-ace-dice-arena.conf /etc/nginx/conf.d/ace-dice-arena.conf

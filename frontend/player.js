@@ -58,12 +58,47 @@
     });
   }
 
-  function getState() {
-    return fetch('/api/state').then(function (r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
+  /**
+   * 统一的 GET 取数。三类失败必须区分开，否则现场排查会被带偏：
+   *   401  → 未登录（生产由 nginx 直接发页面，绕过了后端的登录跳转），直接去登录页
+   *   非 JSON → 接口被代理到了别的服务（例如落进了别家的 SPA 兜底），不是"服务器没开"
+   *   其它 → 带上服务端给的真实原因和路径
+   */
+  var redirectingToLogin = false;
+
+  function getJson(path, allowNoContent) {
+    return fetch(path).catch(function () {
+      // fetch 本身失败 = 根本没连上（服务没起、地址错、断网），别把浏览器的英文原文甩给现场人员
+      throw new Error('连不上服务器（' + path + '）');
+    }).then(function (r) {
+      if (r.status === 401) {
+        // 五个请求并发，过期时会同时 401；只跳一次
+        if (!redirectingToLogin) { redirectingToLogin = true; location.replace('/login.html?next=player'); }
+        var authError = new Error('未登录');
+        authError.status = 401;
+        authError.handled = true;
+        throw authError;
+      }
+      if (allowNoContent && r.status === 204) return null;
+      return r.text().then(function (text) {
+        var body = null;
+        try { body = text ? JSON.parse(text) : null; }
+        catch (ignore) {
+          var e = new Error(path + ' 返回的不是 JSON（该地址可能被代理到了别的服务）');
+          e.status = r.status;
+          throw e;
+        }
+        if (!r.ok) {
+          var failure = new Error((body && body.error) || (path + ' 返回 HTTP ' + r.status));
+          failure.status = r.status;
+          throw failure;
+        }
+        return body;
+      });
     });
   }
+
+  function getState() { return getJson('/api/state'); }
 
   /* ==================== 2. 状态 ==================== */
 
@@ -538,10 +573,14 @@
   /* ---------- 4.4 无服务器错误页 ---------- */
 
   function renderError(root) {
+    var waiting = ui.errStatus === 409;   // 409 是"还没轮到你"，不是故障
     root.innerHTML =
-      '<div class="pl-title">⚠ 未连接到联机服务器</div>' +
+      '<div class="pl-title">' + (waiting ? '⏳ 当前无法进入掷骰端' : '⚠ 无法读取比赛数据') + '</div>' +
       '<div class="pl-status err">' + esc(ui.errText || '无法访问服务器') + '</div>' +
-      '<div class="pl-sub">请确认：① 主持人已启动服务器；② 本机与主持人电脑在同一局域网；③ 通过服务器地址访问本页（形如 http://服务器IP:8080/player ）。</div>' +
+      '<div class="pl-sub">' + (waiting
+        ? '这不是故障：等主持人开赛、并且本局你被队长选进出战五人后，本页会自动可用。'
+        : '请确认：① 后端服务与数据库正常运行；② 本页地址与接口是同一个服务（形如 http://服务器地址:端口/player）；③ 登录状态未过期。')
+      + '</div>' +
       '<div class="pl-foot"><button id="pl-retry" class="btn btn-primary btn-xl">重试连接</button></div>';
     $('#pl-retry').onclick = boot;
   }
@@ -551,13 +590,10 @@
   function boot() {
     Promise.all([
       getState(),
-      fetch('/api/auth/me').then(function (r) {
-        if (r.status === 401) { location.replace('/login.html?next=player'); throw new Error('login required'); }
-        return r.json();
-      }),
-      fetch('/api/game-state').then(function (r) { return r.status === 204 ? null : r.json(); }),
-      fetch('/api/lobby').then(function (r) { return r.json(); }),
-      fetch('/api/roll-assignment').then(function (r) { return r.json().then(function (body) { if (!r.ok) throw new Error(body.error || '无法读取本局阵容'); return body; }); })
+      getJson('/api/auth/me'),
+      getJson('/api/game-state', true),
+      getJson('/api/lobby'),
+      getJson('/api/roll-assignment')
     ]).then(function (result) {
       var st = result[0];
       loginUser = result[1];
@@ -601,11 +637,18 @@
           my = { teamId: assignedTeam, slot: res.slot, name: loginUser.displayName, username: loginUser.username, token: res.token };
           saveMy(); connectSSE(); ui.screen = 'main'; ui.sub = 'calibrating'; ui.calibText = '正在自动校准时钟（5 次 ping）…'; render();
           calibrate(5, finishCalibration);
-        }).catch(function (error) { ui.errText = error.message || '无法加入本局投骰席位'; ui.screen = 'error'; render(); });
+        }).catch(function (error) {
+          ui.errText = error.message || '无法加入本局投骰席位';
+          ui.errStatus = error && error.status;
+          ui.screen = 'error';
+          render();
+        });
       }
-    }).catch(function () {
+    }).catch(function (error) {
+      if (error && error.handled) return;   // 401 已经在跳登录页，不要再闪一屏误导性报错
       setNet('未连接', true);
-      ui.errText = '无法访问 /api/state';
+      ui.errText = (error && error.message) || '无法访问服务器';
+      ui.errStatus = error && error.status;
       ui.screen = 'error';
       render();
     });
