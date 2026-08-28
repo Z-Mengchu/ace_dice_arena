@@ -34,7 +34,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                org.mockito.Mockito.mock(LobbyEventService.class), 1_000L);
+                org.mockito.Mockito.mock(LobbyEventService.class), 1_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
         var dice = java.util.List.of(
                 new OnlineGameService.DiceResult(1, 2, 1d, false), new OnlineGameService.DiceResult(2, 3, 2d, false),
                 new OnlineGameService.DiceResult(3, 4, 3d, false), new OnlineGameService.DiceResult(4, 5, 4d, false),
@@ -61,7 +61,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L);
+                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
         var root = mapper.createObjectNode(); root.put("stage", "ROLE_VOTE");
         var team = root.putArray("teams").addObject();
         team.put("id", "t1"); team.put("roleVoteStage", "captain");
@@ -87,7 +87,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L);
+                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
         var root = mapper.createObjectNode(); root.put("stage", "ROLE_VOTE");
         var team = root.putArray("teams").addObject();
         team.put("id", "t1"); team.put("roleVoteStage", "captain"); team.put("roleVoteDeadlineAt", 1_000L);
@@ -128,7 +128,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                events, 6_000L);
+                events, 6_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
 
         service.assignCurrentRole("t1", "captain", "u1", "admin");
         var afterCaptain = mapper.readTree(record.getContent());
@@ -163,7 +163,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L);
+                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
 
         service.assignCurrentRole("t1", "captain", "u1", "admin");
         assertThat(mapper.readTree(record.getContent()).at("/teams/0/roles/captain").asText()).isEqualTo("u1");
@@ -181,7 +181,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L);
+                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
         var root = mapper.createObjectNode(); root.put("stage", "ATTACK");
         var match = root.putObject("matches").putObject("g1");
         match.put("status", "active"); match.put("phase", "PROPHET"); match.put("prophetDeadlineAt", 10_000L);
@@ -207,7 +207,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L);
+                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
         var match = mapper.createObjectNode();
         match.put("prophetDeadlineAt", System.currentTimeMillis() - 1L);
 
@@ -234,7 +234,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                events, 6_000L);
+                events, 6_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
 
         var result = service.rollRemainingAccumulation("t1", "admin");
         var saved = mapper.readTree(record.getContent());
@@ -263,7 +263,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L);
+                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
 
         assertThatThrownBy(() -> service.rollRemainingAccumulation("t1", "admin"))
                 .hasMessage("该队有玩家正在掷积累骰，请等待本次结果");
@@ -277,7 +277,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), new ObjectMapper(),
-                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L);
+                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
         var root = new ObjectMapper().createObjectNode();
         root.put("stage", "ROLE_VOTE");
         var player = new UserAccount("voter", "投票玩家", "销售部", "USER", "hash", "salt");
@@ -296,7 +296,7 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L);
+                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
         var root = mapper.createObjectNode();
         root.put("stage", "ACCUMULATION");
         var team = root.putArray("teams").addObject();

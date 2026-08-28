@@ -2,6 +2,8 @@ package com.acedicearena.service;
 
 import com.acedicearena.domain.GameStateRecord;
 import com.acedicearena.domain.UserAccount;
+import com.acedicearena.domain.BattleReport;
+import com.acedicearena.repository.BattleReportRepository;
 import com.acedicearena.repository.GameControlRepository;
 import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.PerformanceRecordRepository;
@@ -41,14 +43,17 @@ public class ParallelTournamentService {
     private final ObjectMapper mapper;
     private final LobbyEventService events;
     private final long resultDisplayMs;
+    private final BattleReportRepository reports;
 
     public ParallelTournamentService(GameStateRepository states, UserAccountRepository users,
                                      PerformanceRecordRepository performances,
                                      GameControlRepository controls, ObjectMapper mapper, LobbyEventService events,
-                                     @Value("${app.game.result-display-ms:6000}") long resultDisplayMs) {
+                                     @Value("${app.game.result-display-ms:6000}") long resultDisplayMs,
+                                     BattleReportRepository reports) {
         this.states = states; this.users = users; this.performances = performances;
         this.controls = controls; this.mapper = mapper; this.events = events;
         this.resultDisplayMs = Math.max(0, resultDisplayMs);
+        this.reports = reports;
     }
 
     @Transactional
@@ -702,20 +707,61 @@ public class ParallelTournamentService {
         }
     }
 
+    /**
+     * 沙盘助攻：只在"一方有真实玩家、另一方没有"时干预，保证真人能一直打到下一轮。
+     * 两边都有真人时让他们真打；两边都没有真人时完全不干预——否则整个签表会被固定成编号在前的队伍晋级。
+     */
     private void settleSandboxRound(ObjectNode root, List<ObjectNode> active, Set<String> controlledTeams) {
         for (ObjectNode match : active) {
-            boolean aControlled = controlledTeams.contains(match.path("a").asText());
-            boolean bControlled = controlledTeams.contains(match.path("b").asText());
-            String forcedSide = aControlled == bControlled ? (aControlled ? null : "A") : (aControlled ? "A" : "B");
-            if (forcedSide != null) {
-                String loserSide = "A".equals(forcedSide) ? "B" : "A";
-                ObjectNode winnerRoll = (ObjectNode) match.at("/rolls/" + forcedSide);
-                double loserAttack = match.at("/rolls/" + loserSide + "/attack").asDouble();
-                winnerRoll.put("attack", Math.max(winnerRoll.path("attack").asDouble(), loserAttack + 10));
-                winnerRoll.put("sandboxAssisted", true);
-            }
+            String forcedSide = forcedSandboxSide(controlledTeams.contains(match.path("a").asText()),
+                    controlledTeams.contains(match.path("b").asText()));
+            if (forcedSide != null) assistSandboxSide(match, forcedSide);
             enterResult(root, match);
         }
+    }
+
+    /** 只有"恰好一方有真实玩家"时才助攻；两边都有或都没有真人，一律让骰子说话。 */
+    static String forcedSandboxSide(boolean aControlled, boolean bControlled) {
+        return aControlled == bControlled ? null : (aControlled ? "A" : "B");
+    }
+
+    /**
+     * 助攻的实现方式是"重掷出一手更好的骰子"，而不是直接改写攻击力。
+     * 攻击力始终由骰子按同一套公式算出，大屏上的点数和分数必须永远对得上。
+     */
+    void assistSandboxSide(ObjectNode match, String forcedSide) {
+        String loserSide = "A".equals(forcedSide) ? "B" : "A";
+        ObjectNode winnerRoll = (ObjectNode) match.at("/rolls/" + forcedSide);
+        if (winnerRoll == null) return;
+        double target = match.at("/rolls/" + loserSide + "/attack").asDouble() + 10;
+        if (winnerRoll.path("attack").asDouble() >= target) return;
+        writeRoll(winnerRoll, diceWithSum((int) Math.ceil(target / 1.5)), true);
+        winnerRoll.put("sandboxAssisted", true);
+    }
+
+    /** 生成一组和为 target（自动夹到 5..30）的五枚骰子，顺序打乱以免每次都是同一种形状。 */
+    List<Integer> diceWithSum(int target) {
+        int remaining = Math.min(30, Math.max(5, target)) - 5;
+        List<Integer> dice = new ArrayList<>(List.of(1, 1, 1, 1, 1));
+        for (int index = 0; index < dice.size() && remaining > 0; index++) {
+            int add = Math.min(5, remaining);
+            dice.set(index, 1 + add);
+            remaining -= add;
+        }
+        java.util.Collections.shuffle(dice);
+        return dice;
+    }
+
+    /** 骰子是唯一事实来源：同步加成与豹子倍率都在这里统一结算，避免分数和点数对不上。 */
+    private void writeRoll(ObjectNode roll, List<Integer> dice, boolean sync) {
+        ArrayNode array = roll.putArray("dice");
+        int sum = 0;
+        for (int die : dice) { array.add(die); sum += die; }
+        boolean leopard = dice.size() == 5 && dice.stream().distinct().count() == 1;
+        double attack = sum * (sync ? 1.5 : 1) * (leopard ? 3 : 1);
+        roll.put("syncOk", sync);
+        roll.put("attack", Math.round(attack * 100d) / 100d);
+        roll.put("fatigued", false);
     }
 
     private JsonNode sandboxPlayer(ObjectNode root, String username) {
@@ -960,15 +1006,10 @@ public class ParallelTournamentService {
     private void simulateRoll(ObjectNode root, ObjectNode match, String side) {
         Random random = new Random();
         ObjectNode roll = match.withObject("/rolls").putObject(side);
-        ArrayNode dice = roll.putArray("dice");
-        int sum = 0;
-        for (int i = 0; i < 5; i++) { int die = random.nextInt(6) + 1; dice.add(die); sum += die; }
+        List<Integer> dice = new ArrayList<>();
+        for (int i = 0; i < 5; i++) dice.add(random.nextInt(6) + 1);
         JsonNode timingSync = match.at("/timing/syncOk" + side);
-        boolean sync = timingSync.isBoolean() ? timingSync.asBoolean() : random.nextBoolean();
-        roll.put("syncOk", sync);
-        String teamId = match.path("A".equals(side) ? "a" : "b").asText();
-        double attack = sum * (sync ? 1.5 : 1);
-        roll.put("attack", Math.round(attack * 100d) / 100d); roll.put("fatigued", false);
+        writeRoll(roll, dice, timingSync.isBoolean() ? timingSync.asBoolean() : random.nextBoolean());
     }
 
     private void simulateTiming(ObjectNode match, String side) {
@@ -1088,6 +1129,8 @@ public class ParallelTournamentService {
     }
 
     private void enterResult(ObjectNode root, ObjectNode match) {
+        // 同一局只结算一次：沙盘推进和定时扫描都可能再次走到这里，重复结算会把胜场算两遍、战报写两条。
+        if ("RESULT".equals(match.path("phase").asText())) return;
         boolean prophetA = prophetHit(match, "A", "B");
         boolean prophetB = prophetHit(match, "B", "A");
         match.putObject("prophetResults").put("A", prophetA).put("B", prophetB);
@@ -1104,6 +1147,48 @@ public class ParallelTournamentService {
         match.put("phase", "RESULT");
         match.put("resultReadyAt", System.currentTimeMillis() + resultDisplayMs);
         match.put("matchPoint", true);
+        recordRoundReport(root, match, winnerSide);
+    }
+
+    /**
+     * 每局结算写一条战报。手册第 8 章把"战报日志"作为争议裁定依据，
+     * 所以它必须落库成可追加、可回放的记录，而不是只存在于会被整份覆盖的比赛状态 JSON 里。
+     */
+    private void recordRoundReport(ObjectNode root, ObjectNode match, String winnerSide) {
+        String text = roundLabel(match.path("id").asText())
+                + " " + sideReport(root, match, "A")
+                + " ｜ " + sideReport(root, match, "B")
+                + " ｜ 胜者 " + teamName(root, teamForSide(match, winnerSide));
+        reports.save(new BattleReport(text, "system"));
+    }
+
+    private String sideReport(ObjectNode root, ObjectNode match, String side) {
+        JsonNode roll = match.at("/rolls/" + side);
+        List<String> faces = new ArrayList<>();
+        int sum = 0;
+        for (JsonNode die : roll.path("dice")) { faces.add(die.asText()); sum += die.asInt(); }
+        StringBuilder text = new StringBuilder(teamName(root, teamForSide(match, side)))
+                .append(" 骰子 ").append(String.join("+", faces)).append("=").append(sum);
+        if (roll.path("syncOk").asBoolean()) text.append(" 同步×1.5");
+        if (roll.path("prophetBonus").asInt() > 0) text.append(" 预言+2");
+        if (roll.path("sandboxAssisted").asBoolean()) text.append(" [沙盘助攻]");
+        return text.append(" 攻擂 ").append(roll.path("attackPhaseAttack").asDouble())
+                .append("，积累 ").append(roll.path("accumulationAttack").asDouble())
+                .append("，系数 ").append(roll.path("growthCoefficient").asDouble())
+                .append("，总攻击 ").append(roll.path("finalAttack").asDouble()).toString();
+    }
+
+    private String roundLabel(String matchId) {
+        if (matchId.startsWith("g")) return "【1/4 决赛 " + matchId + "】";
+        if (matchId.startsWith("s")) return "【半决赛 " + matchId + "】";
+        return "【决赛 " + matchId + "】";
+    }
+
+    private String teamName(ObjectNode root, String teamId) {
+        for (JsonNode team : root.path("teams")) {
+            if (teamId.equals(team.path("id").asText())) return team.path("name").asText(teamId);
+        }
+        return teamId;
     }
 
     private String singleRoundWinner(ObjectNode match, double finalA, double finalB) {
@@ -1310,8 +1395,10 @@ public class ParallelTournamentService {
         if (!matches.has("f1") && done(matches, "s1") && done(matches, "s2")) {
             createMatch(matches, "f1", winner(matches, "s1"), winner(matches, "s2"));
         }
-        if (done(matches, "f1")) {
+        if (done(matches, "f1") && !root.hasNonNull("champion")) {
             root.put("champion", winner(matches, "f1"));
+            reports.save(new BattleReport("【冠军】第 " + root.path("day").asInt(1) + " 天擂主产生："
+                    + teamName(root, winner(matches, "f1")), "system"));
             saveDayResult(root);
             controls.findById(1L).ifPresent(control -> control.changePhase("FINISHED"));
         }

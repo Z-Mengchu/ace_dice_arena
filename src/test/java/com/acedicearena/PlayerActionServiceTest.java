@@ -46,7 +46,7 @@ class PlayerActionServiceTest {
         GameStateRecord record = new GameStateRecord(1L, json, "admin");
         when(states.findLockedById(1L)).thenReturn(Optional.of(record));
         ParallelTournamentService tournament = new ParallelTournamentService(states, users,
-                mock(PerformanceRecordRepository.class), mock(GameControlRepository.class), mapper, events, 0);
+                mock(PerformanceRecordRepository.class), mock(GameControlRepository.class), mapper, events, 0, org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class));
         PlayerActionService service = new PlayerActionService(states, users, mapper, events, online, tournament);
 
         when(online.isTeamReady("t2")).thenReturn(true);
