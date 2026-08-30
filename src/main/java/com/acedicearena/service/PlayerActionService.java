@@ -120,9 +120,12 @@ public class PlayerActionService {
         if (command.startsWith("PREPARE_MATCH:")) {
             String matchId = command.substring("PREPARE_MATCH:".length());
             JsonNode match = root.at("/matches/" + matchId);
+            int round = match.path("round").asInt(1);
             action = () -> {
-                online.prepare(match.path("a").asText(), lineupFor(root, match.path("a").asText()));
-                online.prepare(match.path("b").asText(), lineupFor(root, match.path("b").asText()));
+                online.prepare(match.path("a").asText(), matchId, round,
+                        lineupFor(root, match.path("a").asText()));
+                online.prepare(match.path("b").asText(), matchId, round,
+                        lineupFor(root, match.path("b").asText()));
             };
         } else if (command.startsWith("START:")) {
             String teamId = command.substring("START:".length());
@@ -192,10 +195,15 @@ public class PlayerActionService {
                 match.withObject("/countdownUntil").put(side, System.currentTimeMillis() + 3_000L);
                 return "START:" + teamId;
             }
+            case "attack-boost" -> tournament.claimAttackBoost(root, match, user, side);
             case "pitcher-roll" -> {
                 tournament.requireRole(root, user, "pitcher", "只有当选王牌投手可以完成最终投骰");
                 tournament.requireAttackSidePhase(match, side, "PITCHER_ROLL");
                 if (!online.isTimingReady(teamId)) throw new IllegalStateException("请等待五名出战队员全部完成同步点击");
+                ObjectNode sync = match.withObject("/sync");
+                String pendingKey = "revealPending" + side;
+                if (sync.path(pendingKey).asBoolean()) throw new IllegalStateException("最终投骰正在处理，请勿重复点击");
+                sync.put(pendingKey, true);
                 return "REVEAL:" + teamId;
             }
             default -> throw new IllegalArgumentException("未知的玩家操作");

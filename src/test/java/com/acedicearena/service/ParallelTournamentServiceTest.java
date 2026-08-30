@@ -27,6 +27,9 @@ class ParallelTournamentServiceTest {
         match.putObject("sidePhases").put("A", "PITCHER_ROLL").put("B", "PITCHER_ROLL");
         match.putObject("lineups").putArray("A"); ((com.fasterxml.jackson.databind.node.ObjectNode) match.path("lineups")).putArray("B");
         match.putObject("prophet").putArray("A"); ((com.fasterxml.jackson.databind.node.ObjectNode) match.path("prophet")).putArray("B");
+        var boosts = match.putObject("attackBoost");
+        boosts.putObject("claimsA").put("u10", 1.2).put("u11", 1.4);
+        boosts.putObject("claimsB");
         match.putObject("rolls");
         var record = new GameStateRecord(1L, root.toString(), "system");
         org.mockito.Mockito.when(states.findLockedById(1L)).thenReturn(Optional.of(record));
@@ -51,6 +54,31 @@ class ParallelTournamentServiceTest {
         assertThat(settled.at("/matches/g1/phase").asText()).isEqualTo("RESULT");
         assertThat(settled.at("/matches/g1/rolls/A/finalAttack").isNumber()).isTrue();
         assertThat(settled.at("/matches/g1/rolls/B/finalAttack").isNumber()).isTrue();
+        assertThat(settled.at("/matches/g1/rolls/A/attackBoostMultiplier").asDouble()).isEqualTo(1.3);
+        assertThat(settled.at("/matches/g1/rolls/A/finalAttack").asDouble()).isEqualTo(57.2);
+        assertThat(settled.at("/matches/g1/rolls/B/attackBoostMultiplier").asDouble()).isEqualTo(1.0);
+    }
+
+    @Test
+    void attackBoostWindowStartsWithParallelAttackAndLastsTwentySeconds() {
+        var mapper = new ObjectMapper();
+        var service = new ParallelTournamentService(
+                org.mockito.Mockito.mock(com.acedicearena.repository.GameStateRepository.class),
+                org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
+                org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
+                org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
+                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L,
+                org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class),
+                org.mockito.Mockito.mock(com.acedicearena.service.OnlineGameService.class));
+        var match = mapper.createObjectNode();
+        long before = System.currentTimeMillis();
+
+        service.startParallelAttack(match);
+
+        long deadline = match.at("/attackBoost/deadlineAt").asLong();
+        assertThat(deadline).isBetween(before + 20_000L, System.currentTimeMillis() + 20_000L);
+        assertThat(match.at("/attackBoost/claimsA").isObject()).isTrue();
+        assertThat(match.at("/attackBoost/claimsB").isObject()).isTrue();
     }
 
     @Test

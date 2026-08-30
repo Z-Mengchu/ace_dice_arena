@@ -27,7 +27,8 @@ public class OnlineGameService {
     /** 每个设备的时钟探测记录，全部由服务端时间写入，客户端无法直接指定偏移。 */
     private final Map<String, ClockProbe> probes = new LinkedHashMap<>();
     private final Map<String, TeamRollSession> sessions = new LinkedHashMap<>();
-    private final Set<SseEmitter> emitters = ConcurrentHashMap.newKeySet();
+    /** SSE 订阅保留设备 token；同席位被顶替时主动断开旧连接。 */
+    private final Map<SseEmitter, String> emitters = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread thread = new Thread(r, "dice-reveal-timer");
         thread.setDaemon(true);
@@ -74,7 +75,12 @@ public class OnlineGameService {
         if (!TEAM_IDS.contains(teamId) || slot == null || slot < 1 || slot > SLOT_COUNT) {
             throw new IllegalArgumentException("invalid teamId or slot");
         }
-        devices.entrySet().removeIf(e -> e.getValue().teamId().equals(teamId) && e.getValue().slot() == slot);
+        List<String> replacedTokens = devices.entrySet().stream()
+                .filter(e -> e.getValue().teamId().equals(teamId) && e.getValue().slot() == slot)
+                .map(Map.Entry::getKey)
+                .toList();
+        replacedTokens.forEach(devices::remove);
+        replacedTokens.forEach(this::closeSubscribers);
         pruneProbes();
         String token = UUID.randomUUID().toString();
         devices.put(token, new Device(teamId, slot, limit(name, 32), playerId, 0, null, false, false));
@@ -120,28 +126,39 @@ public class OnlineGameService {
         publisher.publishEvent(new DiceReadinessChangedEvent(old.teamId()));
     }
 
-    public synchronized void prepare(String teamId, List<String> lineup) {
+    public synchronized void prepare(String teamId, String matchId, int round, List<String> lineup) {
         if (!TEAM_IDS.contains(teamId) || lineup == null || lineup.size() != SLOT_COUNT)
             throw new IllegalArgumentException("invalid lineup");
-        devices.entrySet().removeIf(entry -> {
-            Device device = entry.getValue();
-            return teamId.equals(device.teamId())
-                    && (device.playerId() == null || !device.playerId().equals(lineup.get(device.slot() - 1)));
-        });
+        if (matchId == null || matchId.isBlank() || round < 1)
+            throw new IllegalArgumentException("invalid match identity");
+        removeDevices(device -> teamId.equals(device.teamId())
+                && (device.playerId() == null || !device.playerId().equals(lineup.get(device.slot() - 1))));
         devices.replaceAll((token, device) -> teamId.equals(device.teamId())
                 ? new Device(device.teamId(), device.slot(), device.name(), device.playerId(), device.offset(), device.rtt(), device.calibrated(), false)
                 : device);
         pruneProbes();
-        sessions.put(teamId, new TeamRollSession(List.copyOf(lineup)));
+        sessions.put(teamId, new TeamRollSession(matchId, round, List.copyOf(lineup)));
         broadcast(Map.of("type", "prepare", "teamId", teamId));
+    }
+
+    /** Compatibility path for the legacy host-controlled flow. */
+    public synchronized void prepare(String teamId, List<String> lineup) {
+        prepare(teamId, "legacy-" + teamId, 1, lineup);
     }
 
     /**
      * 恢复数据库中仍处于备战阶段、但因应用重启而丢失的内存会话。
-     * 已存在的会话绝不能重建，否则会清空其他队员的准备状态。
+     * 仅场次、轮次和阵容完全相同时复用；身份变化必须重建，避免跨局串用准备状态。
      */
+    public synchronized void ensurePrepared(String teamId, String matchId, int round, List<String> lineup) {
+        TeamRollSession current = sessions.get(teamId);
+        if (current == null || !current.matches(matchId, round, lineup)) {
+            prepare(teamId, matchId, round, lineup);
+        }
+    }
+
     public synchronized void ensurePrepared(String teamId, List<String> lineup) {
-        if (!sessions.containsKey(teamId)) prepare(teamId, lineup);
+        ensurePrepared(teamId, "legacy-" + teamId, 1, lineup);
     }
 
     public synchronized boolean isTeamReady(String teamId) {
@@ -177,7 +194,7 @@ public class OnlineGameService {
 
     public synchronized void arm(String teamId) {
         if (!TEAM_IDS.contains(teamId)) throw new IllegalArgumentException("invalid teamId");
-        sessions.put(teamId, new TeamRollSession(List.of()));
+        sessions.put(teamId, new TeamRollSession("legacy-" + teamId, 1, List.of()));
         lastArmedTeam = teamId;
         broadcast(Map.of("type", "arm", "teamId", teamId));
     }
@@ -203,11 +220,8 @@ public class OnlineGameService {
 
     public synchronized void armAndGo(String teamId, List<String> lineup) {
         if (lineup == null || lineup.size() != SLOT_COUNT) throw new IllegalArgumentException("invalid lineup");
-        devices.entrySet().removeIf(entry -> {
-            Device device = entry.getValue();
-            return teamId.equals(device.teamId())
-                    && (device.playerId() == null || !device.playerId().equals(lineup.get(device.slot() - 1)));
-        });
+        removeDevices(device -> teamId.equals(device.teamId())
+                && (device.playerId() == null || !device.playerId().equals(lineup.get(device.slot() - 1))));
         pruneProbes();
         armAndGo(teamId);
     }
@@ -265,9 +279,10 @@ public class OnlineGameService {
         return device != null && (device.playerId() == null || device.playerId().equals(playerId));
     }
 
-    public synchronized boolean matchesAssignment(String token, String teamId, int slot) {
+    public synchronized boolean matchesAssignment(String token, String teamId, int slot, String playerId) {
         Device device = devices.get(token);
-        return device != null && device.teamId().equals(teamId) && device.slot() == slot;
+        return device != null && device.teamId().equals(teamId) && device.slot() == slot
+                && Objects.equals(device.playerId(), playerId);
     }
 
     public synchronized void reset() {
@@ -278,7 +293,7 @@ public class OnlineGameService {
     public synchronized SseEmitter subscribe(String token) {
         if (!"host".equals(token) && !devices.containsKey(token)) throw new SecurityException("unknown token");
         SseEmitter emitter = new SseEmitter(0L);
-        emitters.add(emitter);
+        emitters.put(emitter, token);
         emitter.onCompletion(() -> emitters.remove(emitter));
         emitter.onTimeout(() -> emitters.remove(emitter));
         emitter.onError(e -> emitters.remove(emitter));
@@ -305,7 +320,8 @@ public class OnlineGameService {
      * 缺席位置最终由 finalRoll 自动补掷。
      */
     public synchronized void forceStart(String teamId) {
-        TeamRollSession session = sessions.computeIfAbsent(teamId, ignored -> new TeamRollSession(List.of()));
+        TeamRollSession session = sessions.computeIfAbsent(teamId,
+                ignored -> new TeamRollSession("forced-" + teamId, 1, List.of()));
         if (session.timingReady || session.goTs != null) return;
         session.goTs = System.currentTimeMillis();
         session.countdownAt = session.goTs;
@@ -362,6 +378,15 @@ public class OnlineGameService {
 
     private void pruneProbes() { probes.keySet().retainAll(devices.keySet()); }
 
+    private void removeDevices(java.util.function.Predicate<Device> predicate) {
+        List<String> removedTokens = devices.entrySet().stream()
+                .filter(entry -> predicate.test(entry.getValue()))
+                .map(Map.Entry::getKey)
+                .toList();
+        removedTokens.forEach(devices::remove);
+        removedTokens.forEach(this::closeSubscribers);
+    }
+
     private Device findDevice(String teamId, int slot) {
         return devices.values().stream().filter(d -> d.teamId().equals(teamId) && d.slot() == slot).findFirst().orElse(null);
     }
@@ -376,7 +401,7 @@ public class OnlineGameService {
      * 单线程 + FIFO 队列同时保证事件顺序，以及同一个 emitter 不会被两个线程并发写入。
      */
     private void broadcast(Object event) {
-        List<SseEmitter> targets = List.copyOf(emitters);
+        List<SseEmitter> targets = List.copyOf(emitters.keySet());
         if (targets.isEmpty()) return;
         dispatch(() -> { for (SseEmitter emitter : targets) write(emitter, event); });
     }
@@ -399,8 +424,19 @@ public class OnlineGameService {
         catch (IOException | IllegalStateException e) { emitters.remove(emitter); emitter.complete(); }
     }
 
+    private void closeSubscribers(String token) {
+        emitters.entrySet().stream()
+                .filter(entry -> Objects.equals(entry.getValue(), token))
+                .map(Map.Entry::getKey)
+                .toList()
+                .forEach(emitter -> {
+                    emitters.remove(emitter);
+                    emitter.complete();
+                });
+    }
+
     private void heartbeat() {
-        List<SseEmitter> targets = List.copyOf(emitters);
+        List<SseEmitter> targets = List.copyOf(emitters.keySet());
         if (targets.isEmpty()) return;
         dispatch(() -> {
             for (SseEmitter emitter : targets) write(emitter, SseEmitter.event().comment("keepalive"));
@@ -426,6 +462,8 @@ public class OnlineGameService {
     }
     public record Calibration(double offset, double rtt) {}
     private static class TeamRollSession {
+        private final String matchId;
+        private final int round;
         private final List<String> lineup;
         private final Map<Integer, Roll> rolls = new HashMap<>();
         private boolean timingReady;
@@ -433,7 +471,15 @@ public class OnlineGameService {
         private Double spreadMs;
         private Long goTs;
         private Long countdownAt;
-        private TeamRollSession(List<String> lineup) { this.lineup = lineup; }
+        private TeamRollSession(String matchId, int round, List<String> lineup) {
+            this.matchId = matchId;
+            this.round = round;
+            this.lineup = lineup;
+        }
+
+        private boolean matches(String matchId, int round, List<String> lineup) {
+            return Objects.equals(this.matchId, matchId) && this.round == round && this.lineup.equals(lineup);
+        }
     }
     public record DeviceView(String teamId, int slot, String name, String playerId, Double rtt, boolean calibrated, boolean ready) {}
     public record JoinResult(String token, String teamId, int slot) {}

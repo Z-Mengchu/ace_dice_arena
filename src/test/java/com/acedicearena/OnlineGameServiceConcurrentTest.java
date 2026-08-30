@@ -3,6 +3,9 @@ package com.acedicearena;
 import com.acedicearena.service.OnlineGameService;
 import org.junit.jupiter.api.Test;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -10,6 +13,43 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
 class OnlineGameServiceConcurrentTest {
+    @Test
+    void replacingTheSameSeatClosesTheOldTokenSubscription() {
+        ApplicationEventPublisher publisher = mock(ApplicationEventPublisher.class);
+        OnlineGameService service = new OnlineGameService(publisher);
+        String oldToken = service.join("t1", 1, "队员1", "u1").token();
+        service.subscribe(oldToken);
+
+        String newToken = service.join("t1", 1, "队员1-新页面", "u1").token();
+
+        @SuppressWarnings("unchecked")
+        Map<Object, String> subscribers = (Map<Object, String>) ReflectionTestUtils.getField(service, "emitters");
+        assertThat(newToken).isNotEqualTo(oldToken);
+        assertThat(subscribers).doesNotContainValue(oldToken);
+        assertThatThrownBy(() -> service.subscribe(oldToken)).isInstanceOf(SecurityException.class);
+    }
+
+    @Test
+    void aDifferentMatchRoundOrLineupCannotReuseThePreparationSession() {
+        ApplicationEventPublisher publisher = mock(ApplicationEventPublisher.class);
+        OnlineGameService service = new OnlineGameService(publisher);
+        var firstLineup = java.util.List.of("u1", "u2", "u3", "u4", "u5");
+        var secondLineup = java.util.List.of("u6", "u2", "u3", "u4", "u5");
+        service.prepare("t1", "g1", 1, firstLineup);
+        String token = service.join("t1", 1, "队员1", "u1").token();
+        calibrate(service, token);
+        service.ready(token, true);
+
+        service.ensurePrepared("t1", "g1", 1, firstLineup);
+        assertThat(service.stateView().get("devices").toString()).contains("ready=true");
+
+        service.ensurePrepared("t1", "g1", 2, firstLineup);
+        assertThat(service.stateView().get("devices").toString()).contains("ready=false");
+
+        service.ensurePrepared("t1", "g2", 1, secondLineup);
+        assertThat(service.ownsDevice(token, "u1")).isFalse();
+    }
+
     @Test
     void missingPreparationSessionCanBeRecoveredWithoutResettingAnExistingSession() {
         ApplicationEventPublisher publisher = mock(ApplicationEventPublisher.class);

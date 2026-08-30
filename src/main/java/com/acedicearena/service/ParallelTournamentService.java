@@ -45,6 +45,8 @@ public class ParallelTournamentService {
     private static final long ROLL_DURATION_MS = 30_000L;
     /** 王牌投手最终投骰的时限；超时由服务端代投。 */
     private static final long PITCHER_DURATION_MS = 30_000L;
+    /** 攻擂开始后，非核心角色且未出战的在线队员可领取攻击力盲盒。 */
+    private static final long ATTACK_BOOST_DURATION_MS = 20_000L;
     private static final List<String> ROLE_VOTE_ORDER = List.of("captain", "strategist", "pitcher");
     private final GameStateRepository states;
     private final UserAccountRepository users;
@@ -66,7 +68,7 @@ public class ParallelTournamentService {
     public ParallelTournamentService(GameStateRepository states, UserAccountRepository users,
                                      PerformanceRecordRepository performances,
                                      GameControlRepository controls, ObjectMapper mapper, LobbyEventService events,
-                                     @Value("${app.game.result-display-ms:6000}") long resultDisplayMs,
+                                     @Value("${app.game.result-display-ms:16000}") long resultDisplayMs,
                                      BattleReportRepository reports, OnlineGameService online) {
         this.states = states; this.users = users; this.performances = performances;
         this.controls = controls; this.mapper = mapper; this.events = events;
@@ -936,16 +938,54 @@ public class ParallelTournamentService {
     }
 
     public void startParallelAttack(ObjectNode match) {
-        long displayUntil = System.currentTimeMillis() + 5_000L;
+        long now = System.currentTimeMillis();
+        long displayUntil = now + 5_000L;
         match.put("phase", "ATTACKING");
         match.remove("lineupDeadlineAt");
         match.put("lineupDisplayUntil", displayUntil);
         ObjectNode sidePhases = match.putObject("sidePhases");
         sidePhases.put("A", "PREPARING");
         sidePhases.put("B", "PREPARING");
+        ObjectNode attackBoost = match.putObject("attackBoost");
+        attackBoost.put("deadlineAt", now + ATTACK_BOOST_DURATION_MS);
+        attackBoost.putObject("claimsA");
+        attackBoost.putObject("claimsB");
         // 备战时限从阵容展示结束后才开始计，避免展示的 5 秒被算进准备时间。
         armSideDeadline(match, "A", "PREPARING", displayUntil);
         armSideDeadline(match, "B", "PREPARING", displayUntil);
+    }
+
+    public double claimAttackBoost(ObjectNode root, ObjectNode match, UserAccount user, String side) {
+        if (!"ATTACKING".equals(match.path("phase").asText()))
+            throw new IllegalStateException("当前不在攻击力盲盒领取阶段");
+        if (LobbyService.isStandIn(user)) throw new IllegalStateException("托管队员不能领取攻击力盲盒");
+        ObjectNode attackBoost = match.withObject("/attackBoost");
+        long deadlineAt = attackBoost.path("deadlineAt").asLong(0L);
+        if (deadlineAt <= 0 || deadlineAt <= System.currentTimeMillis())
+            throw new IllegalStateException("攻击力盲盒领取时间已结束，本轮视为放弃");
+
+        String playerId = "u" + user.getId();
+        ObjectNode team = findTeam(root, user.getTeamId());
+        if (playerId.equals(team.at("/roles/captain").asText())
+                || playerId.equals(team.at("/roles/pitcher").asText()))
+            throw new IllegalStateException("队长和王牌投手不能领取攻击力盲盒");
+        if (contains(match.at("/lineups/" + side), playerId))
+            throw new IllegalStateException("本轮出战队员不能领取攻击力盲盒");
+
+        JsonNode player = null;
+        for (JsonNode candidate : team.path("players")) {
+            if (playerId.equals(candidate.path("id").asText())) { player = candidate; break; }
+        }
+        if (player == null) throw new IllegalStateException("当前账号不在本队参赛名单中");
+        if (player.path("managed").asBoolean() || player.path("standIn").asBoolean()
+                || player.path("afk").asBoolean())
+            throw new IllegalStateException("托管队员不能领取攻击力盲盒");
+
+        ObjectNode claims = attackBoost.withObject("/claims" + side);
+        if (claims.has(playerId)) throw new IllegalStateException("本轮已经领取过攻击力盲盒");
+        double multiplier = ThreadLocalRandom.current().nextInt(100, 151) / 100d;
+        claims.put(playerId, multiplier);
+        return multiplier;
     }
 
     public String attackSidePhase(ObjectNode match, String side) {
@@ -1213,6 +1253,7 @@ public class ParallelTournamentService {
         return text.append(" 攻擂 ").append(roll.path("attackPhaseAttack").asDouble())
                 .append("，积累 ").append(roll.path("accumulationAttack").asDouble())
                 .append("，系数 ").append(roll.path("growthCoefficient").asDouble())
+                .append("，盲盒 ").append(roll.path("attackBoostMultiplier").asDouble(1d))
                 .append("，总攻击 ").append(roll.path("finalAttack").asDouble()).toString();
     }
 
@@ -1263,13 +1304,25 @@ public class ParallelTournamentService {
         double accumulation = team.path("accumulationPoints").asDouble();
         ObjectNode roll = (ObjectNode) match.at("/rolls/" + side);
         double attackPhase = roll.path("attack").asDouble() + (prophetHit ? 2 : 0);
-        double finalAttack = round2((accumulation + attackPhase) * coefficient);
+        double attackBoostMultiplier = attackBoostMultiplier(match, side);
+        double finalAttack = round2((accumulation + attackPhase) * coefficient * attackBoostMultiplier);
         roll.put("prophetBonus", prophetHit ? 2 : 0);
         roll.put("accumulationAttack", accumulation);
         roll.put("attackPhaseAttack", round2(attackPhase));
         roll.put("growthCoefficient", coefficient);
+        roll.put("attackBoostMultiplier", attackBoostMultiplier);
         roll.put("finalAttack", finalAttack);
         return finalAttack;
+    }
+
+    static double attackBoostMultiplier(ObjectNode match, String side) {
+        JsonNode claims = match.at("/attackBoost/claims" + side);
+        if (!claims.isObject() || claims.isEmpty()) return 1d;
+        double sum = 0d;
+        int count = 0;
+        var values = claims.elements();
+        while (values.hasNext()) { sum += values.next().asDouble(1d); count++; }
+        return Math.round(sum / count * 100d) / 100d;
     }
 
     private double round2(double value) { return Math.round(value * 100d) / 100d; }
@@ -1400,8 +1453,13 @@ public class ParallelTournamentService {
             }
             startParallelAttack(match);
             String teamA = match.path("a").asText(), teamB = match.path("b").asText();
+            String matchId = match.path("id").asText();
+            int round = match.path("round").asInt(1);
             List<String> lineupA = lineupOf(match, "A"), lineupB = lineupOf(match, "B");
-            onlineActions.add(() -> { online.prepare(teamA, lineupA); online.prepare(teamB, lineupB); });
+            onlineActions.add(() -> {
+                online.prepare(teamA, matchId, round, lineupA);
+                online.prepare(teamB, matchId, round, lineupB);
+            });
             changed = true;
         }
         return changed;
@@ -1560,6 +1618,7 @@ public class ParallelTournamentService {
         match.remove("sandboxReady");
         match.remove("countdownUntil");
         match.remove("lineupDisplayUntil");
+        match.remove("attackBoost");
         match.remove("sidePhases");
         match.remove("lineupVotes"); match.remove("lineupVoteCounts"); match.remove("lineupVoteTotals");
         match.remove("lineupVoteDeadlineAt");

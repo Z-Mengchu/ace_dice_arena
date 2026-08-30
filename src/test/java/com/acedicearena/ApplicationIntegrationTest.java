@@ -240,7 +240,7 @@ class ApplicationIntegrationTest {
     }
 
     @Test
-    void playerReadyRecoversPreparationSessionAfterApplicationRestart() throws Exception {
+    void preparingPlayerCanRecoverAfterRestartAndReplaceAnOlderTab() throws Exception {
         onlineGameService.reset();
         MockHttpSession session = registerAssignedPlayer("restarted_ready_player", "t1");
         var user = userAccountRepository.findByUsername("restarted_ready_player").orElseThrow();
@@ -278,6 +278,73 @@ class ApplicationIntegrationTest {
                         .content("{\"token\":\"" + token + "\",\"ready\":true}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.ready").value(true));
+
+        String replacement = mockMvc.perform(post("/api/join").session(session)
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        String replacementToken = objectMapper.readTree(replacement).path("token").asText();
+        assertThat(replacementToken).isNotEqualTo(token);
+
+        mockMvc.perform(post("/api/player-ready").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"ready\":true}"))
+                .andExpect(status().isForbidden());
+        mockMvc.perform(post("/api/ping").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + replacementToken + "\",\"c0\":" + System.currentTimeMillis() + "}"))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/calibrate").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + replacementToken + "\",\"rtt\":20}"))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/player-ready").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + replacementToken + "\",\"ready\":true}"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void preparationSessionIsRebuiltWhenTheRoundIdentityChanges() throws Exception {
+        onlineGameService.reset();
+        MockHttpSession firstSession = registerAssignedPlayer("round_switch_1", "t1");
+        MockHttpSession secondSession = registerAssignedPlayer("round_switch_2", "t1");
+        var firstUser = userAccountRepository.findByUsername("round_switch_1").orElseThrow();
+        var secondUser = userAccountRepository.findByUsername("round_switch_2").orElseThrow();
+        String firstId = "u" + firstUser.getId(), secondId = "u" + secondUser.getId();
+
+        var root = objectMapper.createObjectNode(); root.put("mode", "parallel");
+        var teams = root.putArray("teams");
+        var team = teams.addObject(); team.put("id", "t1");
+        var players = team.putArray("players");
+        players.addObject().put("id", firstId).put("name", firstUser.getDisplayName());
+        players.addObject().put("id", secondId).put("name", secondUser.getDisplayName());
+        teams.addObject().put("id", "t2").putArray("players");
+        var lineup = objectMapper.createArrayNode()
+                .add(firstId).add(secondId).add("u-dummy-3").add("u-dummy-4").add("u-dummy-5");
+        var match = root.putObject("matches").putObject("round-switch");
+        match.put("id", "round-switch"); match.put("round", 1);
+        match.put("a", "t1"); match.put("b", "t2");
+        match.put("status", "active"); match.put("phase", "ATTACKING");
+        match.putObject("lineups").set("A", lineup);
+        match.putObject("sidePhases").put("A", "PREPARING").put("B", "PREPARING");
+        GameStateRecord state = gameStateRepository.findById(1L).orElse(null);
+        if (state == null) state = new GameStateRecord(1L, root.toString(), "test");
+        else state.update(root.toString(), "test");
+        gameStateRepository.saveAndFlush(state);
+
+        String firstToken = joinCalibrateAndReady(firstSession);
+        joinCalibrateAndReady(secondSession);
+        @SuppressWarnings("unchecked")
+        var readyDevices = (java.util.List<OnlineGameService.DeviceView>) onlineGameService.stateView().get("devices");
+        assertThat(readyDevices).filteredOn(device -> device.teamId().equals("t1") && device.ready()).hasSize(2);
+
+        match.put("round", 2);
+        state.update(root.toString(), "test");
+        gameStateRepository.saveAndFlush(state);
+        mockMvc.perform(post("/api/player-ready").session(firstSession).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + firstToken + "\",\"ready\":true}"))
+                .andExpect(status().isOk());
+
+        @SuppressWarnings("unchecked")
+        var devices = (java.util.List<OnlineGameService.DeviceView>) onlineGameService.stateView().get("devices");
+        assertThat(devices).filteredOn(device -> device.teamId().equals("t1") && device.ready()).hasSize(1);
+        assertThat(devices).filteredOn(device -> secondId.equals(device.playerId())).allMatch(device -> !device.ready());
     }
 
     @Test
@@ -348,6 +415,23 @@ class ApplicationIntegrationTest {
                         .content("{\"username\":\"admin\",\"password\":\"admin123\"}"))
                 .andExpect(status().isOk()).andReturn().getRequest().getSession(false);
         return (MockHttpSession) session;
+    }
+
+    private String joinCalibrateAndReady(MockHttpSession session) throws Exception {
+        String joined = mockMvc.perform(post("/api/join").session(session)
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        String token = objectMapper.readTree(joined).path("token").asText();
+        mockMvc.perform(post("/api/ping").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"c0\":" + System.currentTimeMillis() + "}"))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/calibrate").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"rtt\":20}"))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/player-ready").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"ready\":true}"))
+                .andExpect(status().isOk());
+        return token;
     }
 
     private MockHttpSession registerAssignedPlayer(String username, String teamId) throws Exception {

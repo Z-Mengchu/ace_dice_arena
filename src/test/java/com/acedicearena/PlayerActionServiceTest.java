@@ -13,6 +13,7 @@ import com.acedicearena.service.ParallelTournamentService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
 import java.util.Optional;
@@ -26,6 +27,114 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.*;
 
 class PlayerActionServiceTest {
+    @Test
+    void eligibleReservePlayerCanClaimAttackBoostOnlyOnceWithinDeadline() throws Exception {
+        GameStateRepository states = mock(GameStateRepository.class);
+        UserAccountRepository users = mock(UserAccountRepository.class);
+        LobbyEventService events = mock(LobbyEventService.class);
+        OnlineGameService online = mock(OnlineGameService.class);
+        ObjectMapper mapper = new ObjectMapper();
+        UserAccount reserve = new UserAccount("reserve", "在线替补", "技术部", "USER", "hash", "salt");
+        ReflectionTestUtils.setField(reserve, "id", 10L);
+        reserve.assignTeam("t1");
+        when(users.findByUsername("reserve")).thenReturn(Optional.of(reserve));
+        String json = """
+                {"mode":"parallel","stage":"ATTACK","teams":[
+                  {"id":"t1","roles":{"captain":"u1","pitcher":"u2"},
+                   "players":[{"id":"u10","managed":false}]},
+                  {"id":"t2","roles":{},"players":[]}
+                ],"matches":{"g1":{"id":"g1","a":"t1","b":"t2","status":"active","phase":"ATTACKING",
+                  "sidePhases":{"A":"PREPARING","B":"PREPARING"},
+                  "lineups":{"A":["u3","u4","u5","u6","u7"],"B":[]},
+                  "attackBoost":{"deadlineAt":%d,"claimsA":{},"claimsB":{}}}}}
+                """.formatted(System.currentTimeMillis() + 20_000L);
+        GameStateRecord record = new GameStateRecord(1L, json, "admin");
+        when(states.findLockedById(1L)).thenReturn(Optional.of(record));
+        ParallelTournamentService tournament = new ParallelTournamentService(states, users,
+                mock(PerformanceRecordRepository.class), mock(GameControlRepository.class), mapper, events, 0,
+                mock(com.acedicearena.repository.BattleReportRepository.class), online);
+        PlayerActionService service = new PlayerActionService(states, users, mapper, events, online, tournament);
+
+        service.submit("reserve", "attack-boost", List.of());
+
+        double multiplier = mapper.readTree(record.getContent())
+                .at("/matches/g1/attackBoost/claimsA/u10").asDouble();
+        assertThat(multiplier).isBetween(1d, 1.5d);
+        assertThat(java.math.BigDecimal.valueOf(multiplier).stripTrailingZeros().scale()).isLessThanOrEqualTo(2);
+        assertThatThrownBy(() -> service.submit("reserve", "attack-boost", List.of()))
+                .hasMessage("本轮已经领取过攻击力盲盒");
+    }
+
+    @Test
+    void captainLineupStandInAndExpiredReserveCannotClaimAttackBoost() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ParallelTournamentService tournament = new ParallelTournamentService(
+                mock(GameStateRepository.class), mock(UserAccountRepository.class),
+                mock(PerformanceRecordRepository.class), mock(GameControlRepository.class), mapper,
+                mock(LobbyEventService.class), 0, mock(com.acedicearena.repository.BattleReportRepository.class),
+                mock(OnlineGameService.class));
+        UserAccount player = new UserAccount("player", "队员", "技术部", "USER", "hash", "salt");
+        ReflectionTestUtils.setField(player, "id", 10L);
+        player.assignTeam("t1");
+        ObjectNode root = (ObjectNode) mapper.readTree("""
+                {"teams":[{"id":"t1","roles":{"captain":"u10","pitcher":"u2"},
+                  "players":[{"id":"u10","managed":false}]}]}
+                """);
+        ObjectNode match = (ObjectNode) mapper.readTree("""
+                {"phase":"ATTACKING","lineups":{"A":[]},
+                 "attackBoost":{"deadlineAt":9999999999999,"claimsA":{}}}
+                """);
+
+        assertThatThrownBy(() -> tournament.claimAttackBoost(root, match, player, "A"))
+                .hasMessage("队长和王牌投手不能领取攻击力盲盒");
+        ((ObjectNode) root.at("/teams/0/roles")).put("captain", "u1");
+        ((ObjectNode) match.path("lineups")).withArray("A").add("u10");
+        assertThatThrownBy(() -> tournament.claimAttackBoost(root, match, player, "A"))
+                .hasMessage("本轮出战队员不能领取攻击力盲盒");
+        ((ObjectNode) match.path("lineups")).putArray("A");
+        UserAccount standIn = new UserAccount("__arena_stand_in_10", "托管队员", "技术部", "USER", "hash", "salt");
+        ReflectionTestUtils.setField(standIn, "id", 10L);
+        standIn.assignTeam("t1");
+        assertThatThrownBy(() -> tournament.claimAttackBoost(root, match, standIn, "A"))
+                .hasMessage("托管队员不能领取攻击力盲盒");
+        ((ObjectNode) match.path("attackBoost")).put("deadlineAt", System.currentTimeMillis() - 1);
+        assertThatThrownBy(() -> tournament.claimAttackBoost(root, match, player, "A"))
+                .hasMessage("攻击力盲盒领取时间已结束，本轮视为放弃");
+    }
+
+    @Test
+    void pitcherFinalRollIsAcceptedOnlyOnceWhileRevealIsPending() throws Exception {
+        GameStateRepository states = mock(GameStateRepository.class);
+        UserAccountRepository users = mock(UserAccountRepository.class);
+        LobbyEventService events = mock(LobbyEventService.class);
+        OnlineGameService online = mock(OnlineGameService.class);
+        ObjectMapper mapper = new ObjectMapper();
+        UserAccount pitcher = new UserAccount("pitcher", "王牌投手", "技术部", "USER", "hash", "salt");
+        pitcher.assignTeam("t1");
+        when(users.findByUsername("pitcher")).thenReturn(Optional.of(pitcher));
+        when(online.isTimingReady("t1")).thenReturn(true);
+        String json = """
+                {"mode":"parallel","stage":"ATTACK","teams":[
+                  {"id":"t1","roles":{"pitcher":"unull"}},
+                  {"id":"t2","roles":{}}
+                ],"matches":{"g1":{"id":"g1","a":"t1","b":"t2","status":"active","phase":"ATTACKING",
+                  "sidePhases":{"A":"PITCHER_ROLL","B":"WAITING"},"sync":{}}}}
+                """;
+        GameStateRecord record = new GameStateRecord(1L, json, "admin");
+        when(states.findLockedById(1L)).thenReturn(Optional.of(record));
+        ParallelTournamentService tournament = new ParallelTournamentService(states, users,
+                mock(PerformanceRecordRepository.class), mock(GameControlRepository.class), mapper, events, 0,
+                mock(com.acedicearena.repository.BattleReportRepository.class), online);
+        PlayerActionService service = new PlayerActionService(states, users, mapper, events, online, tournament);
+
+        service.submit("pitcher", "pitcher-roll", List.of());
+
+        assertThatThrownBy(() -> service.submit("pitcher", "pitcher-roll", List.of()))
+                .hasMessage("最终投骰正在处理，请勿重复点击");
+        assertThat(mapper.readTree(record.getContent()).at("/matches/g1/sync/revealPendingA").asBoolean()).isTrue();
+        verify(online, times(1)).finalRoll("t1");
+    }
+
     @Test
     void opposingTeamCanPrepareAndReceiveCountdownWhileFirstTeamIsAlreadyTiming() throws Exception {
         GameStateRepository states = mock(GameStateRepository.class);

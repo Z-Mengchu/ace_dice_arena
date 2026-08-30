@@ -51,7 +51,7 @@ app:
     queue-capacity: ${AUDIT_QUEUE_CAPACITY:50000}
   game:
     # 双方投骰完成后，本局结果在所有比赛视角中的展示时长。
-    result-display-ms: ${RESULT_DISPLAY_MS:6000}
+    result-display-ms: ${RESULT_DISPLAY_MS:16000}
     result-scan-ms: ${RESULT_SCAN_MS:500}
   # 当前开发版本默认开启；正式环境可设置 GAME_TEST_MODE=false 隐藏管理员沙盘。
   test-mode:

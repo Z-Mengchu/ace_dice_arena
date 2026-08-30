@@ -26,7 +26,7 @@
     }).join('') + '</div>';
   }
   function resultSide(team, roll, won) {
-    return '<div class="round-result-side ' + (won ? 'is-winner' : '') + '"><b>' + esc(teamName(team.id)) + '</b><div class="round-result-dice">' + ((roll && roll.dice) || []).map(function (value) { return '<i>' + value + '</i>'; }).join('') + '</div><strong>' + esc(roll && roll.finalAttack == null ? '-' : roll.finalAttack) + '</strong><small>（积累 ' + esc(roll && roll.accumulationAttack || 0) + ' + 攻擂 ' + esc(roll && roll.attackPhaseAttack || 0) + '）× 系数 ' + Number(roll && roll.growthCoefficient || 1).toFixed(4) + '</small></div>';
+    return '<div class="round-result-side ' + (won ? 'is-winner' : '') + '"><b>' + esc(teamName(team.id)) + '</b><div class="round-result-dice">' + ((roll && roll.dice) || []).map(function (value) { return '<i>' + value + '</i>'; }).join('') + '</div><strong>' + esc(roll && roll.finalAttack == null ? '-' : roll.finalAttack) + '</strong><small>（积累 ' + esc(roll && roll.accumulationAttack || 0) + ' + 攻擂 ' + esc(roll && roll.attackPhaseAttack || 0) + '）× 业绩 ' + Number(roll && roll.growthCoefficient || 1).toFixed(4) + ' × 盲盒 ' + Number(roll && roll.attackBoostMultiplier || 1).toFixed(2) + '</small></div>';
   }
   function prophetResult(match, side, team, opponent) {
     var guess = match.prophet && match.prophet[side], hit = match.prophetResults && match.prophetResults[side];

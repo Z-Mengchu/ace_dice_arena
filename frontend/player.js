@@ -41,16 +41,33 @@
   }
   function pad2(n) { return n < 10 ? '0' + n : '' + n; }
 
+  function fetchWithTimeout(path, options, timeoutMs) {
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = controller ? setTimeout(function () { controller.abort(); }, timeoutMs || 8000) : null;
+    var requestOptions = options || {};
+    if (controller) requestOptions.signal = controller.signal;
+    return fetch(path, requestOptions).catch(function (error) {
+      if (error && error.name === 'AbortError') {
+        var timeoutError = new Error('请求超时，请检查网络后重试');
+        timeoutError.endpoint = path;
+        throw timeoutError;
+      }
+      if (error) error.endpoint = path;
+      throw error;
+    }).finally(function () { if (timer) clearTimeout(timer); });
+  }
+
   function api(path, body) {
-    return fetch(path, {
+    return fetchWithTimeout(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {})
-    }).then(function (r) {
+    }, 8000).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (responseBody) {
         if (!r.ok) {
           var e = new Error(responseBody.error || ('HTTP ' + r.status));
           e.status = r.status;
+          e.endpoint = path;
           throw e;
         }
         return responseBody;
@@ -59,8 +76,13 @@
   }
 
   function getState() {
-    return fetch('/api/state').then(function (r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+    return fetchWithTimeout('/api/state', {}, 8000).then(function (r) {
+      if (!r.ok) {
+        var error = new Error('读取联机状态失败（HTTP ' + r.status + '）');
+        error.status = r.status;
+        error.endpoint = '/api/state';
+        throw error;
+      }
       return r.json();
     });
   }
@@ -85,9 +107,11 @@
     calibText: '',
     calibWarn: false,
     reveal: null,
-    errText: ''
+    errText: '',
+    recoveryNotice: ''
   };
   var es = null;
+  var lobbyReturnTimer = null;
 
   function announceRule(rule, phase) {
     if (!window.GameRules || !rollAssignment) return;
@@ -107,6 +131,28 @@
     try { sessionStorage.setItem(SKEY, JSON.stringify(my)); } catch (e) { }
   }
 
+  function deviceForPlayer(player) {
+    return ui.devices.find(function (device) {
+      return my && device.teamId === my.teamId && device.slot === player.slot &&
+        String(device.playerId || '') === String(player.id || '');
+    });
+  }
+
+  function myDevice() {
+    return ui.devices.find(function (device) {
+      return my && device.teamId === my.teamId && device.slot === my.slot &&
+        String(device.playerId || '') === String(my.playerId || '');
+    });
+  }
+
+  function readyCount() {
+    var lineup = (rollAssignment && rollAssignment.lineup) || [];
+    return lineup.filter(function (player) {
+      var device = deviceForPlayer(player);
+      return !!(device && device.ready);
+    }).length;
+  }
+
   function teamInfo(tid) {
     var list = teamCatalog;
     for (var i = 0; i < list.length; i++) if (list[i].id === tid) return list[i];
@@ -116,6 +162,18 @@
   function defaultName(tid, slot) { return teamInfo(tid).shortName + '-' + pad2(slot); }
 
   /* ==================== 3. 网络：SSE + 校准 ==================== */
+
+  function cancelLobbyReturn() {
+    if (lobbyReturnTimer) clearTimeout(lobbyReturnTimer);
+    lobbyReturnTimer = null;
+  }
+
+  function scheduleLobbyReturn() {
+    cancelLobbyReturn();
+    lobbyReturnTimer = setTimeout(function () {
+      if (ui.sub === 'reveal') location.replace('/lobby');
+    }, 8000);
+  }
 
   function connectSSE() {
     if (es) { try { es.close(); } catch (e) { } es = null; }
@@ -137,6 +195,7 @@
         break;
       case 'prepare':
         if (my && msg.teamId === my.teamId && ui.screen === 'main' && ui.sub !== 'calibrating') {
+          cancelLobbyReturn();
           ui.sub = 'standby'; render();
         }
         break;
@@ -174,6 +233,7 @@
           ui.reveal = msg;
           ui.sub = 'reveal';
           render();
+          scheduleLobbyReturn();
         }
         break;
       case 'timing-ready':
@@ -281,6 +341,14 @@
       ui.sub = 'kick';
       render();
     }
+  }
+
+  function recoverPlayerSession(err) {
+    if (es) { try { es.close(); } catch (e) { } es = null; }
+    try { sessionStorage.removeItem(SKEY); } catch (e) { }
+    my = null;
+    ui.recoveryNotice = (err && err.message ? err.message : '备战席凭证已失效') + '，正在重新加入备战席…';
+    boot();
   }
 
   function setNet(txt, warn) {
@@ -395,7 +463,7 @@
       this.disabled = true;
       this.textContent = '加入中…';
       api('/api/join', { teamId: tid, slot: ui.slot, name: nm }).then(function (res) {
-        my = { teamId: tid, slot: ui.slot, name: nm, token: res.token };
+        my = { teamId: tid, slot: ui.slot, name: nm, playerId: loginUser ? 'u' + loginUser.id : '', token: res.token };
         saveMy();
         connectSSE();
         ui.screen = 'main';
@@ -422,8 +490,9 @@
   function lineupHTML() {
     var lineup = (rollAssignment && rollAssignment.lineup) || [];
     return '<div class="pl-assigned-lineup"><div class="pl-title">本局五人出战阵容</div><div class="pl-lineup-grid">' + lineup.map(function (player) {
-      var device = ui.devices.find(function (item) { return item.teamId === rollAssignment.teamId && item.slot === player.slot; });
-      return '<div class="pl-lineup-seat ' + (player.slot === my.slot ? 'mine ' : '') + (device && device.ready ? 'ready' : '') + '"><i>' + player.slot + '</i><b>' + esc(player.name) + '</b><small>' + (device && device.ready ? '已准备' : device&&device.calibrated?'等待准备':'正在进入') + (player.slot === my.slot ? ' · 你' : '') + '</small></div>';
+      var device = deviceForPlayer(player);
+      var mine = player.slot === my.slot && String(player.id) === String(my.playerId);
+      return '<div class="pl-lineup-seat ' + (mine ? 'mine ' : '') + (device && device.ready ? 'ready' : '') + '"><i>' + player.slot + '</i><b>' + esc(player.name) + '</b><small>' + (device && device.ready ? '已准备' : device&&device.calibrated?'等待准备':'正在进入') + (mine ? ' · 你' : '') + '</small></div>';
     }).join('') + '</div><p class="pl-sub">五人分别点击准备；全员准备后由队长发令，3 秒倒计时结束即可同时进攻。</p><div class="pl-sync-rule"><b>同步操作规则</b><span>系统记录五名出战队员的点击时间，若最大误差在 0.5 秒以内，本局攻击力 ×1.5；否则使用原始攻击力，无惩罚。最终五枚骰子由王牌投手投出。</span></div></div>';
   }
 
@@ -433,9 +502,11 @@
   }
 
   function renderMain(root) {
+    var recovery = ui.recoveryNotice ? '<div class="pl-status warn">' + esc(ui.recoveryNotice) + '</div>' : '';
     var h = '<div class="pl-me">' +
       '<div class="pl-me-team">' + esc(myTeamName()) + '</div>' +
       '<div class="pl-me-slot">' + my.slot + ' 号位 · ' + esc(my.name) + '</div></div>' +
+      recovery +
       '<div id="pl-calib-status" class="pl-status' + (ui.calibWarn ? ' warn' : '') + '">' + esc(ui.calibText || '✓ 已校准') + '</div>' +
       lineupHTML() + '<div id="pl-stage"></div>' +
       '<div class="pl-foot"><a class="btn btn-ghost" href="/lobby">返回队伍大厅</a></div>';
@@ -453,8 +524,8 @@
       h = '<div class="pl-status err">' + esc(ui.calibText || '设备时钟校准失败，暂时不能准备') + '</div>' +
         '<div class="pl-foot"><button id="pl-retry-calibration" class="btn btn-primary btn-xl">重新校准</button></div>';
     } else if (ui.sub === 'standby') {
-      var mineDevice=ui.devices.find(function(device){return my&&device.teamId===my.teamId&&device.slot===my.slot;}),isReady=!!(mineDevice&&mineDevice.ready),readyCount=ui.devices.filter(function(device){return my&&device.teamId===my.teamId&&device.ready;}).length;
-      h = '<div class="pl-wait"><span class="big-ico">🪑</span>'+(isReady?'你已准备':'你已进入备战席')+'<br><small>本队 '+readyCount+' / 5 人已准备；全部准备后由队长发号施令</small></div><div class="pl-foot"><button id="pl-ready" class="btn '+(isReady?'btn-ghost':'btn-primary')+' btn-xl">'+(isReady?'取消准备':'准备')+'</button>'+(rollAssignment&&rollAssignment.captain?'<button id="pl-command" class="btn btn-primary btn-xl" '+(readyCount===5?'':'disabled')+'>队长发号施令</button>':'')+'</div>';
+      var mineDevice=myDevice(),isReady=!!(mineDevice&&mineDevice.ready),teamReadyCount=readyCount();
+      h = '<div class="pl-wait"><span class="big-ico">🪑</span>'+(isReady?'你已准备':'你已进入备战席')+'<br><small>本队 '+teamReadyCount+' / 5 人已准备；全部准备后由队长发号施令</small></div><div class="pl-foot"><button id="pl-ready" class="btn '+(isReady?'btn-ghost':'btn-primary')+' btn-xl">'+(isReady?'取消准备':'准备')+'</button>'+(rollAssignment&&rollAssignment.captain?'<button id="pl-command" class="btn btn-primary btn-xl" '+(teamReadyCount===5?'':'disabled')+'>队长发号施令</button>':'')+'</div>';
     } else if (ui.sub === 'countdown') {
       var seconds=Math.max(0,Math.ceil((Number(ui.countdownAt||Date.now())-Date.now())/1000));
       h = '<div class="pl-command-countdown"><small>队长已经发令</small><strong>'+seconds+'</strong><p>倒计时结束后立即点击进攻</p></div>';
@@ -476,7 +547,7 @@
     var rollBtn = $('#pl-roll');
     if (rollBtn) rollBtn.onclick = doRoll;
     var readyBtn=$('#pl-ready');
-    if(readyBtn)readyBtn.onclick=function(){var mineDevice=ui.devices.find(function(device){return my&&device.teamId===my.teamId&&device.slot===my.slot;}),next=!(mineDevice&&mineDevice.ready);readyBtn.disabled=true;api('/api/player-ready',{token:my.token,ready:next}).then(refreshState).catch(function(err){if(err&&err.status===409){boot();return;}readyBtn.disabled=false;});};
+    if(readyBtn)readyBtn.onclick=function(){var device=myDevice(),next=!(device&&device.ready);readyBtn.disabled=true;api('/api/player-ready',{token:my.token,ready:next}).then(function(){ui.recoveryNotice='';refreshState();}).catch(function(err){if(err&&(err.status===401||err.status===403)){recoverPlayerSession(err);return;}if(err&&err.status===409){ui.recoveryNotice=err.message||'比赛阶段已变化，正在刷新…';boot();return;}ui.recoveryNotice=err&&err.message?err.message:'准备失败，请重试';readyBtn.disabled=false;render();});};
     var retryCalibrationBtn = $('#pl-retry-calibration');
     if (retryCalibrationBtn) retryCalibrationBtn.onclick = retryCalibration;
     var commandBtn=$('#pl-command');
@@ -548,16 +619,28 @@
 
   /* ==================== 5. 启动 ==================== */
 
+  function bootJson(path, allowNoContent) {
+    return fetchWithTimeout(path, {}, 8000).then(function (response) {
+      if (allowNoContent && response.status === 204) return null;
+      return response.json().catch(function () { return {}; }).then(function (body) {
+        if (!response.ok) {
+          var error = new Error(body.error || ('访问 ' + path + ' 失败（HTTP ' + response.status + '）'));
+          error.status = response.status;
+          error.endpoint = path;
+          throw error;
+        }
+        return body;
+      });
+    });
+  }
+
   function boot() {
     Promise.all([
       getState(),
-      fetch('/api/auth/me').then(function (r) {
-        if (r.status === 401) { location.replace('/login.html?next=player'); throw new Error('login required'); }
-        return r.json();
-      }),
-      fetch('/api/game-state').then(function (r) { return r.status === 204 ? null : r.json(); }),
-      fetch('/api/lobby').then(function (r) { return r.json(); }),
-      fetch('/api/roll-assignment').then(function (r) { return r.json().then(function (body) { if (!r.ok) throw new Error(body.error || '无法读取本局阵容'); return body; }); })
+      bootJson('/api/auth/me'),
+      bootJson('/api/game-state', true),
+      bootJson('/api/lobby'),
+      bootJson('/api/roll-assignment')
     ]).then(function (result) {
       var st = result[0];
       loginUser = result[1];
@@ -566,11 +649,12 @@
       rollAssignment = result[4];
       if (saved && saved.state && Array.isArray(saved.state.teams)) teamCatalog = saved.state.teams;
       var assignedTeam = lobby && lobby.me && lobby.me.teamId;
-      if (!assignedTeam) throw new Error('你不在本轮参赛队伍中');
+      if (!assignedTeam) { location.replace('/lobby'); return; }
       if (rollAssignment.phase && rollAssignment.phase.indexOf('ROLL_') === 0) announceRule('TIMING', 'ROLL-' + assignedTeam);
       if (rollAssignment.phase && rollAssignment.phase.indexOf('PITCHER_ROLL_') === 0) announceRule('PITCHER_ROLL', 'PITCHER_ROLL-' + assignedTeam);
       teamCatalog = teamCatalog.filter(function (team) { return team.id === assignedTeam; });
-      if (my && (my.teamId !== assignedTeam || my.slot !== rollAssignment.slot || my.username !== loginUser.username)) {
+      var assignedPlayerId = 'u' + loginUser.id;
+      if (my && (my.teamId !== assignedTeam || my.slot !== rollAssignment.slot || my.username !== loginUser.username || my.playerId !== assignedPlayerId)) {
         try { sessionStorage.removeItem(SKEY); } catch (e) { }
         my = null;
       }
@@ -583,8 +667,8 @@
       setNet('已连接服务器', false);
       if (!rollAssignment.eligible) {
         if (my) try { sessionStorage.removeItem(SKEY); } catch (e) { }
-        my = null; ui.screen = 'bench'; render();
-        setTimeout(boot, 3000);
+        my = null;
+        location.replace('/lobby');
         return;
       }
       if (my) {
@@ -598,14 +682,23 @@
       } else {
         ui.teamId = assignedTeam; ui.slot = rollAssignment.slot;
         api('/api/join', { teamId: assignedTeam, slot: rollAssignment.slot, name: loginUser.displayName }).then(function (res) {
-          my = { teamId: assignedTeam, slot: res.slot, name: loginUser.displayName, username: loginUser.username, token: res.token };
+          my = { teamId: assignedTeam, slot: res.slot, name: loginUser.displayName, username: loginUser.username, playerId: assignedPlayerId, token: res.token };
           saveMy(); connectSSE(); ui.screen = 'main'; ui.sub = 'calibrating'; ui.calibText = '正在自动校准时钟（5 次 ping）…'; render();
           calibrate(5, finishCalibration);
         }).catch(function (error) { ui.errText = error.message || '无法加入本局投骰席位'; ui.screen = 'error'; render(); });
       }
-    }).catch(function () {
+    }).catch(function (error) {
+      if (error && error.status === 401) {
+        location.replace('/login.html?next=player');
+        return;
+      }
+      if (error && error.endpoint === '/api/roll-assignment' && (error.status === 403 || error.status === 409)) {
+        try { sessionStorage.removeItem(SKEY); } catch (e) { }
+        location.replace('/lobby');
+        return;
+      }
       setNet('未连接', true);
-      ui.errText = '无法访问 /api/state';
+      ui.errText = error && error.message ? error.message : '无法连接比赛服务';
       ui.screen = 'error';
       render();
     });

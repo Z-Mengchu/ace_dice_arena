@@ -95,7 +95,8 @@ public class OnlineGameController {
         try {
             UserAccount user = lobby.requireUser((String) session.getAttribute(AuthController.SESSION_USER));
             RollAssignment assignment = assignment(user);
-            if (!assignment.eligible() || !service.matchesAssignment(body.token(), assignment.teamId(), assignment.slot()))
+            if (!assignment.eligible() || !service.matchesAssignment(body.token(), assignment.teamId(),
+                    assignment.slot(), "u" + user.getId()))
                 return ResponseEntity.status(403).body(Map.of("error", "当前账号没有本局备战席位"));
             ensurePreparationSession(assignment);
             service.ready(body.token(), body.ready());
@@ -122,7 +123,8 @@ public class OnlineGameController {
         try {
             UserAccount user = lobby.requireUser((String) session.getAttribute(AuthController.SESSION_USER));
             RollAssignment assignment = assignment(user);
-            if (!assignment.eligible() || !service.matchesAssignment(body.token(), assignment.teamId(), assignment.slot()))
+            if (!assignment.eligible() || !service.matchesAssignment(body.token(), assignment.teamId(),
+                    assignment.slot(), "u" + user.getId()))
                 return ResponseEntity.status(403).body(Map.of("error", "当前账号没有本局投骰席位"));
             service.roll(body.token(), body.clientTs());
             return ResponseEntity.ok(Map.of("ok", true));
@@ -187,7 +189,7 @@ public class OnlineGameController {
         List<String> lineupIds = assignment.lineup().stream()
                 .map(player -> String.valueOf(player.get("id")))
                 .toList();
-        service.ensurePrepared(assignment.teamId(), lineupIds);
+        service.ensurePrepared(assignment.teamId(), assignment.matchId(), assignment.round(), lineupIds);
     }
 
     public record PingBody(String token, Double c0) {}
