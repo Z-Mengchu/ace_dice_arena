@@ -16,6 +16,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -1096,8 +1097,11 @@ public class ParallelTournamentService {
         setAttackSidePhase(match, side, "PITCHER_ROLL");
     }
 
+    // 这些监听器把内存掷骰事件同步进持久化比赛状态，发布点可能在 afterCommit 回调里
+    // （如 finalRoll），此时线程上还绑着已提交的事务；REQUIRES_NEW 保证始终挂起残留上下文、
+    // 在干净的新事务里执行，否则 FOR UPDATE 查询会报 TransactionRequiredException。
     @EventListener
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void onDiceAttackStarted(OnlineGameService.DiceAttackStartedEvent event) {
         updateAttackStart(event.teamId());
     }
@@ -1126,7 +1130,7 @@ public class ParallelTournamentService {
     }
 
     @EventListener
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void onDiceTimingProgress(OnlineGameService.DiceTimingProgressEvent event) {
         GameStateRecord record = states.findLockedById(1L).orElse(null);
         if (record == null) return;
@@ -1150,7 +1154,7 @@ public class ParallelTournamentService {
     }
 
     @EventListener
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void onDiceTimingReady(OnlineGameService.DiceTimingReadyEvent event) {
         GameStateRecord record = states.findLockedById(1L).orElse(null);
         if (record == null) return;
@@ -1173,7 +1177,7 @@ public class ParallelTournamentService {
     }
 
     @EventListener
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void onDiceReveal(OnlineGameService.DiceRevealEvent event) {
         GameStateRecord record = states.findLockedById(1L).orElse(null);
         if (record == null) return;

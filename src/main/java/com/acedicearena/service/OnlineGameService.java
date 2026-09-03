@@ -184,12 +184,22 @@ public class OnlineGameService {
         return target;
     }
 
-    private synchronized void startAfterCountdown(String teamId, long target) {
-        TeamRollSession session = sessions.get(teamId);
-        if (session == null || !Objects.equals(session.countdownAt, target) || session.goTs != null) return;
-        session.goTs = target;
-        publisher.publishEvent(new DiceAttackStartedEvent(teamId));
+    private void startAfterCountdown(String teamId, long target) {
+        int mark = markGoTs(teamId, target);
+        if (mark == 0) return;
+        // 先出锁发布事件把库里的攻击方阶段推进到 ROLL，再广播 go，
+        // 保证客户端看到 go 后回源/掷骰时读到的比赛阶段已经是 ROLL。
+        // mark==2 表示到点的 roll 已抢先武装并发布过事件，这里只补发 go 广播。
+        if (mark == 1) publisher.publishEvent(new DiceAttackStartedEvent(teamId));
         broadcast(Map.of("type", "go", "teamId", teamId, "goTs", target));
+    }
+
+    private synchronized int markGoTs(String teamId, long target) {
+        TeamRollSession session = sessions.get(teamId);
+        if (session == null || !Objects.equals(session.countdownAt, target)) return 0;
+        if (session.goTs != null) return Objects.equals(session.goTs, target) ? 2 : 0;
+        session.goTs = target;
+        return 1;
     }
 
     public synchronized void arm(String teamId) {
@@ -234,20 +244,42 @@ public class OnlineGameService {
         else scheduler.schedule(() -> tryAutomaticGo(teamId), 1000, TimeUnit.MILLISECONDS);
     }
 
-    public synchronized void roll(String token, Double clientTs) {
+    /**
+     * 应用事件一律在监视器外发布：监听器是 @Transactional，会取 InnoDB 行锁；
+     * 若持监视器等行锁，会与"事务内持行锁再调本服务 synchronized 方法"的线程（如 pitcher-roll
+     * 校验 isTimingReady）形成 AB-BA 死锁。临界区内只做内存状态变更和 SSE 入队。
+     */
+    private void publishAfterUnlock(List<Object> events) {
+        for (Object event : events) publisher.publishEvent(event);
+    }
+
+    public void roll(String token, Double clientTs) {
+        publishAfterUnlock(rollLocked(token, clientTs));
+    }
+
+    private synchronized List<Object> rollLocked(String token, Double clientTs) {
         long serverTs = System.currentTimeMillis();
         Device device = requireDevice(token);
         TeamRollSession session = sessions.get(device.teamId());
-        if (session == null || session.timingReady || session.goTs == null) throw new IllegalStateException("not armed");
+        if (session == null || session.timingReady) throw new IllegalStateException("not armed");
         if (clientTs == null || !Double.isFinite(clientTs)) throw new IllegalArgumentException("invalid clientTs");
+        List<Object> events = new ArrayList<>();
+        if (session.goTs == null) {
+            // 倒计时到点即视为 go：调度线程有毫秒级抖动，不能拒绝已到点的合法点击。
+            if (session.countdownAt == null || serverTs < session.countdownAt)
+                throw new IllegalStateException("not armed");
+            session.goTs = session.countdownAt;
+            events.add(new DiceAttackStartedEvent(device.teamId()));
+        }
         boolean recorded = session.rolls.putIfAbsent(device.slot(),
                 new Roll(device.slot(), clientTs, normalizedClick(clientTs, device, serverTs))) == null;
         if (recorded) {
             List<Integer> rolledSlots = session.rolls.keySet().stream().sorted().toList();
             broadcast(Map.of("type", "timing-progress", "teamId", device.teamId(), "rolledSlots", rolledSlots));
-            publisher.publishEvent(new DiceTimingProgressEvent(device.teamId(), rolledSlots));
+            events.add(new DiceTimingProgressEvent(device.teamId(), rolledSlots));
         }
-        if (session.rolls.size() >= SLOT_COUNT) completeTiming(device.teamId());
+        if (session.rolls.size() >= SLOT_COUNT) events.addAll(completeTimingLocked(device.teamId(), false));
+        return events;
     }
 
     public synchronized boolean isTimingReady(String teamId) {
@@ -255,7 +287,11 @@ public class OnlineGameService {
         return session != null && session.timingReady;
     }
 
-    public synchronized void finalRoll(String teamId) {
+    public void finalRoll(String teamId) {
+        publishAfterUnlock(finalRollLocked(teamId));
+    }
+
+    private synchronized List<Object> finalRollLocked(String teamId) {
         TeamRollSession session = sessions.get(teamId);
         if (session == null || !session.timingReady) throw new IllegalStateException("five player timings not ready");
         List<DiceResult> dice = new ArrayList<>();
@@ -269,8 +305,8 @@ public class OnlineGameService {
         event.put("type", "reveal"); event.put("teamId", teamId); event.put("dice", dice);
         event.put("spreadMs", session.spreadMs); event.put("syncOk", session.syncOk);
         broadcast(event);
-        publisher.publishEvent(new DiceRevealEvent(teamId, dice, session.syncOk, session.spreadMs));
         sessions.remove(teamId);
+        return List.of(new DiceRevealEvent(teamId, dice, session.syncOk, session.spreadMs));
     }
 
     /** 校准前的席位归属校验：设备一旦绑定了玩家，就只有该玩家本人可以继续校准它。 */
@@ -329,18 +365,21 @@ public class OnlineGameService {
     }
 
     /** 超时兜底：用已经到位的点击完成计时判定，人不齐一律判为未同步（同步增益失效）。 */
-    public synchronized void forceTiming(String teamId) {
-        TeamRollSession session = sessions.get(teamId);
-        if (session == null || session.timingReady) return;
-        if (session.goTs == null) session.goTs = System.currentTimeMillis();
-        completeTiming(teamId, true);
+    public void forceTiming(String teamId) {
+        publishAfterUnlock(forceTimingLocked(teamId));
     }
 
-    private synchronized void completeTiming(String teamId) { completeTiming(teamId, false); }
-
-    private synchronized void completeTiming(String teamId, boolean forced) {
+    private synchronized List<Object> forceTimingLocked(String teamId) {
         TeamRollSession session = sessions.get(teamId);
-        if (session == null || session.timingReady) return;
+        if (session == null || session.timingReady) return List.of();
+        if (session.goTs == null) session.goTs = System.currentTimeMillis();
+        return completeTimingLocked(teamId, true);
+    }
+
+    /** 只允许在持有本服务监视器的上下文中调用；返回的事件由调用方出锁后发布。 */
+    private synchronized List<Object> completeTimingLocked(String teamId, boolean forced) {
+        TeamRollSession session = sessions.get(teamId);
+        if (session == null || session.timingReady) return List.of();
         List<Double> timestamps = new ArrayList<>();
         int earlyCount = 0;
         for (int slot = 1; slot <= SLOT_COUNT; slot++) {
@@ -355,7 +394,7 @@ public class OnlineGameService {
                 && spread <= SYNC_WINDOW_MS && earlyCount == 0;
         session.timingReady = true; session.spreadMs = spread; session.syncOk = syncOk;
         broadcast(Map.of("type", "timing-ready", "teamId", teamId, "spreadMs", spread, "syncOk", syncOk));
-        publisher.publishEvent(new DiceTimingReadyEvent(teamId, syncOk, spread));
+        return List.of(new DiceTimingReadyEvent(teamId, syncOk, spread));
     }
 
     /**

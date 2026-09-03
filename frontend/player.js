@@ -111,6 +111,7 @@
     recoveryNotice: ''
   };
   var es = null;
+  var sseProbing = false;
   var lobbyReturnTimer = null;
 
   function announceRule(rule, phase) {
@@ -179,12 +180,37 @@
     if (es) { try { es.close(); } catch (e) { } es = null; }
     try { es = new EventSource('/api/events?token=' + encodeURIComponent(my.token)); } catch (e) { return; }
     es.onopen = function () { setNet('已连接服务器', false); refreshState(); };
-    es.onerror = function () { setNet('连接中断，重连中…', true); };
+    es.onerror = function () {
+      setNet('连接中断，重连中…', true);
+      probeSseError();
+    };
     es.onmessage = function (ev) {
       var msg = null;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       onServerEvent(msg);
     };
+  }
+
+  // SSE 报错时探测真实原因：401/403 说明 token 已失效（服务器重启或被顶替），
+  // EventSource 会对 401 无限重试且永远连不上，需重新加入备战席换发新 token；
+  // 其他情况（网络抖动、服务器暂不可达）交给 EventSource 原生重连即可。
+  function probeSseError() {
+    if (sseProbing || !my || !my.token) return;
+    sseProbing = true;
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = controller ? setTimeout(function () { controller.abort(); }, 5000) : null;
+    fetch('/api/events?token=' + encodeURIComponent(my.token), controller ? { signal: controller.signal } : {})
+      .then(function (r) {
+        if (r.status === 401 || r.status === 403) {
+          recoverPlayerSession(new Error('备战席凭证已失效'));
+        }
+      })
+      .catch(function () { /* 网络不可达：交给原生重连 */ })
+      .finally(function () {
+        if (timer) clearTimeout(timer);
+        if (controller) { try { controller.abort(); } catch (e) { } }
+        sseProbing = false;
+      });
   }
 
   function onServerEvent(msg) {
