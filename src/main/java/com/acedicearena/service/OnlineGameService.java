@@ -56,7 +56,7 @@ public class OnlineGameService {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("devices", deviceViews());
         result.put("armedTeam", lastArmedTeam);
-        result.put("preparedTeams", sessions.keySet());
+        result.put("preparedTeams", List.copyOf(sessions.keySet()));
         result.put("armedTeams", sessions.entrySet().stream().filter(e -> e.getValue().goTs != null).map(Map.Entry::getKey).toList());
         Map<String, Long> countdowns = new LinkedHashMap<>();
         sessions.forEach((team, session) -> { if (session.countdownAt != null) countdowns.put(team, session.countdownAt); });
@@ -116,14 +116,18 @@ public class OnlineGameService {
         return new Calibration(offset, rtt);
     }
 
-    public synchronized void ready(String token, boolean ready) {
+    public void ready(String token, boolean ready) {
+        publishAfterUnlock(readyLocked(token, ready));
+    }
+
+    private synchronized List<Object> readyLocked(String token, boolean ready) {
         Device old = requireDevice(token);
         if (ready && !old.calibrated()) throw new IllegalStateException("设备校准完成后才能准备");
         TeamRollSession session = sessions.get(old.teamId());
         if (session == null || session.goTs != null) throw new IllegalStateException("当前不在备战准备阶段");
         devices.put(token, new Device(old.teamId(), old.slot(), old.name(), old.playerId(), old.offset(), old.rtt(), old.calibrated(), ready));
         broadcast(Map.of("type", "roster", "devices", deviceViews()));
-        publisher.publishEvent(new DiceReadinessChangedEvent(old.teamId()));
+        return List.of(new DiceReadinessChangedEvent(old.teamId()));
     }
 
     public synchronized void prepare(String teamId, String matchId, int round, List<String> lineup) {
