@@ -30,7 +30,8 @@
   function tournamentCard(match) {
     var stage = TournamentUI.stage(match), winner = game.teams.find(function (team) { return team.id === match.winner; });
     var detail;
-    if (match.status === 'done') detail = '胜者 · ' + (winner ? winner.name : match.winner);
+    if (match.status === 'done') detail = '胜者 · ' + (winner ? winner.name : match.winner) + (match.tieBreak && match.tieBreak !== '胜场' ? ' · 按' + match.tieBreak + '判定' : '');
+    else if (match.phase === 'OVERTIME_PENDING') detail = '三连环全平 · 待加赛';
     else if (match.phase === 'RESULT') detail = '本场结果结算中 · ' + (match.tieBreak || '胜场');
     else if (match.phase === 'BATTLE') detail = '第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中');
     else detail = '等待开赛';
@@ -83,11 +84,11 @@
       var total = (mine.players || []).length;
       var rolled = (mine.players || []).filter(function (p) { return p.dice != null; }).length;
       body = '<div class="flow-detail"><span>已掷</span><b>' + rolled + ' / ' + total + '</b></div><div class="flow-detail"><span>' + (game.rollGoAt ? '倒计时' : '截止') + '</span><b>' + countdown(game.rollGoAt ? game.rollGoAt : game.stageDeadlineAt) + '</b></div>';
-      copy = '321 倒计时后 6 支小队按顺序间隔 1 秒开掷，每小队 15 秒窗口；小队 5 人时刻首尾差 ≤0.5s 触发 ×1.5 暴击。';
+      copy = '321 倒计时后 6 支小队按顺序间隔 1 秒开掷，截止时刻全员统一；小队 5 人时刻首尾差 ≤0.5s 触发 ×1.5 暴击。';
     } else if (stage === 'BLIND_BOX') {
       var opened = (mine.players || []).filter(function (p) { return p.blindBox != null; }).length;
       body = '<div class="flow-detail"><span>已开</span><b>' + opened + ' / ' + (mine.players || []).length + '</b></div>';
-      copy = '每人手动开盲盒（+5/+4/+3/+2/+1/-1/-2），15 秒内不开视为放弃（按 0 计）。';
+      copy = '每人手动开盲盒（+5/+4/+3/+2/+1/-1/-2），25 秒内不开视为放弃（按 0 计）。';
     } else if (stage === 'TACTICS') {
       var limit = Math.min(mine.rerollQuota || 0, 5);
       body = '<div class="flow-detail"><span>重掷</span><b>' + Number(mine.rerollUsed || 0) + ' / ' + limit + '</b></div><div class="flow-detail"><span>出场顺序</span><b>' + (mine.squadOrderLocked ? '已锁定' : '待锁定') + '</b></div>';
@@ -98,7 +99,8 @@
         var a = game.teams.find(function (t) { return t.id === match.a; }) || { id: match.a, name: match.a };
         var b = game.teams.find(function (t) { return t.id === match.b; }) || { id: match.b, name: match.b };
         var detail;
-        if (match.status === 'done') detail = '胜者 · ' + esc(teamName(match.winner));
+        if (match.status === 'done') detail = '胜者 · ' + esc(teamName(match.winner)) + (match.tieBreak && match.tieBreak !== '胜场' ? ' · 按' + match.tieBreak + '判定' : '');
+        else if (match.phase === 'OVERTIME_PENDING') detail = '三连环全平 · 待加赛';
         else if (match.phase === 'RESULT') detail = '本场结果结算中 · ' + esc(match.tieBreak || '胜场');
         else if (match.phase === 'BATTLE') detail = '第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中');
         else detail = '等待开赛';
@@ -143,6 +145,8 @@
     refreshTimer = setTimeout(function () { refreshTimer = null; load(); }, 300);
   }
   var source = new EventSource('/api/lobby/events');
+  // （重）连上后补拉一次：断线期间错过的推进靠这次回源追平
+  source.onopen = function () { queueLoad(); };
   source.onmessage = function (e) {
     var m;
     try { m = JSON.parse(e.data); } catch (err) { return; }

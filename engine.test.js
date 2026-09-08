@@ -49,7 +49,7 @@ test('API 导出与规格一致', () => {
   assert.equal(GameEngine.DEFAULT_CONFIG.syncCritMultiplier, 1.5);
   assert.equal(GameEngine.DEFAULT_CONFIG.gmvPerReroll, 100000);
   assert.deepStrictEqual(GameEngine.DEFAULT_CONFIG.blindBoxValues, [5, 4, 3, 2, 1, -1, -2]);
-  assert.deepStrictEqual(GameEngine.DEFAULT_CONFIG.blindBoxWeights, [1, 3, 8, 20, 28, 22, 18]);
+  assert.deepStrictEqual(GameEngine.DEFAULT_CONFIG.blindBoxWeights, [1, 4, 10, 25, 35, 17, 8]);
 });
 
 /* ---------- 数值规则（与服务端 ParallelTournamentServiceTest 对拍） ---------- */
@@ -114,8 +114,10 @@ test('rerollQuotaFor 为 GMV 除以 10 万向下取整', () => {
   assert.equal(GameEngine.rerollQuotaFor(300000), 3);
 });
 
-test('drawBlindBox 只落在声明档位且覆盖全部档位', () => {
+test('drawBlindBox 只落在声明档位且分布符合权重', () => {
   const values = GameEngine.DEFAULT_CONFIG.blindBoxValues;
+  const weights = GameEngine.DEFAULT_CONFIG.blindBoxWeights;
+  assert.equal(weights.reduce((a, b) => a + b, 0), 100);
   const counts = {};
   const total = 20000;
   const rng = makeRng(1234);
@@ -125,25 +127,28 @@ test('drawBlindBox 只落在声明档位且覆盖全部档位', () => {
     counts[v] = (counts[v] || 0) + 1;
   }
   assert.deepStrictEqual(Object.keys(counts).map(Number).sort((a, b) => a - b), values.slice().sort((a, b) => a - b));
-  for (const v of values) {
-    const ratio = counts[v] / total;
-    assert.ok(ratio > 0.005 && ratio < 0.35, `档位 ${v} 占比 ${ratio} 超出 0.5%~35%`);
+  for (let i = 0; i < values.length; i++) {
+    const ratio = (counts[values[i]] || 0) / total;
+    const expected = weights[i] / 100;
+    assert.ok(Math.abs(ratio - expected) <= 0.02, `档位 ${values[i]} 占比 ${ratio} 偏离权重 ${expected}`);
   }
+  // 负档（debuff）合计应为 25%
+  const debuff = ((counts[-1] || 0) + (counts[-2] || 0)) / total;
+  assert.ok(debuff > 0.22 && debuff < 0.28, `debuff 占比 ${debuff} 偏离 25%`);
 });
 
 /* ---------- 平局链（与服务端 compareMatchTieBreak / decideMatchWinner 对拍） ---------- */
 
-test('平局链：总点数 → 增长系数 → 队伍 ID 字典序', () => {
-  assert.ok(GameEngine.compareMatchTieBreak(100, 99, 1.0, 2.0, 't1', 't2') > 0);
-  assert.ok(GameEngine.compareMatchTieBreak(99, 100, 2.0, 1.0, 't1', 't2') < 0);
-  assert.ok(GameEngine.compareMatchTieBreak(100, 100, 1.2, 1.1, 't1', 't2') > 0);
-  assert.ok(GameEngine.compareMatchTieBreak(100, 100, 1.1, 1.2, 't1', 't2') < 0);
-  assert.ok(GameEngine.compareMatchTieBreak(100, 100, 1.0, 1.0, 't1', 't2') > 0);
-  assert.ok(GameEngine.compareMatchTieBreak(100, 100, 1.0, 1.0, 't2', 't1') < 0);
+test('平局链：总点数 → GMV → 全平待加赛', () => {
+  assert.ok(GameEngine.compareMatchTieBreak(100, 99, 100000, 200000) > 0);
+  assert.ok(GameEngine.compareMatchTieBreak(99, 100, 200000, 100000) < 0);
+  assert.ok(GameEngine.compareMatchTieBreak(100, 100, 300000, 200000) > 0);
+  assert.ok(GameEngine.compareMatchTieBreak(100, 100, 200000, 300000) < 0);
+  assert.strictEqual(GameEngine.compareMatchTieBreak(100, 100, 200000, 200000), 0);
 });
 
 test('比赛胜负链走完全程', () => {
-  const base = { totalPointsA: 180, totalPointsB: 30, coefficientA: 1.2, coefficientB: 1.0, idA: 't1', idB: 't2' };
+  const base = { totalPointsA: 180, totalPointsB: 30, gmvA: 300000, gmvB: 200000 };
 
   let r = GameEngine.decideMatchWinner(Object.assign({}, base, { winsA: 4, winsB: 2 }));
   assert.equal(r.winnerSide, 'A');
@@ -153,17 +158,17 @@ test('比赛胜负链走完全程', () => {
   assert.equal(r.winnerSide, 'A');
   assert.equal(r.tieBreak, '总点数');
 
-  r = GameEngine.decideMatchWinner({ winsA: 3, winsB: 3, totalPointsA: 180, totalPointsB: 180, coefficientA: 1.2, coefficientB: 1.0, idA: 't1', idB: 't2' });
+  r = GameEngine.decideMatchWinner({ winsA: 3, winsB: 3, totalPointsA: 180, totalPointsB: 180, gmvA: 300000, gmvB: 200000 });
   assert.equal(r.winnerSide, 'A');
-  assert.equal(r.tieBreak, '增长系数');
+  assert.equal(r.tieBreak, 'GMV');
 
-  r = GameEngine.decideMatchWinner({ winsA: 3, winsB: 3, totalPointsA: 180, totalPointsB: 180, coefficientA: 1.2, coefficientB: 1.2, idA: 't1', idB: 't2' });
-  assert.equal(r.winnerSide, 'A');
-  assert.equal(r.tieBreak, '队伍ID');
-
-  r = GameEngine.decideMatchWinner({ winsA: 3, winsB: 3, totalPointsA: 180, totalPointsB: 180, coefficientA: 1.2, coefficientB: 1.2, idA: 't2', idB: 't1' });
+  r = GameEngine.decideMatchWinner({ winsA: 3, winsB: 3, totalPointsA: 180, totalPointsB: 180, gmvA: 200000, gmvB: 300000 });
   assert.equal(r.winnerSide, 'B');
-  assert.equal(r.tieBreak, '队伍ID');
+  assert.equal(r.tieBreak, 'GMV');
+
+  r = GameEngine.decideMatchWinner({ winsA: 3, winsB: 3, totalPointsA: 180, totalPointsB: 180, gmvA: 300000, gmvB: 300000 });
+  assert.strictEqual(r.winnerSide, null);
+  assert.equal(r.tieBreak, '加赛');
 });
 
 test('单局胜负：战力高者胜，相等平局', () => {
@@ -203,8 +208,8 @@ test('simulateMatch 用同一随机种子可复现且结构完整', () => {
 
   assert.equal(a.rounds.length, 6);
   assert.equal(a.winsA + a.winsB <= 6, true);
-  assert.ok(a.winnerSide === 'A' || a.winnerSide === 'B');
-  assert.ok(['胜场', '总点数', '增长系数', '队伍ID'].indexOf(a.tieBreak) >= 0);
+  assert.ok(a.winnerSide === 'A' || a.winnerSide === 'B' || a.winnerSide === null);
+  assert.ok(['胜场', '总点数', 'GMV', '加赛'].indexOf(a.tieBreak) >= 0);
   a.rounds.forEach((round, i) => {
     assert.equal(round.round, i + 1);
     assert.equal(round.powerA, GameEngine.squadPower(round.baseA, round.critA, round.guessHitsA));

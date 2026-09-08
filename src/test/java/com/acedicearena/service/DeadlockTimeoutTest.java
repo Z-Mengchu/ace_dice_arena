@@ -32,6 +32,23 @@ class DeadlockTimeoutTest {
     }
 
     @Test
+    void captainVoteTimeoutSkipsEmptyTeamsAndStillAdvances() {
+        ObjectNode root = state("CAPTAIN_VOTE");
+        ObjectNode emptyTeam = ((ArrayNode) root.path("teams")).addObject();
+        emptyTeam.put("id", "t3").put("name", "t3");
+        emptyTeam.putObject("roles");
+        emptyTeam.putObject("roleVotes");
+        emptyTeam.putArray("players");
+        root.path("teams").forEach(team ->
+                ((ObjectNode) team).put("roleVoteDeadlineAt", System.currentTimeMillis() - 1));
+
+        assertThat(service().expireVoting(root, System.currentTimeMillis())).isTrue();
+
+        assertThat(emptyTeam.path("roles").has("captain")).isFalse();
+        assertThat(root.path("stage").asText()).isEqualTo("SQUAD_FORM");
+    }
+
+    @Test
     void squadFormTimeoutSplitsThirtyPlayersIntoSixSquadsOfFive() {
         ObjectNode root = state("SQUAD_FORM");
         root.put("stageDeadlineAt", System.currentTimeMillis() - 1);
@@ -88,10 +105,10 @@ class DeadlockTimeoutTest {
     }
 
     @Test
-    void squadWindowExpiryAutoRollsOnlyThatSquad() {
+    void squadWindowPassedDoesNotAutoRollBeforeTheSharedDeadline() {
         ObjectNode root = state("ROLL");
         root.path("teams").forEach(team -> formSquads((ObjectNode) team));
-        // 1 号小队窗口刚结束 500ms，2 号小队窗口还剩 500ms，全局截止仍在将来
+        // 1 号小队开掷已过 15.5s，但全局截止（go+20s，全员统一）还没到：不代掷、不推进
         long now = System.currentTimeMillis();
         long go = now - 15_500L;
         root.put("rollGoAt", go);
@@ -99,20 +116,11 @@ class DeadlockTimeoutTest {
         for (int k = 0; k < 6; k++) rollOpenAts.add(go + k * 1_000L);
         root.put("stageDeadlineAt", go + 20_000L);
 
-        assertThat(service().expireRoll(root, now)).isTrue();
+        assertThat(service().expireRoll(root, now)).isFalse();
 
         assertThat(root.path("stage").asText()).isEqualTo("ROLL");
-        root.path("teams").forEach(team -> {
-            team.path("squads").get(0).forEach(idNode -> {
-                JsonNode player = findPlayer(team, idNode.asText());
-                assertThat(player.path("dice").asInt()).isBetween(1, 6);
-                assertThat(player.path("rollTs").asLong()).isEqualTo(go + 1_000L);
-                assertThat(player.path("autoRolled").asBoolean()).isTrue();
-            });
-            for (int k = 1; k < 6; k++)
-                team.path("squads").get(k).forEach(idNode ->
-                        assertThat(findPlayer(team, idNode.asText()).has("dice")).isFalse());
-        });
+        root.path("teams").forEach(team -> team.path("players")
+                .forEach(player -> assertThat(player.has("dice")).isFalse()));
     }
 
     @Test

@@ -202,6 +202,17 @@ public class LobbyController {
         return adminOnly(s, () -> tournament.forceMatch(matchId));
     }
 
+    /**
+     * 单场加赛：三连环全平的场次由管理员触发两队重赛。
+     */
+    @PostMapping("/admin/matches/{matchId}/rematch")
+    public ResponseEntity<?> rematch(@PathVariable String matchId, HttpSession s) {
+        return adminOnly(s, () -> {
+            tournament.rematch(user(s), matchId);
+            return Map.of("ok", true);
+        });
+    }
+
     @GetMapping("/admin/test-mode/status")
     public ResponseEntity<?> testModeStatus(HttpSession s) {
         return adminOnly(s, testMode::status);

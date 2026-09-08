@@ -14,3 +14,4 @@ src/main/resources/gmv-sample-data.csv
 *.jks
 *.p12
 *.pem
+loadtest/

@@ -22,6 +22,7 @@ import org.springframework.web.bind.annotation.*;
 import java.util.List;
 import java.util.Map;
 import java.time.Instant;
+import java.util.concurrent.ConcurrentHashMap;
 
 @RestController
 @RequestMapping("/api")
@@ -67,9 +68,14 @@ public class GameDataController {
         JsonNode state = snapshot.state();
         if (ordinaryUser) {
             UserAccount account = users.findByUsername(username).orElse(null);
-            state = tournament.publicStateView(state,
-                    account == null ? null : account.getTeamId(),
-                    account == null ? null : "u" + account.getId());
+            String teamId = account == null ? null : account.getTeamId();
+            String playerId = account == null ? null : "u" + account.getId();
+            // 脱敏视图只取决于 (state, teamId, playerId)：按队缓存在快照上，随快照替换整体失效，
+            // 避免每个回源请求都对全树深拷贝；teamId 为空时视图按 playerId 兜底定位本队。
+            String viewKey = teamId != null ? "t:" + teamId
+                    : playerId != null ? "p:" + playerId : "outsider";
+            state = snapshot.teamViews().computeIfAbsent(viewKey,
+                    key -> tournament.publicStateView(snapshot.state(), teamId, playerId));
         }
         return ResponseEntity.ok(Map.of("state", state, "version", snapshot.version()));
     }
@@ -171,10 +177,11 @@ public class GameDataController {
                         // BLIND_BOX 阶段开盒结果在 player_blind_box 表，注入后再入缓存
                         tournament.injectBlindBoxResults(state);
                         return new StateSnapshot(true, state, record.getVersion(),
-                                record.getUpdatedAt(), record.getUpdatedBy() == null ? "" : record.getUpdatedBy(), loadedAt);
+                                record.getUpdatedAt(), record.getUpdatedBy() == null ? "" : record.getUpdatedBy(),
+                                loadedAt, new ConcurrentHashMap<>());
                     })
                     .orElseGet(() -> new StateSnapshot(false, objectMapper.createObjectNode(), 0,
-                            Instant.EPOCH, "", loadedAt));
+                            Instant.EPOCH, "", loadedAt, new ConcurrentHashMap<>()));
             stateCache = loaded;
             return loaded;
         }
@@ -196,6 +203,6 @@ public class GameDataController {
 
     public record ReportBody(String content) {}
     private record StateSnapshot(boolean present, JsonNode state, long version, Instant updatedAt,
-                                 String updatedBy, long loadedAt) {}
+                                 String updatedBy, long loadedAt, ConcurrentHashMap<String, JsonNode> teamViews) {}
     private record TestUserSnapshot(boolean present, long loadedAt) {}
 }

@@ -136,9 +136,11 @@
     var stage = TournamentUI.stage(match);
     var done = match.status === 'done';
     var result = match.phase === 'RESULT';
-    var headerText = done ? '已完赛' : result ? '结果结算中' : match.phase === 'BATTLE' ? ('第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中')) : '等待开赛';
+    var pending = match.phase === 'OVERTIME_PENDING';
+    var headerText = done ? '已完赛' : pending ? '待加赛' : result ? '结果结算中' : match.phase === 'BATTLE' ? ('第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中')) : '等待开赛';
     var winnerName = done && match.winner ? esc(team(state, match.winner).name) : '';
-    var tieLine = result || done ? '<div class="feed-meta"><span>判定依据：' + esc(match.tieBreak || '胜场') + '</span>' + (match.totalPointsA != null ? '<span>总点数 ' + match.totalPointsA + ' : ' + match.totalPointsB + '</span>' : '') + '</div>' : '';
+    var tieText = TournamentUI.tieBreakText(match, a.name, b.name);
+    var tieLine = result || done || pending ? '<div class="feed-meta"><span>' + esc(tieText || ('判定依据：' + (match.tieBreak || '胜场'))) + '</span></div>' : '';
     var live = match.status === 'active';
     return '<article class="live-feed ' + (done ? 'finished ' : '') + (result ? 'showing-result ' : '') + 'match-card">'
       + '<header><span>' + esc(stage.label) + ' · ' + (live ? 'LIVE' : 'ARCHIVE') + '</span><b>' + esc(headerText) + '</b></header>'
@@ -245,6 +247,8 @@
   }
   function connectEvents() {
     var source = new EventSource('/api/lobby/events');
+    // （重）连上后补拉一次：断线期间错过的推进靠这次回源追平
+    source.onopen = function () { queueLoad(); };
     source.onmessage = function (e) {
       var m;
       try { m = JSON.parse(e.data); } catch (err) { return; }

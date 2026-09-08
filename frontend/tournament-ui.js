@@ -22,6 +22,7 @@
   function status(match) {
     if (match.status === 'done') return '已结束';
     if (match.phase === 'RESULT') return '结果展示';
+    if (match.phase === 'OVERTIME_PENDING') return '待加赛';
     return '进行中';
   }
 
@@ -71,6 +72,27 @@
       }).join('') + '</div></div>';
   }
 
+  /**
+   * 决胜链文案：胜场打平时给玩家解释"为什么平了还分胜负"。
+   * labelA/labelB 为两侧标签（队名或"我方"/"对方"），顺序须与界面上比分顺序一致。
+   * tieBreak 为 '胜场' 或为空时返回 ''（比分本身已说明）；数值字段仅在胜场打平时存在，需判空。
+   */
+  function tieBreakText(match, labelA, labelB) {
+    var tieBreak = match && match.tieBreak;
+    if (!tieBreak || tieBreak === '胜场') return '';
+    if (tieBreak === '加赛') return '胜场、总点数、GMV 全部打平，等待管理员安排两队加赛';
+    var a = labelA || 'A 队', b = labelB || 'B 队';
+    if (tieBreak === '总点数') {
+      if (match.totalPointsA == null || match.totalPointsB == null) return '胜场相同，按 30 人总点数判定，总点数高者胜';
+      return '胜场相同，按 30 人总点数判定：' + a + ' ' + match.totalPointsA + ' : ' + match.totalPointsB + ' ' + b + '，总点数高者胜';
+    }
+    if (tieBreak === 'GMV') {
+      if (match.gmvA == null || match.gmvB == null) return '胜场与总点数均相同，按队伍 GMV 判定，GMV 高者胜';
+      return '胜场与总点数均相同，按队伍 GMV 判定：' + a + ' ' + match.gmvA + ' : ' + match.gmvB + ' ' + b + '，GMV 高者胜';
+    }
+    return '按' + tieBreak + '判定胜负';
+  }
+
   window.TournamentUI = { stage: stage, matches: matches, status: status, currentStage: currentStage,
-    resultMembers: resultMembers, resultRosterHtml: resultRosterHtml };
+    resultMembers: resultMembers, resultRosterHtml: resultRosterHtml, tieBreakText: tieBreakText };
 })();

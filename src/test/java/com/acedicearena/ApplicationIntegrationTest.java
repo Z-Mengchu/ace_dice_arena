@@ -280,14 +280,13 @@ class ApplicationIntegrationTest {
     }
 
     @Test
-    void laterSquadsKeepTheirOwnFullFifteenSecondWindow() throws Exception {
+    void laterSquadsOpenLaterButShareTheSameDeadline() throws Exception {
         MockHttpSession squad0Session = registerAssignedPlayer("squad0_roller", "t1");
         MockHttpSession squad5Session = registerAssignedPlayer("squad5_roller", "t1");
         var squad0User = userAccountRepository.findByUsername("squad0_roller").orElseThrow();
         var squad5User = userAccountRepository.findByUsername("squad5_roller").orElseThrow();
 
-        // go 已过去 17s：1 号小队窗口（go..go+15s）刚关闭，6 号小队窗口（go+5s..go+20s）仍开放约 3s。
-        // 若所有小队共用同一个截止时刻，6 号小队的掷骰也会被一并拒掉——这正是要锁住的回归。
+        // go 已过去 17s：1 号小队已开掷，6 号小队（go+5s 开）也在窗口内；全局截止 go+20s 未到，双方都能掷。
         ObjectNode root = rollStateRoot(List.of(), List.of());
         long go = System.currentTimeMillis() - 17_000L;
         root.put("rollGoAt", go);
@@ -309,16 +308,13 @@ class ApplicationIntegrationTest {
                 .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
         assertThat(assign0.path("squadIndex").asInt()).isEqualTo(0);
         assertThat(assign5.path("squadIndex").asInt()).isEqualTo(5);
-        // 每个小队有独立的 15s 窗口：6 号小队的开掷与截止都比 1 号小队晚 5s（错峰补偿）
+        // 开掷时刻仍按小队错开 5s，但截止时刻全员统一为全局 stageDeadlineAt
         assertThat(assign5.path("rollOpenAt").asLong() - assign0.path("rollOpenAt").asLong()).isEqualTo(5_000L);
-        assertThat(assign5.path("rollDeadlineAt").asLong() - assign0.path("rollDeadlineAt").asLong()).isEqualTo(5_000L);
-        assertThat(assign0.path("rollDeadlineAt").asLong()).isLessThan(System.currentTimeMillis());
-        assertThat(assign5.path("rollDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
+        assertThat(assign0.path("rollDeadlineAt").asLong()).isEqualTo(assign0.path("stageDeadlineAt").asLong());
+        assertThat(assign5.path("rollDeadlineAt").asLong()).isEqualTo(assign5.path("stageDeadlineAt").asLong());
 
-        // 1 号小队窗口已关闭 → 409（窗口已结束或被扫描代掷）；6 号小队窗口仍开放 → 200
-        mockMvc.perform(post("/api/roll").session(squad0Session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + token0 + "\",\"clientTs\":" + System.currentTimeMillis() + "}"))
-                .andExpect(status().isConflict());
+        // 双方都在全局窗口内 → 都能掷
+        roll(squad0Session, token0);
         roll(squad5Session, token5);
     }
 
@@ -332,15 +328,20 @@ class ApplicationIntegrationTest {
         root.put("stageDeadlineAt", System.currentTimeMillis() + 15_000L);
         saveState(root);
 
-        // 开盒结果写入 player_blind_box 独立行并随响应返回，不改写 game_state 行
-        int box = objectMapper.readTree(mockMvc.perform(post("/api/lobby/player-action").session(session)
+        // 开盒结果写入 player_blind_box 独立行并随响应返回，不改写 game_state 行；
+        // 三选一：selections 带盒子序号，响应返回 3 个盒子内容与选中序号
+        JsonNode opened = objectMapper.readTree(mockMvc.perform(post("/api/lobby/player-action").session(session)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"type\":\"blind-box-open\",\"selections\":[]}"))
+                        .content("{\"type\":\"blind-box-open\",\"selections\":[\"1\"]}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.ok").value(true))
                 .andExpect(jsonPath("$.blindBox").isNumber())
-                .andReturn().getResponse().getContentAsString()).path("blindBox").asInt();
-        assertThat(box).isBetween(-2, 3);
+                .andExpect(jsonPath("$.picked").value(1))
+                .andReturn().getResponse().getContentAsString());
+        int box = opened.path("blindBox").asInt();
+        assertThat(box).isBetween(-2, 5);
+        assertThat(opened.path("boxes").size()).isEqualTo(3);
+        assertThat(opened.path("boxes").get(1).asInt()).isEqualTo(box);
 
         // game_state 行内不落盲盒字段；/api/game-state 读取层注入本轮已开结果
         JsonNode saved = objectMapper.readTree(gameStateRepository.findById(1L).orElseThrow().getContent());
@@ -358,12 +359,13 @@ class ApplicationIntegrationTest {
         assertThat(me.path("blindBox").asInt()).isEqualTo(box);
         assertThat(me.path("blindBoxOpened").asBoolean()).isTrue();
 
-        // 重复开盒幂等：返回同一结果，「每人限开一次」由唯一键保证
+        // 重复开盒幂等：返回同一结果，「每人限开一次」由唯一键保证；重放不带陪跑值，前端按刷新重进处理
         mockMvc.perform(post("/api/lobby/player-action").session(session)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"type\":\"blind-box-open\",\"selections\":[]}"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.blindBox").value(box));
+                .andExpect(jsonPath("$.blindBox").value(box))
+                .andExpect(jsonPath("$.boxes").doesNotExist());
     }
 
     @Test

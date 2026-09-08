@@ -84,33 +84,37 @@ class ParallelTournamentServiceTest {
     @Test
     void blindBoxDrawsStayWithinDeclaredTiersAndCoverAllOfThem() {
         ParallelTournamentService service = service();
-        Set<Integer> tiers = new HashSet<>();
-        for (int value : ParallelTournamentService.BLIND_BOX_VALUES) tiers.add(value);
+        int weightSum = 0;
+        for (int weight : ParallelTournamentService.BLIND_BOX_WEIGHTS) weightSum += weight;
+        assertThat(weightSum).isEqualTo(100);
         Map<Integer, Integer> counts = new HashMap<>();
         int total = 20_000;
         for (int i = 0; i < total; i++) {
             int value = service.drawBlindBox();
-            assertThat(value).isIn(tiers);
             counts.merge(value, 1, Integer::sum);
         }
-        assertThat(counts.keySet()).isEqualTo(tiers);
-        for (int count : counts.values()) {
-            double ratio = (double) count / total;
-            assertThat(ratio).isBetween(0.005d, 0.35d);
+        for (int i = 0; i < ParallelTournamentService.BLIND_BOX_VALUES.length; i++) {
+            double expected = ParallelTournamentService.BLIND_BOX_WEIGHTS[i] / 100d;
+            double ratio = counts.getOrDefault(ParallelTournamentService.BLIND_BOX_VALUES[i], 0) / (double) total;
+            assertThat(ratio).isBetween(Math.max(0d, expected - 0.02d), expected + 0.02d);
         }
+        // 负档（debuff）合计应为 25%
+        double debuff = (counts.getOrDefault(-1, 0) + counts.getOrDefault(-2, 0)) / (double) total;
+        assertThat(debuff).isBetween(0.22d, 0.28d);
     }
 
     /* ---------- 平局链 ---------- */
 
     @Test
-    void matchTieBreakChainIsPointsThenGrowthCoefficientThenTeamId() {
-        assertThat(ParallelTournamentService.compareMatchTieBreak(100, 99, 1.0, 2.0, "t1", "t2")).isPositive();
-        assertThat(ParallelTournamentService.compareMatchTieBreak(99, 100, 2.0, 1.0, "t1", "t2")).isNegative();
-        assertThat(ParallelTournamentService.compareMatchTieBreak(100, 100, 1.2, 1.1, "t1", "t2")).isPositive();
-        assertThat(ParallelTournamentService.compareMatchTieBreak(100, 100, 1.1, 1.2, "t1", "t2")).isNegative();
-        // 全部相等时队伍 ID 字典序小者胜
-        assertThat(ParallelTournamentService.compareMatchTieBreak(100, 100, 1.0, 1.0, "t1", "t2")).isPositive();
-        assertThat(ParallelTournamentService.compareMatchTieBreak(100, 100, 1.0, 1.0, "t2", "t1")).isNegative();
+    void matchTieBreakChainIsPointsThenGmvThenOvertime() {
+        assertThat(ParallelTournamentService.compareMatchTieBreak(100, 99, BigDecimal.ZERO, BigDecimal.TEN)).isPositive();
+        assertThat(ParallelTournamentService.compareMatchTieBreak(99, 100, BigDecimal.TEN, BigDecimal.ZERO)).isNegative();
+        assertThat(ParallelTournamentService.compareMatchTieBreak(100, 100,
+                BigDecimal.valueOf(300_000), BigDecimal.valueOf(200_000))).isPositive();
+        assertThat(ParallelTournamentService.compareMatchTieBreak(100, 100,
+                BigDecimal.valueOf(200_000), BigDecimal.valueOf(300_000))).isNegative();
+        // 总点数与 GMV 全部相等 → 全平，待加赛
+        assertThat(ParallelTournamentService.compareMatchTieBreak(100, 100, BigDecimal.TEN, BigDecimal.TEN)).isZero();
     }
 
     @Test
@@ -118,6 +122,8 @@ class ParallelTournamentServiceTest {
         ObjectNode root = battleRoot();
         giveDice(team(root, "t1"), 6, 1_000L, 600L, false);
         giveDice(team(root, "t2"), 1, 1_000L, 600L, false);
+        team(root, "t1").put("gmv", BigDecimal.valueOf(300_000));
+        team(root, "t2").put("gmv", BigDecimal.valueOf(200_000));
         ObjectNode match = match(root);
 
         match.put("winsA", 4).put("winsB", 2);
@@ -129,17 +135,53 @@ class ParallelTournamentServiceTest {
         assertThat(service().decideMatchWinner(root, match)).isEqualTo("A");
         assertThat(match.path("tieBreak").asText()).isEqualTo("总点数");
 
-        // 总点数也相等 → 增长系数（t1 1.2 > t2 1.0）
+        // 总点数也相等 → GMV（t1 30 万 > t2 20 万）
         giveDice(team(root, "t2"), 6, 1_000L, 600L, false);
         assertThat(service().decideMatchWinner(root, match)).isEqualTo("A");
-        assertThat(match.path("tieBreak").asText()).isEqualTo("增长系数");
+        assertThat(match.path("tieBreak").asText()).isEqualTo("GMV");
 
-        // 增长系数也相等 → 队伍 ID 字典序小者胜
-        team(root, "t2").put("growthCoefficient", 1.2);
-        assertThat(service().decideMatchWinner(root, match)).isEqualTo("A");
-        assertThat(match.path("tieBreak").asText()).isEqualTo("队伍ID");
-        match.put("a", "t2").put("b", "t1");
-        assertThat(service().decideMatchWinner(root, match)).isEqualTo("B");
+        // GMV 也相等 → 全平，不产生胜者，待加赛
+        team(root, "t2").put("gmv", BigDecimal.valueOf(300_000));
+        assertThat(service().decideMatchWinner(root, match)).isNull();
+        assertThat(match.path("tieBreak").asText()).isEqualTo("加赛");
+    }
+
+    @Test
+    void rematchResetsFullTieMatchBackIntoRollFlow() throws Exception {
+        ObjectNode root = battleRoot();
+        ObjectNode match = match(root);
+        match.put("phase", "OVERTIME_PENDING");
+        match.put("tieBreak", "加赛");
+        match.put("totalPointsA", 180).put("totalPointsB", 180);
+        match.put("gmvA", BigDecimal.valueOf(300_000)).put("gmvB", BigDecimal.valueOf(300_000));
+        var record = new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test");
+        var states = mock(com.acedicearena.repository.GameStateRepository.class);
+        when(states.findLockedById(1L)).thenReturn(Optional.of(record));
+
+        service(states, mock(com.acedicearena.repository.UserAccountRepository.class),
+                mock(LobbyEventService.class)).rematch("admin", "g1");
+
+        ObjectNode after = (ObjectNode) mapper.readTree(record.getContent());
+        ObjectNode rematched = (ObjectNode) after.path("matches").path("g1");
+        assertThat(rematched.path("phase").asText()).isEqualTo("PENDING");
+        assertThat(rematched.has("winner")).isFalse();
+        assertThat(rematched.has("tieBreak")).isFalse();
+        assertThat(rematched.path("winsA").asInt()).isZero();
+        assertThat(rematched.path("rounds")).isEmpty();
+        assertThat(after.path("stage").asText()).isEqualTo("ROLL");
+    }
+
+    @Test
+    void rematchRejectsMatchNotWaitingForOvertime() {
+        ObjectNode root = battleRoot();
+        var record = new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test");
+        var states = mock(com.acedicearena.repository.GameStateRepository.class);
+        when(states.findLockedById(1L)).thenReturn(Optional.of(record));
+
+        assertThatThrownBy(() -> service(states,
+                mock(com.acedicearena.repository.UserAccountRepository.class),
+                mock(LobbyEventService.class)).rematch("admin", "g1"))
+                .hasMessage("该场次不在待加赛状态");
     }
 
     /* ---------- 队长投票 ---------- */
@@ -272,6 +314,20 @@ class ParallelTournamentServiceTest {
         assertThat(opened.has("autoOpened")).isFalse();
         assertThatThrownBy(() -> service.openBlindBox(root, member))
                 .hasMessage("你已经开过本轮盲盒");
+    }
+
+    @Test
+    void blindBoxOpenRejectsOutOfRangeBoxIndex() {
+        ParallelTournamentService service = service();
+        ObjectNode root = blindBoxRoot();
+        UserAccount member = user(1L, "t1");
+
+        assertThatThrownBy(() -> service.openBlindBox(root, member, List.of("3")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("盲盒序号超出范围");
+        assertThatThrownBy(() -> service.openBlindBox(root, member, List.of("x")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("盲盒序号必须是数字");
     }
 
     /* ---------- 排阵 ---------- */
@@ -597,17 +653,21 @@ class ParallelTournamentServiceTest {
     /* ---------- 小队错峰掷骰 ---------- */
 
     @Test
-    void liveRollRejectsBeforeOwnSquadWindowOpensAndAfterItCloses() {
+    void liveRollRejectsBeforeOwnSquadWindowOpensAndAfterGlobalDeadline() {
         long now = System.currentTimeMillis();
         // 2 号小队（u6~u10）在 go+1s 才开掷，提前提交被拒
         ObjectNode root = rollRoot(now - 500L, now + 19_500L);
         assertThatThrownBy(() -> rollingService(root, user(6L, "t1")).recordLiveRoll("user6", now))
                 .hasMessage("还没轮到你们小队掷骰");
 
-        // 2 号小队窗口（go+1s ~ go+16s）已结束，全局截止时间还没到
-        ObjectNode late = rollRoot(now - 17_000L, now + 3_000L);
+        // 本小队已开掷、全局截止未到：接受（截止时刻全员统一，不再按小队截断）
+        ObjectNode open = rollRoot(now - 17_000L, now + 3_000L);
+        assertThat(rollingService(open, user(6L, "t1")).recordLiveRoll("user6", now).rollTs()).isPositive();
+
+        // 全局截止时间已过才被拒
+        ObjectNode late = rollRoot(now - 21_000L, now - 1L);
         assertThatThrownBy(() -> rollingService(late, user(6L, "t1")).recordLiveRoll("user6", now))
-                .hasMessage("你们小队的掷骰窗口已结束");
+                .hasMessage("本轮掷骰已截止");
     }
 
     @Test

@@ -60,6 +60,14 @@ public class LobbyEventService {
     }
 
     /**
+     * 阶段/截止时间推进：时效敏感，跳过合并立即广播。
+     */
+    public void gameChangedNow() {
+        Event event = new Event("game", null, null, null);
+        clients.forEach(client -> send(client, event));
+    }
+
+    /**
      * 单张角色选票变化只刷新管理员监控，避免普通玩家的投票表单被反复重绘。
      */
     public void adminGameChanged() {

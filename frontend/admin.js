@@ -212,6 +212,18 @@
     if (forceBound) return;
     forceBound = true;
     document.getElementById('match-grid').addEventListener('click', function (event) {
+      var rematchButton = event.target.closest ? event.target.closest('[data-rematch-match]') : null;
+      if (rematchButton) {
+        var rematchId = rematchButton.getAttribute('data-rematch-match');
+        if (!window.confirm('确认安排两队重赛（加赛）？该场将重新掷骰再打一场。')) return;
+        rematchButton.disabled = true;
+        api('/api/admin/matches/' + encodeURIComponent(rematchId) + '/rematch', 'POST')
+          .catch(function (error) {
+            rematchButton.disabled = false;
+            window.alert(error && error.message ? error.message : '加赛发起失败');
+          });
+        return;
+      }
       var button = event.target.closest ? event.target.closest('[data-force-match]') : null;
       if (!button) return;
       var matchId = button.getAttribute('data-force-match');
@@ -234,6 +246,7 @@
     var b = teams.find(function (team) { return team.id === match.b; }) || { name: match.b };
     var detail;
     if (match.status === 'done') detail = '胜者 · ' + esc((teams.find(function (t) { return t.id === match.winner; }) || {}).name || match.winner);
+    else if (match.phase === 'OVERTIME_PENDING') detail = '三连环全平（胜场/总点数/GMV）· 待加赛';
     else if (match.phase === 'RESULT') detail = '本场结果结算中 · ' + esc(match.tieBreak || '胜场');
     else if (match.phase === 'BATTLE') detail = '第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中');
     else detail = '等待开赛';
@@ -243,7 +256,7 @@
       var cls = entry ? (entry.winner ? 'is-' + String(entry.winner).toLowerCase() : 'is-draw') : current ? 'is-current' : '';
       return '<div class="score-cell ' + cls + '"><i>' + n + '</i><b>' + (entry ? (entry.winner ? esc((entry.winner === 'A' ? a : b).name) : '平') : current ? '…' : '') + '</b></div>';
     }).join('');
-    return '<article class="watch-card tournament-card ' + (match.status === 'active' ? 'is-live' : 'is-history') + '"><small><span>' + esc(stage.label) + '</span><i>' + TournamentUI.status(match) + '</i></small><div><b>' + esc(a.name) + '</b><strong>' + Number(match.winsA || 0) + ' : ' + Number(match.winsB || 0) + '</strong><b>' + esc(b.name) + '</b></div><div class="score-cells admin-score-cells">' + cells + '</div><p>' + detail + '</p>' + (match.status === 'active' ? '<button class="btn btn-ghost btn-force" data-force-match="' + esc(match.id) + '">强制推进本局</button>' : '') + '</article>';
+    return '<article class="watch-card tournament-card ' + (match.status === 'active' ? 'is-live' : 'is-history') + '"><small><span>' + esc(stage.label) + '</span><i>' + TournamentUI.status(match) + '</i></small><div><b>' + esc(a.name) + '</b><strong>' + Number(match.winsA || 0) + ' : ' + Number(match.winsB || 0) + '</strong><b>' + esc(b.name) + '</b></div><div class="score-cells admin-score-cells">' + cells + '</div><p>' + detail + '</p>' + (match.phase === 'OVERTIME_PENDING' ? '<button class="btn btn-primary" data-rematch-match="' + esc(match.id) + '">两队重赛（加赛）</button>' : '') + (match.status === 'active' && match.phase !== 'OVERTIME_PENDING' ? '<button class="btn btn-ghost btn-force" data-force-match="' + esc(match.id) + '">强制推进本局</button>' : '') + '</article>';
   }
   function teamPlayerName(team, playerId) {
     var player = (team.players || []).find(function (candidate) { return candidate.id === playerId; });
@@ -282,6 +295,7 @@
     if (!match) return '<div class="flow-empty">等待本队对局建立</div>';
     var phaseText2;
     if (match.status === 'done') phaseText2 = '本场已结束';
+    else if (match.phase === 'OVERTIME_PENDING') phaseText2 = '三连环全平 · 待加赛';
     else if (match.phase === 'RESULT') phaseText2 = '本场结果结算中';
     else if (match.phase === 'BATTLE') phaseText2 = '第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '揭晓中' : '猜阵中');
     else phaseText2 = '等待开赛';
@@ -478,4 +492,7 @@
   document.getElementById('copy-player-b-login').onclick = function () { copyFormalLogin(this); };
   document.getElementById('hub-logout').onclick = function () { api('/api/auth/logout', 'POST', {}).finally(function () { location.replace('/login'); }); };
   load(); connectStateEvents();
+  /* SSE 之外的兜底：慢轮询 + 回前台补拉，避免断线后流程监控失鲜 */
+  setInterval(function () { if (!document.hidden) queueEventRefresh('game'); }, 15000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) queueEventRefresh('lobby'); });
 })();

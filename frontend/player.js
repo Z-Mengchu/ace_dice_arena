@@ -78,12 +78,17 @@
   var gameState = null;         // /api/game-state 的 state 部分（取队名与已掷点数用）
   var ui = {
     screen: 'loading',          // loading / idle / main / ended / error
-    sub: 'calibrating',         // main 内：calibrating / calibration-error / countdown / go / rolled / kick
-    offset: 0,                  // 服务端时钟 - 本地时钟（校准返回值，用于本地渲染倒计时）
+    sub: 'calibrating',         // main 内：countdown / go / rolled / kick / blindbox / battle / waiting（calibrating 仅作 join 期间的瞬时占位）
+    offset: 0,                  // 服务端时钟 - 本地时钟（后台校准返回值，用于本地渲染倒计时）
     lastRtt: null,
     calibText: '',
     calibWarn: false,
     die: null,
+    rolling: false,             // 掷骰请求在途：在途期间忽略重复点击并保持按钮禁用
+    rollAnimating: false,       // 投骰动画播放中：期间禁止 paintStage 重绘阶段区冲掉动画 DOM
+    renderedNotice: '',         // 阶段区当前已渲染的提示文案：未变化时走秒不重建按钮 DOM
+    myBox: null,                // 开盲盒响应里的本地结果：回源到达前先于 gameState 渲染，新一轮掷骰时清空
+    boxAnimating: false,        // 开盒动画播放中：期间禁止 paintStage 重绘盲盒视图冲掉动画 DOM
     notice: '',
     errText: '',
     guessSel: [],             // 猜阵已选中的敌方球员 id（最多 5 个）
@@ -292,31 +297,38 @@
       (ui.calibWarn ? '（网络较差，建议切换网络/靠近路由器）' : '');
   }
 
+  /**
+   * 后台校准完成：只更新时钟偏移与状态栏，并纠正倒计时显示。
+   * 失败不阻塞掷骰——掷骰时刻由服务端按收包时间钳制，与本地时钟无关。
+   */
   function finishCalibration(est) {
-    if (ui.screen !== 'main' || ui.sub !== 'calibrating') return;
     if (!est) {
-      ui.sub = 'calibration-error';
-      render();
+      ui.calibText = '时钟校准失败，倒计时按本机时间显示';
+      ui.calibWarn = true;
+      renderStatus();
       return;
     }
     ui.calibText = calibOkText();
-    var openAt = rollOpenAt();
-    ui.sub = openAt && serverNow() < openAt ? 'countdown' : 'go';
-    render();
+    renderStatus();
+    if (ui.screen === 'main' && (ui.sub === 'countdown' || ui.sub === 'go')) {
+      var openAt = rollOpenAt();
+      var target = openAt && serverNow() < openAt ? 'countdown' : 'go';
+      if (target !== ui.sub) ui.sub = target;
+      paintStage();
+    }
   }
 
   function retryCalibration() {
-    ui.sub = 'calibrating';
     ui.calibText = '正在重新校准设备时钟…';
     ui.calibWarn = false;
-    render();
+    renderStatus();
     calibrate(5, function (est, tokenExpired) {
       if (tokenExpired) { rejoinAndCalibrate(); return; }
       finishCalibration(est);
     });
   }
 
-  /** 令牌失效后的恢复：清会话 → 重新领取令牌 → 重新校准 */
+  /** 令牌失效后的后台恢复：清会话 → 重新领取令牌 → 后台校准，不打断当前界面 */
   function rejoinAndCalibrate() {
     clearMy();
     api('/api/join', {}).then(function (res) {
@@ -329,9 +341,6 @@
         rollTs: null
       };
       saveMy();
-      ui.sub = 'calibrating';
-      ui.calibText = '正在自动校准时钟（5 次 ping）…';
-      render();
       calibrate(5, function (est, tokenExpired) {
         if (tokenExpired) { ui.sub = 'kick'; render(); return; }
         finishCalibration(est);
@@ -353,7 +362,8 @@
   function connectEvents() {
     if (es) return;
     try { es = new EventSource('/api/lobby/events'); } catch (e) { return; }
-    es.onopen = function () { setNet('已连接服务器', false); };
+    // （重）连上后补拉一次：断线期间错过的阶段推进靠这次回源追平
+    es.onopen = function () { setNet('已连接服务器', false); scheduleRefresh(); };
     es.onerror = function () { setNet('连接中断，重连中…', true); };
     es.onmessage = function (ev) {
       var msg = null;
@@ -362,13 +372,13 @@
     };
   }
 
-  /** 阶段变化通知可能连发，600ms 去抖后统一回源资格与整局状态 */
+  /** 阶段变化通知可能连发，短去抖后统一回源资格与整局状态（保留随机抖动削峰） */
   function scheduleRefresh() {
     if (refreshTimer) return;
     refreshTimer = setTimeout(function () {
       refreshTimer = null;
       refreshAssignment();
-    }, 600);
+    }, 120 + Math.floor(Math.random() * 120));
   }
 
   /** 资格与整局状态回源：in-flight 去重，并发触发合并为一次，期间到达的请求在完成后补一轮 */
@@ -502,6 +512,8 @@
   /* ==================== 4. 渲染 ==================== */
 
   function render() {
+    // 投骰动画播放中：整页重绘会冲掉立方体 DOM；动画结束后的重绘/下一次回源会补齐目标视图
+    if (ui.rollAnimating) return;
     var root = $('#player-root');
     switch (ui.screen) {
       case 'loading': root.innerHTML = '<div class="pl-wait"><span class="big-ico">⏳</span>正在查询掷骰资格…</div>'; break;
@@ -614,9 +626,6 @@
     if (assignment.rollDeadlineAt != null) return Number(assignment.rollDeadlineAt);
     return Number(assignment.stageDeadlineAt || 0);
   }
-  function mySquadNo() {
-    return Number(assignment && assignment.squadIndex != null ? assignment.squadIndex : 0) + 1;
-  }
 
   function goReached() {
     var openAt = rollOpenAt();
@@ -630,6 +639,10 @@
   function paintStage() {
     var stage = $('#pl-stage');
     if (!stage) return;
+    // 开盒动画播放中：回源/走秒触发的重绘会冲掉动画 DOM，动画结束后再统一渲染结果卡
+    if (ui.sub === 'blindbox' && ui.boxAnimating) return;
+    // 投骰动画播放中同理：立方体 DOM 由动画托管，落定后再切 rolled 结果卡
+    if (ui.rollAnimating) return;
     if (ui.sub !== 'battle') { ui.battleKey = ''; ui.preEdit = false; }
     var h = '';
     if (ui.sub === 'calibrating') {
@@ -639,16 +652,24 @@
         '<div class="pl-foot"><button id="pl-retry-calibration" class="btn btn-primary btn-xl">重新校准</button></div>';
     } else if (ui.sub === 'countdown') {
       var remain = Math.max(1, Math.ceil((rollOpenAt() - serverNow()) / 1000));
-      h = '<div class="pl-command-countdown"><small>你们是第 ' + mySquadNo() + ' 小队</small><strong>' + remain + '</strong>' +
-        '<p>秒后轮到你们 · 本小队掷骰窗口 15 秒，轮到后立即点击【掷！】</p></div>';
+      h = '<div class="pl-command-countdown"><small>掷骰即将开始</small><strong>' + remain + '</strong>' +
+        '<p>秒后开掷 · 截止时刻全员统一，开掷后立即点击【掷！】</p></div>';
     } else if (ui.sub === 'go') {
       if (deadlinePassed()) {
-        h = '<div class="pl-wait"><span class="big-ico">⌛</span>你们小队的掷骰窗口已结束<br><small>未提交的掷骰将由系统代掷，等待稍后开盲盒…</small></div>';
+        h = '<div class="pl-wait"><span class="big-ico">⌛</span>本轮掷骰窗口已结束<br><small>未提交的掷骰将由系统代掷，等待稍后开盲盒…</small></div>';
       } else {
         var left = Math.max(0, Math.ceil((rollDeadlineAt() - serverNow()) / 1000));
+        var liveRollBtn = $('#pl-roll');
+        // 走秒时就地刷新文案：每 200ms 重建按钮会吞掉正在落下的点击
+        if (liveRollBtn && (ui.notice || '') === ui.renderedNotice) {
+          var subEl = stage.querySelector('.pl-sub');
+          if (subEl) subEl.textContent = '窗口剩余 ' + left + ' 秒 · 每人限掷 1 枚';
+          liveRollBtn.disabled = !!ui.rolling;
+          return;
+        }
         h = (ui.notice ? '<div class="pl-status warn">' + esc(ui.notice) + '</div>' : '') +
-          '<button id="pl-roll" class="pl-roll-btn">掷！</button>' +
-          '<div class="pl-sub">你们是第 ' + mySquadNo() + ' 小队 · 窗口剩余 ' + left + ' 秒 · 每人限掷 1 枚</div>';
+          '<button id="pl-roll" class="pl-roll-btn"' + (ui.rolling ? ' disabled' : '') + '>掷！</button>' +
+          '<div class="pl-sub">窗口剩余 ' + left + ' 秒 · 每人限掷 1 枚</div>';
       }
     } else if (ui.sub === 'rolled') {
       var mePlayer = findMyPlayer();
@@ -674,11 +695,13 @@
         '<div class="pl-foot"><button id="pl-rejoin" class="btn btn-primary btn-xl">重新加入 →</button></div>';
     }
     stage.innerHTML = h;
+    ui.renderedNotice = ui.sub === 'go' ? (ui.notice || '') : '';
 
     var rollBtn = $('#pl-roll');
     if (rollBtn) rollBtn.onclick = doRoll;
-    var blindBoxBtn = $('#pl-blindbox-open');
-    if (blindBoxBtn) blindBoxBtn.onclick = doBlindBoxOpen;
+    Array.prototype.slice.call(document.querySelectorAll('.bb-box')).forEach(function (boxBtn) {
+      boxBtn.onclick = function () { doBlindBoxOpen(Number(boxBtn.getAttribute('data-idx'))); };
+    });
     bindGuessGrid();
     var retryCalibrationBtn = $('#pl-retry-calibration');
     if (retryCalibrationBtn) retryCalibrationBtn.onclick = retryCalibration;
@@ -692,27 +715,51 @@
 
   function doRoll() {
     if (ui.sub !== 'go' || !my || !my.token) return;
+    if (ui.rolling || ui.rollAnimating) return; // 请求在途/动画播放中，忽略重复点击
     if (!goReached() || deadlinePassed()) return;   // go 前点击无效，截止后不再提交
-    var rollBtn = $('#pl-roll');
-    if (rollBtn) rollBtn.disabled = true;
+    ui.rolling = true;
     ui.notice = '';
+    // 点数以 /api/roll 响应为准，动画只是本地表演：点击即起滚掩盖网络耗时，响应到达后定格到真实点数
+    var canAnimate = !!window.gsap && !!window.DiceRollUI && !(window.BlindBoxUI && window.BlindBoxUI.reducedMotion());
+    var anim = null;
+    if (canAnimate) {
+      ui.rollAnimating = true;
+      anim = window.DiceRollUI.startTumble($('#pl-stage'));
+    } else {
+      // 低动效/GSAP 缺失：保持原有按钮禁用态，响应到达直接出结果卡
+      var rollBtn = $('#pl-roll');
+      if (rollBtn) rollBtn.disabled = true;
+    }
     var clientTs = Date.now();
     api('/api/roll', { token: my.token, clientTs: clientTs }).then(function (res) {
+      ui.rolling = false;
       ui.die = res && res.die != null ? Number(res.die) : null;
       if (my) {
         my.die = ui.die;
         my.rollTs = res && res.rollTs != null ? Number(res.rollTs) : null;
         saveMy();
       }
-      ui.sub = 'rolled';
-      paintStage();
+      if (anim && ui.die != null) {
+        // sub 在响应到达时即切 rolled（与无动画路径一致）；动画期间若阶段推进，
+        // applyAssignment 会改写 sub，动画结束只负责解除守卫并按当前 sub 重绘
+        ui.sub = 'rolled';
+        anim.settle(ui.die, function () {
+          ui.rollAnimating = false;
+          paintStage();
+        });
+      } else {
+        if (anim) { anim.abort(); ui.rollAnimating = false; }
+        ui.sub = 'rolled';
+        paintStage();
+      }
     }).catch(function (err) {
+      ui.rolling = false;
+      if (anim) { anim.abort(); ui.rollAnimating = false; }
       if (err && (err.status === 401 || err.status === 403)) {
         ui.sub = 'kick';
         render();
         return;
       }
-      if (rollBtn) rollBtn.disabled = false;
       if (err && err.status === 409) {
         // go 前/截止后/重复掷：展示服务端提示并回源（重复掷时回源会带出已掷结果）
         ui.notice = err.message || '本次掷骰未被接受';
@@ -740,8 +787,10 @@
    *  避免"开了却看不到、要退回大厅才知道"；blindBoxHTML 与 waitingHTML 共用。 */
   function myBlindBoxCard() {
     var me = findMyPlayer();
-    if (!me || me.blindBox == null) return '';
-    var box = Number(me.blindBox);
+    if (!me) return '';
+    var box = me.blindBox != null ? Number(me.blindBox) : ui.myBox;
+    if (box == null) return '';
+    box = Number(box);
     var tier = (box > 0 ? '+' : '') + box;
     var dice = me.diceFinal != null ? Number(me.diceFinal) : (me.dice != null ? Number(me.dice) : null);
     var finalPoints = dice != null ? dice + box : null;
@@ -762,9 +811,11 @@
     var opened = 0;
     for (var i = 0; i < players.length; i++) if (players[i].blindBoxOpened) opened++;
     var me = findMyPlayer();
+    var openedSelf = !!(me && me.blindBoxOpened) || ui.myBox != null;
+    if (ui.myBox != null && !(me && me.blindBoxOpened)) opened++;   // 自己刚开、回源未至：本地先计入进度
     var h = '<div class="pl-title" style="font-size:24px">🎁 开盲盒</div>';
-    if (me && me.blindBoxOpened) {
-      var box = me.blindBox != null ? Number(me.blindBox) : 0;
+    if (openedSelf) {
+      var box = me && me.blindBox != null ? Number(me.blindBox) : (ui.myBox != null ? ui.myBox : 0);
       var tier = (box > 0 ? '+' : '') + box;
       var dice = me.dice != null ? Number(me.dice) : null;
       var diceFinal = me.diceFinal != null ? Number(me.diceFinal) : dice;
@@ -783,24 +834,40 @@
         '<small>本队进度 ' + opened + ' / ' + players.length + ' · 全员开完后进入队长战术阶段</small></div>' +
         '<p class="pl-deadline-hint">本阶段剩余时间见右侧阶段面板</p>';
     } else {
-      h += '<div class="pl-sub">盲盒档位 -2 ~ +5（不含 0），直接加在你的骰子点数上 · 每人限开一次 · 15 秒内不开视为放弃（按 0 计），系统不再代开</div>' +
+      h += '<div class="pl-sub">从 3 个盲盒中选 1 个开启：档位 -2 ~ +5（不含 0）· 每人限开一次 · 25 秒内不选视为放弃（按 0 计），系统不代选不代开</div>' +
         (ui.notice ? '<div class="pl-status warn">' + esc(ui.notice) + '</div>' : '') +
-        '<button id="pl-blindbox-open" class="pl-roll-btn pl-open-btn">开盲盒</button>' +
+        window.BlindBoxUI.boxesHTML() +
         '<p class="pl-deadline-hint">剩余时间见右侧阶段面板</p>';
     }
     return h;
   }
 
-  function doBlindBoxOpen() {
-    if (ui.sub !== 'blindbox') return;
-    var btn = $('#pl-blindbox-open');
-    if (btn) btn.disabled = true;
+  function doBlindBoxOpen(idx) {
+    if (ui.sub !== 'blindbox' || ui.boxAnimating) return;
+    var boxEls = Array.prototype.slice.call(document.querySelectorAll('.bb-box'));
+    if (boxEls.length !== 3) return;
+    boxEls.forEach(function (b) { b.disabled = true; });
     ui.notice = '';
-    // 结果不本地编造：提交成功后回源整局状态，由刷新后的 state 渲染
-    api('/api/lobby/player-action', { type: 'blind-box-open', selections: [] }).then(function () {
+    // 响应里就有盲盒档位与三盒内容：动画播完再渲染结果卡，同时回源同步全队进度
+    api('/api/lobby/player-action', { type: 'blind-box-open', selections: [String(idx)] }).then(function (res) {
+      var canAnimate = res && res.blindBox != null
+        && Array.isArray(res.boxes) && res.boxes.length === 3 && res.picked === idx
+        && window.gsap && !window.BlindBoxUI.reducedMotion();
+      if (canAnimate) {
+        ui.boxAnimating = true;
+        window.BlindBoxUI.playBoxReveal(boxEls, idx, res.boxes.map(Number), function () {
+          ui.myBox = Number(res.blindBox);
+          ui.boxAnimating = false;
+          paintStage();
+        });
+      } else {
+        // 幂等重放/低动效/GSAP 缺失：直接出结果卡，与刷新重进一致
+        if (res && res.blindBox != null) ui.myBox = Number(res.blindBox);
+        paintStage();
+      }
       refreshAssignment();
     }).catch(function (err) {
-      if (btn) btn.disabled = false;
+      boxEls.forEach(function (b) { b.disabled = false; });
       ui.notice = err && err.message ? err.message : '开盲盒失败，请检查网络后重试';
       if (err && (err.status === 400 || err.status === 409)) refreshAssignment();
       paintStage();
@@ -870,15 +937,34 @@
     if (min) min.textContent = guessRevealLine(battle);
   }
 
-  function battleScoreHTML(match) {
-    return '<div class="pl-battle-score"><span>' + esc(teamNameOf(match.a)) + '</span><b>' +
-      (match.winsA || 0) + ' : ' + (match.winsB || 0) + '</b><span>' + esc(teamNameOf(match.b)) + '</span></div>';
+  /** 对峙式比分头：我方金色、敌方红色；side 为本队所在侧（'A'/'B'） */
+  function battleScoreHTML(match, side) {
+    return '<div class="pl-battle-score"><span class="' + (side === 'A' ? 'is-me' : 'is-foe') + '">' + esc(teamNameOf(match.a)) + '</span><b>' +
+      (match.winsA || 0) + ' : ' + (match.winsB || 0) + '</b><span class="' + (side === 'A' ? 'is-foe' : 'is-me') + '">' + esc(teamNameOf(match.b)) + '</span></div>';
+  }
+
+  /** 6 局赛道：与大厅 hero 共用 .arena-cells 样式 */
+  function plTrackHtml(match, side) {
+    var rounds = match.rounds || [];
+    var cells = '';
+    for (var n = 1; n <= 6; n++) {
+      var entry = null;
+      for (var i = 0; i < rounds.length; i++) if (Number(rounds[i].round) === n) { entry = rounds[i]; break; }
+      var current = match.status === 'active' && match.phase === 'BATTLE' && Number(match.round) === n;
+      var cls = '', mark = '';
+      if (entry) {
+        if (entry.winner) { cls = entry.winner === side ? 'is-win' : 'is-lose'; mark = cls === 'is-win' ? '胜' : '负'; }
+        else { cls = 'is-draw'; mark = '平'; }
+      } else if (current) cls = 'is-current';
+      cells += '<div class="arena-cell ' + cls + '"><i>第 ' + n + ' 局</i><b>' + mark + '</b></div>';
+    }
+    return '<div class="arena-cells pl-track">' + cells + '</div>';
   }
 
   function battleHTML(battle) {
     if (!battle) return '<div class="pl-wait"><span class="big-ico">⏳</span>等待对局数据…</div>';
     var match = battle.match;
-    if (match.status === 'done' || match.phase === 'RESULT' || match.phase === 'FINISHED') {
+    if (match.status === 'done' || match.phase === 'RESULT' || match.phase === 'FINISHED' || match.phase === 'OVERTIME_PENDING') {
       return battleResultHTML(battle);
     }
     if (match.phase !== 'BATTLE') {
@@ -888,7 +974,7 @@
     }
     var h = '<div id="pl-battle">' +
       '<div class="pl-title" style="font-size:24px">⚔️ 第 ' + battle.round + ' / 6 局</div>' +
-      battleScoreHTML(match);
+      battleScoreHTML(match, battle.side) + plTrackHtml(match, battle.side);
     if (match.roundPhase === 'REVEAL') return h + battleRevealHTML(battle) + '</div>';
     // GUESS：密封猜阵，双方各 5 份
     h += '<div class="pl-guess-counts" id="pl-guess-counts">' + esc(guessCountsText(battle)) + '</div>' +
@@ -1047,18 +1133,19 @@
       '<p class="pl-deadline-hint">下一局倒计时见右侧阶段面板</p>';
   }
 
-  /** 本场打完（RESULT/FINISHED）：胜者、比分与平局链提示 */
+  /** 本场打完（RESULT/FINISHED/OVERTIME_PENDING）：胜者、比分与平局链提示 */
   function battleResultHTML(battle) {
     var match = battle.match;
     var winnerId = match.winner;
     var won = !!winnerId && winnerId === battle.team.id;
+    var overtimePending = match.phase === 'OVERTIME_PENDING';
     var h = '<div id="pl-battle">' +
-      '<div class="pl-title" style="font-size:24px">' + (winnerId ? (won ? '🎉 本场获胜' : '本场惜败') : '本场结束') + '</div>' +
-      battleScoreHTML(match);
+      '<div class="pl-title" style="font-size:24px">' + (overtimePending ? '三连环全平 · 待加赛' : winnerId ? (won ? '🎉 本场获胜' : '本场惜败') : '本场结束') + '</div>' +
+      battleScoreHTML(match, battle.side) + plTrackHtml(match, battle.side);
     if (winnerId) h += '<div class="pl-sub">胜者：' + esc(teamNameOf(winnerId)) + '</div>';
-    if (match.tieBreak && match.tieBreak !== '胜场') {
-      h += '<div class="pl-sub">6 局胜场相同，按' + esc(match.tieBreak) + '判定胜负</div>';
-    }
+    var tieText = window.TournamentUI ? TournamentUI.tieBreakText(match, teamNameOf(match.a), teamNameOf(match.b)) : '';
+    if (overtimePending && !tieText) tieText = '胜场、总点数、GMV 全部打平，等待管理员安排两队加赛';
+    if (tieText) h += '<div class="pl-sub">' + esc(tieText) + '</div>';
     h += '<div class="pl-wait"><span class="big-ico">📋</span>等待下一场对阵<br>' +
       '<small>详细战报与后续赛程请在队伍大厅查看</small></div>' +
       '<div class="pl-foot"><a class="btn btn-primary" href="/lobby">前往队伍大厅 →</a></div></div>';
@@ -1088,12 +1175,17 @@
 
   function renderEnded(root) {
     var champion = gameState && gameState.champion;
-    var title, body;
+    var cls, mark, title, score = '', sub;
     if (champion) {
-      title = '比赛已全部结束';
-      body = champion === myTeamId()
-        ? '<span class="big-ico">🏆</span>恭喜！本队夺得冠军'
-        : '<span class="big-ico">🏁</span>冠军已产生：' + esc(teamNameOf(champion));
+      if (champion === myTeamId()) {
+        cls = 'is-victory'; mark = 'CHAMPION';
+        title = '🏆 恭喜！本队夺得冠军';
+        sub = '全部赛程已结束，荣耀属于你们';
+      } else {
+        cls = 'is-end'; mark = 'GAME OVER';
+        title = '比赛已全部结束';
+        sub = '冠军已产生：' + esc(teamNameOf(champion));
+      }
     } else {
       var lost = null, allMatches = (gameState && gameState.matches) || {};
       for (var key in allMatches) {
@@ -1101,21 +1193,29 @@
         if (m && m.status === 'done' && (m.a === myTeamId() || m.b === myTeamId()) && m.winner !== myTeamId()) lost = m;
       }
       if (lost) {
-        var myScore = Number(lost.a === myTeamId() ? lost.winsA : lost.winsB) || 0;
-        var oppScore = Number(lost.a === myTeamId() ? lost.winsB : lost.winsA) || 0;
+        var mySideA = lost.a === myTeamId();
+        var myScore = Number(mySideA ? lost.winsA : lost.winsB) || 0;
+        var oppScore = Number(mySideA ? lost.winsB : lost.winsA) || 0;
+        cls = 'is-elim'; mark = 'ELIMINATED';
         title = '本场惜败 · 本队被淘汰';
-        body = '<span class="big-ico">📦</span>最终比分 ' + myScore + ' : ' + oppScore +
-          '，对手「' + esc(teamNameOf(lost.a === myTeamId() ? lost.b : lost.a)) + '」晋级' +
-          '<br><small>后续赛程与战报请在队伍大厅查看</small>';
+        score = myScore + ' : ' + oppScore;
+        sub = '对手「' + esc(teamNameOf(mySideA ? lost.b : lost.a)) + '」晋级 · 后续赛程与战报请在队伍大厅查看';
+        var lostTieText = window.TournamentUI ? TournamentUI.tieBreakText(lost, mySideA ? '我方' : '对方', mySideA ? '对方' : '我方') : '';
+        if (lostTieText) sub = esc(lostTieText) + '<br>' + sub;
       } else {
+        cls = 'is-end'; mark = 'GAME OVER';
         title = '本队赛程已结束';
-        body = '<span class="big-ico">📦</span>本队本轮比赛已结束<br><small>后续赛程与战报请在队伍大厅查看</small>';
+        sub = '本队本轮比赛已结束 · 后续赛程与战报请在队伍大厅查看';
       }
     }
     root.innerHTML =
-      '<div class="pl-title">' + title + '</div>' +
-      '<div class="pl-wait">' + body + '</div>' +
-      '<div class="pl-foot"><a class="btn btn-primary btn-xl" href="/lobby">前往队伍大厅 →</a></div>';
+      '<div class="pl-poster ' + cls + '">' +
+        '<div class="arena-watermark">' + mark + '</div>' +
+        '<h1 class="arena-post-title">' + title + '</h1>' +
+        (score ? '<div class="arena-final">' + score + '</div>' : '') +
+        '<p class="arena-post-sub">' + sub + '</p>' +
+        '<div class="pl-foot"><a class="btn btn-primary btn-xl" href="/lobby">前往队伍大厅 →</a></div>' +
+      '</div>';
   }
 
   /* ---------- 4.5 无服务器错误页 ---------- */
@@ -1186,15 +1286,25 @@
         return;
       }
 
-      ui.sub = 'calibrating';
-      ui.calibText = '正在自动校准时钟（5 次 ping）…';
-      render();
-      if (my && my.token) {
-        // 恢复会话：令牌可能仍有效，直接复校；失效则由 rejoinAndCalibrate 重领
+      // 新一轮掷骰：清掉上一轮的盲盒本地结果
+      ui.myBox = null;
+      ui.calibText = '';
+      // 不阻塞界面：领令牌后立刻进入倒计时/可掷，时钟校准在后台完成并自我修正
+      var enterRoll = function () {
+        var openAt = rollOpenAt();
+        ui.sub = openAt && serverNow() < openAt ? 'countdown' : 'go';
+        render();
+      };
+      var backgroundCalibrate = function () {
         calibrate(5, function (est, tokenExpired) {
           if (tokenExpired) { rejoinAndCalibrate(); return; }
           finishCalibration(est);
         });
+      };
+      if (my && my.token) {
+        // 恢复会话：令牌可能仍有效，直接进视图；失效则由 rejoinAndCalibrate 后台重领
+        enterRoll();
+        backgroundCalibrate();
       } else {
         api('/api/join', {}).then(function (res) {
           my = {
@@ -1206,10 +1316,8 @@
             rollTs: null
           };
           saveMy();
-          calibrate(5, function (est, tokenExpired) {
-            if (tokenExpired) { rejoinAndCalibrate(); return; }
-            finishCalibration(est);
-          });
+          enterRoll();
+          backgroundCalibrate();
         }).catch(joinFailed);
       }
     }).catch(function (error) {
@@ -1271,29 +1379,32 @@
     } else if (stage === 'ROLL') {
       if (rollDeadlineAt()) deadline = rollDeadlineAt();
       if (ui.sub === 'rolled') extra = '已扔完，等待稍后开盲盒';
-      else if (ui.sub === 'go' && goReached() && !deadlinePassed()) extra = '轮到你们了，立即点击【掷！】';
-      else if (rollOpenAt() && serverNow() < rollOpenAt()) extra = '你们是第 ' + mySquadNo() + ' 小队，等待轮到你队';
+      else if (ui.sub === 'go' && goReached() && !deadlinePassed()) extra = '开掷了，立即点击【掷！】';
+      else if (rollOpenAt() && serverNow() < rollOpenAt()) extra = '掷骰即将开始，请准备';
     }
     window.StagePanel.update({ stage: stage, stageLabel: stageText(stage), deadline: deadline, serverOffset: ui.offset, extraLine: extra });
     return deadline;
   }
 
   // 倒计时走秒与 go 时刻切换：以校准后的服务端时间轴为准
+  var lastExpireRefreshAt = 0;
   setInterval(function () {
     var deadline = tickStagePanel();
     if (ui.screen !== 'main' || !assignment) return;
     if (ui.sub === 'countdown') {
-      if (goReached()) {
-        ui.sub = 'go';
-        paintStage();
-      } else {
-        paintStage();
-      }
+      if (goReached()) ui.sub = 'go';
+      paintStage();
     } else if (ui.sub === 'go') {
       paintStage();
-    } else if (ui.sub === 'blindbox' || ui.sub === 'battle' || ui.sub === 'waiting') {
-      // 到点回源：服务端扫描兜底推进阶段，回源拿到新视图
-      if (deadline && serverNow() > Number(deadline)) scheduleRefresh();
+    }
+    // 到点回源：任何子状态下当前 deadline 过期都回源拿新视图，SSE 漏消息时也能自愈；
+    // 服务端尚未推进时同一批过期数据最多每 1.5s 重试一次，避免刷爆接口
+    if (deadline && serverNow() > Number(deadline)) {
+      var nowMs = Date.now();
+      if (nowMs - lastExpireRefreshAt > 1500) {
+        lastExpireRefreshAt = nowMs;
+        scheduleRefresh();
+      }
     }
   }, 200);
 

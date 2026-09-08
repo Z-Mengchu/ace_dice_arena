@@ -17,6 +17,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -36,6 +38,7 @@ import java.math.RoundingMode;
 
 @Service
 public class ParallelTournamentService {
+    private static final Logger log = LoggerFactory.getLogger(ParallelTournamentService.class);
     private static final BigDecimal GMV_PER_REROLL = BigDecimal.valueOf(100_000L);
     /**
      * 队长投票时限；超时按已投票计票，无人投票按名单顺序取先。
@@ -58,9 +61,9 @@ public class ParallelTournamentService {
      */
     static final long SQUAD_ROLL_STAGGER_MS = 1_000L;
     /**
-     * 每个小队独立的掷骰窗口时长。
+     * 最后一个小队的掷骰窗口时长：全局截止 = 最后开掷时刻 + 窗口，早开掷的小队窗口相应更长。
      */
-    static final long SQUAD_ROLL_WINDOW_MS = 15_000L;
+    static final long SQUAD_ROLL_WINDOW_MS = 25_000L;
     /**
      * 真人掷骰时刻允许早于服务端收包时刻的最大值：覆盖真实网络单程延迟，同时限制伪造空间。
      */
@@ -68,7 +71,7 @@ public class ParallelTournamentService {
     /**
      * 开盲盒窗口；超时未开视为放弃（按 0 计），系统不再代开。
      */
-    private static final long BLIND_BOX_DURATION_MS = 15_000L;
+    private static final long BLIND_BOX_DURATION_MS = 25_000L;
     /**
      * 队长重掷与排阵的战术窗口；超时未用重掷作废、顺序按小队编号锁定。
      */
@@ -97,7 +100,9 @@ public class ParallelTournamentService {
      */
     static final long AUTO_ROLL_OFFSET_MS = 1_000L;
     static final int[] BLIND_BOX_VALUES = {5, 4, 3, 2, 1, -1, -2};
-    static final int[] BLIND_BOX_WEIGHTS = {1, 3, 8, 20, 28, 22, 18};
+    static final int[] BLIND_BOX_WEIGHTS = {1, 4, 10, 25, 35, 17, 8};
+    /** 三选一盲盒：摆出供玩家选择的盒子数量。 */
+    static final int BLIND_BOX_COUNT = 3;
 
     private final GameStateRepository states;
     private final UserAccountRepository users;
@@ -200,7 +205,7 @@ public class ParallelTournamentService {
         if (record == null) record = new GameStateRecord(1L, root.toString(), username);
         else record.update(root.toString(), username);
         states.save(record);
-        events.gameChanged();
+        events.gameChangedNow();
     }
 
     /**
@@ -270,7 +275,7 @@ public class ParallelTournamentService {
         if (record == null) record = new GameStateRecord(1L, root.toString(), username);
         else record.update(root.toString(), username);
         states.save(record);
-        events.gameChanged();
+        events.gameChangedNow();
     }
 
     private ObjectNode readState(GameStateRecord record) {
@@ -454,7 +459,7 @@ public class ParallelTournamentService {
         switch (type == null ? "" : type) {
             case "role-vote" -> submitRoleVote(root, player, values);
             case "squad-form" -> submitSquadForm(root, player, values);
-            case "blind-box-open" -> openBlindBox(root, player);
+            case "blind-box-open" -> openBlindBox(root, player, values);
             case "reroll" -> submitReroll(root, player, values);
             case "squad-order" -> submitSquadOrder(root, player, values);
             case "tactics-confirm" -> submitTacticsConfirm(root, player, true);
@@ -594,6 +599,8 @@ public class ParallelTournamentService {
         boolean changed = false;
         for (JsonNode teamNode : root.path("teams")) {
             ObjectNode team = (ObjectNode) teamNode;
+            // 无成员队伍无人可投，直接跳过，避免 electCaptain 抛异常导致整轮扫描回滚卡死
+            if (team.path("players").isEmpty()) continue;
             if (!hasCaptain(team) && team.path("roleVoteDeadlineAt").asLong(Long.MAX_VALUE) <= now) {
                 electCaptain(team);
                 changed = true;
@@ -607,7 +614,9 @@ public class ParallelTournamentService {
 
     boolean startSquadsIfReady(ObjectNode root) {
         if (!"CAPTAIN_VOTE".equals(root.path("stage").asText())) return false;
-        for (JsonNode team : root.path("teams")) if (!hasCaptain((ObjectNode) team)) return false;
+        // 无成员队伍永远选不出队长，不作为进入分队阶段的前置条件
+        for (JsonNode team : root.path("teams"))
+            if (!team.path("players").isEmpty() && !hasCaptain((ObjectNode) team)) return false;
         root.put("stage", "SQUAD_FORM");
         root.put("stageDeadlineAt", System.currentTimeMillis() + SQUAD_FORM_DURATION_MS);
         return true;
@@ -738,47 +747,15 @@ public class ParallelTournamentService {
     }
 
     /**
-     * 小队窗口到期后由系统代掷该小队未掷成员；时刻记为该小队开掷时刻 +1s，含代掷的小队不能暴击。
-     */
-    private boolean autoRollSquad(ObjectNode root, ObjectNode team, int squadIndex) {
-        JsonNode squad = team.path("squads").path(squadIndex);
-        if (!squad.isArray()) return false;
-        boolean changed = false;
-        for (JsonNode idNode : squad) {
-            ObjectNode player = findPlayer(team, idNode.asText());
-            if (player == null || player.has("dice")) continue;
-            int die = ThreadLocalRandom.current().nextInt(1, 7);
-            player.put("dice", die);
-            player.put("diceFinal", die);
-            player.put("rollTs", rollOpenAt(root, squadIndex) + AUTO_ROLL_OFFSET_MS);
-            player.put("autoRolled", true);
-            changed = true;
-        }
-        return changed;
-    }
-
-    /**
-     * 逐小队扫描代掷：只补窗口已结束的小队；全员掷齐立即进盲盒；全局截止时间做最终兜底（force 推进依赖它）。
+     * 全员（真人）掷齐立即进盲盒；截止时刻全员统一为 stageDeadlineAt，到点由 doRoll 代掷未掷者（force 推进依赖它）。
      */
     boolean expireRoll(ObjectNode root, long now) {
         if (!"ROLL".equals(root.path("stage").asText())) return false;
-        boolean changed = false;
-        if (root.hasNonNull("rollGoAt") || root.has("rollOpenAts")) {
-            Set<String> activeTeams = activeTeamIds(root);
-            for (JsonNode teamNode : root.path("teams")) {
-                ObjectNode team = (ObjectNode) teamNode;
-                if (!activeTeams.contains(team.path("id").asText())) continue;
-                for (int k = 0; k < SQUAD_COUNT; k++) {
-                    if (now <= rollOpenAt(root, k) + SQUAD_ROLL_WINDOW_MS) continue;
-                    changed |= autoRollSquad(root, team, k);
-                }
-            }
-            if (allActiveRolled(root)) {
-                enterBlindBox(root);
-                return true;
-            }
+        if ((root.hasNonNull("rollGoAt") || root.has("rollOpenAts")) && allActiveRolled(root)) {
+            enterBlindBox(root);
+            return true;
         }
-        if (root.path("stageDeadlineAt").asLong(Long.MAX_VALUE) > now) return changed;
+        if (root.path("stageDeadlineAt").asLong(Long.MAX_VALUE) > now) return false;
         doRoll(root);
         return true;
     }
@@ -837,8 +814,7 @@ public class ParallelTournamentService {
                 throw new IllegalStateException("本轮掷骰已截止");
             long openAt = rollOpenAt(root, squadIndexOf(team, player.path("id").asText()));
             if (now < openAt) throw new IllegalStateException("还没轮到你们小队掷骰");
-            if (openAt != Long.MIN_VALUE && now > openAt + SQUAD_ROLL_WINDOW_MS)
-                throw new IllegalStateException("你们小队的掷骰窗口已结束");
+            // 开掷时刻按小队错开，但截止时刻全员统一为 stageDeadlineAt
             if (player.has("dice")) throw new IllegalStateException("你本轮已经掷过骰子");
             long rollTs = Math.max(Math.min(Math.max(clientTs, now - ROLL_TOLERANCE_MS), now), goAt);
             int die = ThreadLocalRandom.current().nextInt(1, 7);
@@ -846,10 +822,13 @@ public class ParallelTournamentService {
             player.put("diceFinal", die);
             player.put("rollTs", rollTs);
             // 全员掷齐立即进盲盒，不等阶段截止
-            if (allActiveRolled(root)) enterBlindBox(root);
+            boolean advanced = allActiveRolled(root);
+            if (advanced) enterBlindBox(root);
             record.update(root.toString(), username);
             states.save(record);
-            events.gameChanged();
+            // 阶段推进走立即广播，普通掷骰走合并广播
+            if (advanced) events.gameChangedNow();
+            else events.gameChanged();
             return new LiveRoll(die, rollTs);
         } catch (IllegalStateException e) {
             throw e;
@@ -885,10 +864,9 @@ public class ParallelTournamentService {
                 if (player != null) {
                     squadIndex = squadIndexOf(team, player.path("id").asText());
                     long openAt = rollOpenAt(root, squadIndex);
-                    if (openAt != Long.MIN_VALUE) {
-                        rollOpenAt = openAt;
-                        rollDeadlineAt = openAt + SQUAD_ROLL_WINDOW_MS;
-                    }
+                    if (openAt != Long.MIN_VALUE) rollOpenAt = openAt;
+                    // 截止时刻全员统一为全局 stageDeadlineAt，不再按小队截断
+                    rollDeadlineAt = deadline;
                 }
             }
             return new RollAssignmentView(eligible, stage, rollGoAt, deadline, alreadyRolled, teamId,
@@ -1008,7 +986,38 @@ public class ParallelTournamentService {
         return BLIND_BOX_VALUES[BLIND_BOX_VALUES.length - 1];
     }
 
+    /** 三选一：一次抽出全部盒子的内容，玩家选中的那个落库，其余仅用于展示对比。 */
+    int[] drawBlindBoxes() {
+        int[] boxes = new int[BLIND_BOX_COUNT];
+        for (int i = 0; i < boxes.length; i++) boxes[i] = drawBlindBox();
+        return boxes;
+    }
+
+    /**
+     * 开盒结果：value 为落库点数档；boxes/picked 仅本次开盒的响应携带（陪跑值不落库），
+     * 幂等重放（并发重复或已开过）时 boxes 为 null、picked 为 -1，前端按刷新重进处理。
+     */
+    public record BlindBoxResult(int value, int[] boxes, int picked) {}
+
+    /** 解析可选的盒子序号；缺省时服务端随机选一个（玩家主动开盒为前提，系统不代开）。 */
+    private int parseBoxIndex(List<String> values) {
+        if (values == null || values.isEmpty())
+            return ThreadLocalRandom.current().nextInt(BLIND_BOX_COUNT);
+        int index;
+        try {
+            index = Integer.parseInt(values.getFirst());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("盲盒序号必须是数字");
+        }
+        if (index < 0 || index >= BLIND_BOX_COUNT) throw new IllegalArgumentException("盲盒序号超出范围");
+        return index;
+    }
+
     public void openBlindBox(ObjectNode root, UserAccount user) {
+        openBlindBox(root, user, List.of());
+    }
+
+    public void openBlindBox(ObjectNode root, UserAccount user, List<String> values) {
         if (!"BLIND_BOX".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在开盲盒阶段");
         if (root.path("stageDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
@@ -1019,7 +1028,8 @@ public class ParallelTournamentService {
         ObjectNode player = findPlayer(team, "u" + user.getId());
         if (player == null) throw new IllegalStateException("当前账号不在本队参赛名单中");
         if (player.has("blindBox")) throw new IllegalStateException("你已经开过本轮盲盒");
-        player.put("blindBox", drawBlindBox());
+        int[] boxes = drawBlindBoxes();
+        player.put("blindBox", boxes[parseBoxIndex(values)]);
         player.put("blindBoxOpened", true);
         startTacticsIfReady(root);
     }
@@ -1044,7 +1054,7 @@ public class ParallelTournamentService {
      * 只回滚本事务，外层可改走「读已有行」恢复，互不污染。
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public int openBlindBoxIndependent(UserAccount user) {
+    public BlindBoxResult openBlindBoxIndependent(UserAccount user, Integer boxIndex) {
         GameStateRecord record = states.findById(1L)
                 .orElseThrow(() -> new IllegalStateException("主持人尚未创建比赛"));
         ObjectNode root = readState(record);
@@ -1061,15 +1071,20 @@ public class ParallelTournamentService {
         String playerId = "u" + user.getId();
         ObjectNode player = findPlayer(team, playerId);
         if (player == null) throw new IllegalStateException("当前账号不在本队参赛名单中");
-        if (player.has("blindBox")) return player.path("blindBox").asInt();
+        if (player.has("blindBox"))
+            return new BlindBoxResult(player.path("blindBox").asInt(), null, -1);
         int day = root.path("day").asInt(1);
         int round = bracketRoundOf(root);
         var existing = blindBoxes.findByGameDayAndBracketRoundAndPlayerId(day, round, playerId);
-        if (existing.isPresent()) return existing.get().getBoxValue();
-        int value = drawBlindBox();
+        if (existing.isPresent()) return new BlindBoxResult(existing.get().getBoxValue(), null, -1);
+        int picked = boxIndex == null
+                ? ThreadLocalRandom.current().nextInt(BLIND_BOX_COUNT) : boxIndex;
+        if (picked < 0 || picked >= BLIND_BOX_COUNT) throw new IllegalArgumentException("盲盒序号超出范围");
+        int[] boxes = drawBlindBoxes();
+        int value = boxes[picked];
         blindBoxes.saveAndFlush(new PlayerBlindBox(day, round, playerId, team.path("id").asText(), value));
         if (allBlindBoxesOpened(root, day, round)) advanceToTacticsLocked();
-        return value;
+        return new BlindBoxResult(value, boxes, picked);
     }
 
     /**
@@ -1128,7 +1143,8 @@ public class ParallelTournamentService {
         startTactics(root);
         record.update(root.toString(), "system");
         states.save(record);
-        events.gameChanged();
+        // 阶段推进：立即广播，玩家端不依赖到点兜底
+        events.gameChangedNow();
     }
 
     /**
@@ -1578,10 +1594,15 @@ public class ParallelTournamentService {
 
     private void enterResult(ObjectNode root, ObjectNode match) {
         String winnerSide = decideMatchWinner(root, match);
-        match.put("phase", "RESULT");
         match.remove("roundPhase");
-        match.put("resultReadyAt", System.currentTimeMillis() + resultDisplayMs);
-        match.put("winner", teamForSide(match, winnerSide));
+        if (winnerSide == null) {
+            // 胜场/总点数/GMV 全平：不出胜者，停在待加赛状态，由管理员触发两队重赛
+            match.put("phase", "OVERTIME_PENDING");
+        } else {
+            match.put("phase", "RESULT");
+            match.put("resultReadyAt", System.currentTimeMillis() + resultDisplayMs);
+            match.put("winner", teamForSide(match, winnerSide));
+        }
         recordMatchReport(root, match, winnerSide);
         // 逐局战力明细归档到 match_report，GameState 行内只留 {round, winner} 摘要，控制行体积
         archiveMatchDetail(root, match);
@@ -1593,7 +1614,7 @@ public class ParallelTournamentService {
     }
 
     /**
-     * 比赛胜负链：6 局胜场多者胜 → 30 人最终个人点数总和 → 增长系数 → 队伍 ID 字典序。
+     * 比赛胜负链：6 局胜场多者胜 → 30 人最终个人点数总和 → 队伍 GMV → 全平则待加赛（返回 null）。
      */
     String decideMatchWinner(ObjectNode root, ObjectNode match) {
         int winsA = match.path("winsA").asInt(), winsB = match.path("winsB").asInt();
@@ -1605,23 +1626,25 @@ public class ParallelTournamentService {
         double pointsA = totalPersonalPoints(root, a), pointsB = totalPersonalPoints(root, b);
         match.put("totalPointsA", pointsA);
         match.put("totalPointsB", pointsB);
-        double coefficientA = findTeam(root, a).path("growthCoefficient").asDouble(1d);
-        double coefficientB = findTeam(root, b).path("growthCoefficient").asDouble(1d);
-        int comparison = compareMatchTieBreak(pointsA, pointsB, coefficientA, coefficientB, a, b);
-        if (pointsA != pointsB) match.put("tieBreak", "总点数");
-        else if (coefficientA != coefficientB) match.put("tieBreak", "增长系数");
-        else match.put("tieBreak", "队伍ID");
-        return comparison >= 0 ? "A" : "B";
+        BigDecimal gmvA = findTeam(root, a).path("gmv").decimalValue();
+        BigDecimal gmvB = findTeam(root, b).path("gmv").decimalValue();
+        match.put("gmvA", gmvA);
+        match.put("gmvB", gmvB);
+        int comparison = compareMatchTieBreak(pointsA, pointsB, gmvA, gmvB);
+        if (comparison == 0) {
+            match.put("tieBreak", "加赛");
+            return null;
+        }
+        match.put("tieBreak", pointsA != pointsB ? "总点数" : "GMV");
+        return comparison > 0 ? "A" : "B";
     }
 
     /**
-     * 平局链比较：返回正数表示 A 方胜。总点数多者胜 → 增长系数高者胜 → 队伍 ID 字典序小者胜。
+     * 平局链比较：返回正数表示 A 方胜，0 表示全平待加赛。总点数多者胜 → GMV 高者胜。
      */
-    static int compareMatchTieBreak(double pointsA, double pointsB, double coefficientA, double coefficientB,
-                                    String idA, String idB) {
+    static int compareMatchTieBreak(double pointsA, double pointsB, BigDecimal gmvA, BigDecimal gmvB) {
         int comparison = Double.compare(pointsA, pointsB);
-        if (comparison == 0) comparison = Double.compare(coefficientA, coefficientB);
-        if (comparison == 0) comparison = idB.compareTo(idA);
+        if (comparison == 0) comparison = gmvA.compareTo(gmvB);
         return comparison;
     }
 
@@ -1658,10 +1681,17 @@ public class ParallelTournamentService {
             text.append("\n平局链：胜场 ").append(match.path("winsA").asInt())
                     .append(":").append(match.path("winsB").asInt())
                     .append(" → 30 人总点数 ").append(match.path("totalPointsA").asDouble())
-                    .append(":").append(match.path("totalPointsB").asDouble())
-                    .append(" → 按").append(tieBreak).append("判定");
+                    .append(":").append(match.path("totalPointsB").asDouble());
+            if ("总点数".equals(tieBreak)) {
+                text.append(" → 按总点数判定");
+            } else {
+                text.append(" → GMV ").append(match.path("gmvA").decimalValue())
+                        .append(":").append(match.path("gmvB").decimalValue())
+                        .append("加赛".equals(tieBreak) ? " → 全平，待管理员加赛" : " → 按 GMV 判定");
+            }
         }
-        text.append("\n胜者 ").append(teamName(root, teamForSide(match, winnerSide)));
+        if (winnerSide != null)
+            text.append("\n胜者 ").append(teamName(root, teamForSide(match, winnerSide)));
         reports.save(new BattleReport(text.toString(), "system"));
     }
 
@@ -1760,8 +1790,9 @@ public class ParallelTournamentService {
             record.update(root.toString(), "system");
             states.save(record);
             if (root.hasNonNull("champion")) events.stateChanged();
-            else events.gameChanged();
-        } catch (Exception ignored) {
+            else events.gameChangedNow();
+        } catch (Exception e) {
+            log.warn("定时推进比赛阶段失败", e);
         }
     }
 
@@ -1969,7 +2000,7 @@ public class ParallelTournamentService {
                 case "CAPTAIN_VOTE" -> {
                     for (JsonNode teamNode : root.path("teams")) {
                         ObjectNode team = (ObjectNode) teamNode;
-                        if (!hasCaptain(team)) {
+                        if (!team.path("players").isEmpty() && !hasCaptain(team)) {
                             electCaptain(team);
                             progressed++;
                         }
@@ -2012,6 +2043,12 @@ public class ParallelTournamentService {
                             case "RESULT" -> {
                                 completeResult(match);
                                 progressed++;
+                            }
+                            case "OVERTIME_PENDING" -> {
+                                if (canRematch(root, match)) {
+                                    prepareRematch(root, match);
+                                    progressed++;
+                                }
                             }
                             default -> {
                             }
@@ -2097,6 +2134,48 @@ public class ParallelTournamentService {
         states.save(record);
         events.gameChanged();
         return new ForceResult(matchId, "BATTLE".equals(stage) ? phase : stage, forced);
+    }
+
+    /**
+     * 单场加赛：胜场/总点数/GMV 三连环全平的场次由管理员触发两队重赛，
+     * 重置该场后复用正常轮次流程重走 ROLL → … → BATTLE，直到分出胜负。
+     */
+    @Transactional
+    public void rematch(String username, String matchId) {
+        GameStateRecord record = states.findLockedById(1L)
+                .orElseThrow(() -> new IllegalStateException("比赛尚未开始"));
+        ObjectNode root = readState(record);
+        if (root == null || !root.path("matches").has(matchId)) throw new IllegalArgumentException("场次不存在");
+        ObjectNode match = (ObjectNode) root.path("matches").path(matchId);
+        if (!"OVERTIME_PENDING".equals(match.path("phase").asText()))
+            throw new IllegalStateException("该场次不在待加赛状态");
+        if (!canRematch(root, match)) throw new IllegalStateException("等其他场次结束后再安排加赛");
+        prepareRematch(root, match);
+        reports.save(new BattleReport("【加赛】" + roundLabel(matchId)
+                + teamName(root, match.path("a").asText()) + " vs "
+                + teamName(root, match.path("b").asText()) + " 三连环全平，两队重赛", "system"));
+        record.update(root.toString(), username);
+        states.save(record);
+        events.gameChanged();
+    }
+
+    /** 同 bracket 轮次还有其他在赛场次时不能加赛，避免重置到别人的掷骰数据。 */
+    private boolean canRematch(ObjectNode root, ObjectNode match) {
+        for (JsonNode other : root.path("matches")) {
+            if (other != match && "active".equals(other.path("status").asText())) return false;
+        }
+        return true;
+    }
+
+    private void prepareRematch(ObjectNode root, ObjectNode match) {
+        match.remove(List.of("winner", "tieBreak", "totalPointsA", "totalPointsB", "gmvA", "gmvB",
+                "resultReadyAt", "guesses", "preGuesses", "guessDeadlineAt", "guessOpenedAt", "revealUntil"));
+        match.put("winsA", 0);
+        match.put("winsB", 0);
+        match.put("round", 1);
+        match.set("rounds", mapper.createArrayNode());
+        match.put("phase", "PENDING");
+        startRoundFlow(root);
     }
 
     @Transactional

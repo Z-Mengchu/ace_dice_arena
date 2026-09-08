@@ -53,6 +53,8 @@ class PlayerActionServiceTest {
         PlayerActionService service = new PlayerActionService(states, users, mapper, events, tournament);
 
         service.submit("player", "squad-form", List.of("u1"));
+        when(tournament.openBlindBoxIndependent(any(), any()))
+                .thenReturn(new ParallelTournamentService.BlindBoxResult(2, new int[]{2, -1, 3}, 0));
         service.submit("player", "blind-box-open", List.of());
         service.submit("player", "reroll", List.of("u5"));
         service.submit("player", "squad-order", List.of("3", "1", "2", "4", "5", "6"));
@@ -62,8 +64,8 @@ class PlayerActionServiceTest {
         verify(tournament).dispatchPlayerAction(any(), eq(player), eq("reroll"), eq(List.of("u5")));
         verify(tournament).dispatchPlayerAction(any(), eq(player), eq("squad-order"), eq(List.of("3", "1", "2", "4", "5", "6")));
         verify(tournament).dispatchPlayerAction(any(), eq(player), eq("round-guess"), eq(List.of("u101")));
-        // 开盲盒走独立行存储路径，不进 game_state 全局锁也不走动作分发表
-        verify(tournament).openBlindBoxIndependent(eq(player));
+        // 开盲盒走独立行存储路径，不进 game_state 全局锁也不走动作分发表；未带序号时为 null
+        verify(tournament).openBlindBoxIndependent(eq(player), isNull());
         verify(tournament, never()).dispatchPlayerAction(any(), any(), eq("blind-box-open"), any());
         verify(tournament, never()).submitSandboxAction(any(), any(), any(), any());
         verify(states, times(4)).save(record);
@@ -194,7 +196,8 @@ class PlayerActionServiceTest {
         new PlayerActionService(states, users, new ObjectMapper(), events, tournament)
                 .submit("final_voter", "role-vote", List.of("u1"));
 
-        verify(events).gameChanged();
+        verify(events).gameChangedNow();
+        verify(events, never()).gameChanged();
         verify(events, never()).teamGameChanged(anyString());
         verify(events, never()).adminGameChanged();
     }

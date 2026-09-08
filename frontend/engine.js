@@ -8,7 +8,7 @@
  *  - 小队战力 = round2(base × (同步暴击 ? 1.5 : 1)) + guessBonus
  *  - guessBonus = min(命中人次 × 0.4, 10)
  *  - 同步暴击 = 小队 5 人掷骰时刻首尾差 ≤ 500ms 且无系统代掷
- *  - 比赛胜负链 = 6 局胜场 → 30 人总点数 → 增长系数 → 队伍 ID 字典序
+ *  - 比赛胜负链 = 6 局胜场 → 30 人总点数 → GMV → 全平则加赛重赛
  */
 (function (root, factory) {
   const GameEngine = factory();
@@ -35,7 +35,7 @@
     syncCritMultiplier: 1.5,  // 同步暴击倍率
     days: 2,                  // 比赛天数
     blindBoxValues: [5, 4, 3, 2, 1, -1, -2],           // 盲盒点数档（不含 0）
-    blindBoxWeights: [1, 3, 8, 20, 28, 22, 18]         // 对应概率（百分比）
+    blindBoxWeights: [1, 4, 10, 25, 35, 17, 8]         // 对应概率（百分比），负档合计 25%
   };
 
   /** 8 个战区 mock 数据（gmv / growth 均为 day1 / day2 两天，growth 为增长率百分数值） */
@@ -138,27 +138,26 @@
   }
 
   /**
-   * 平局链比较：返回正数表示 A 方胜。
-   * 30 人总点数多者胜 → 增长系数高者胜 → 队伍 ID 字典序小者胜。
+   * 平局链比较：返回正数表示 A 方胜，0 表示全平待加赛。
+   * 30 人总点数多者胜 → GMV 高者胜。
    */
-  function compareMatchTieBreak(pointsA, pointsB, coefficientA, coefficientB, idA, idB) {
+  function compareMatchTieBreak(pointsA, pointsB, gmvA, gmvB) {
     if (pointsA !== pointsB) return pointsA - pointsB;
-    if (coefficientA !== coefficientB) return coefficientA - coefficientB;
-    if (idA === idB) return 0;
-    return idA < idB ? 1 : -1;
+    return gmvA - gmvB;
   }
 
   /**
-   * 比赛胜负链：6 局胜场多者胜 → 30 人总点数 → 增长系数 → 队伍 ID。
-   * 返回 { winnerSide, tieBreak }。
+   * 比赛胜负链：6 局胜场多者胜 → 30 人总点数 → GMV → 全平则待加赛。
+   * 返回 { winnerSide, tieBreak }；全平时 winnerSide 为 null、tieBreak 为 '加赛'。
    */
-  function decideMatchWinner({ winsA, winsB, totalPointsA, totalPointsB, coefficientA, coefficientB, idA, idB }) {
+  function decideMatchWinner({ winsA, winsB, totalPointsA, totalPointsB, gmvA, gmvB }) {
     if (winsA !== winsB) return { winnerSide: winsA > winsB ? 'A' : 'B', tieBreak: '胜场' };
-    const comparison = compareMatchTieBreak(totalPointsA, totalPointsB, coefficientA, coefficientB, idA, idB);
-    let tieBreak = '队伍ID';
-    if (totalPointsA !== totalPointsB) tieBreak = '总点数';
-    else if (coefficientA !== coefficientB) tieBreak = '增长系数';
-    return { winnerSide: comparison >= 0 ? 'A' : 'B', tieBreak };
+    const comparison = compareMatchTieBreak(totalPointsA, totalPointsB, gmvA, gmvB);
+    if (comparison === 0) return { winnerSide: null, tieBreak: '加赛' };
+    return {
+      winnerSide: comparison > 0 ? 'A' : 'B',
+      tieBreak: totalPointsA !== totalPointsB ? '总点数' : 'GMV'
+    };
   }
 
   /** 单局胜负：战力高者胜，相等记平局（winner 为 'A' / 'B' / null） */
@@ -213,9 +212,8 @@
     const config = Object.assign({}, DEFAULT_CONFIG, opts.config || {});
     const rng = opts.rng || Math.random;
     const day = opts.day || 1;
-    const coefficientOf = function (team) {
-      if (opts.coefficients && opts.coefficients[team.id] != null) return opts.coefficients[team.id];
-      return 1 + (team.growth ? (team.growth['day' + day] || 0) : 0) / 100;
+    const gmvOf = function (team) {
+      return team.gmv && team.gmv['day' + day] != null ? team.gmv['day' + day] : 0;
     };
     const prepare = function (team) {
       const players = team.players.map(function (p) {
@@ -234,7 +232,7 @@
         target.diceFinal = rollDie(rng);
         target.rerolled = true;
       }
-      return { id: team.id, name: team.name, players: players, squads: squads, coefficient: coefficientOf(team) };
+      return { id: team.id, name: team.name, players: players, squads: squads };
     };
     const A = prepare(teamA), B = prepare(teamB);
     const rounds = [];
@@ -264,16 +262,15 @@
     const decided = decideMatchWinner({
       winsA: winsA, winsB: winsB,
       totalPointsA: totalPointsA, totalPointsB: totalPointsB,
-      coefficientA: A.coefficient, coefficientB: B.coefficient,
-      idA: teamA.id, idB: teamB.id
+      gmvA: gmvOf(teamA), gmvB: gmvOf(teamB)
     });
     return {
       idA: teamA.id, idB: teamB.id,
       rounds: rounds, winsA: winsA, winsB: winsB,
       totalPointsA: totalPointsA, totalPointsB: totalPointsB,
-      coefficientA: A.coefficient, coefficientB: B.coefficient,
+      gmvA: gmvOf(teamA), gmvB: gmvOf(teamB),
       winnerSide: decided.winnerSide,
-      winner: decided.winnerSide === 'A' ? teamA.id : teamB.id,
+      winner: decided.winnerSide === null ? null : (decided.winnerSide === 'A' ? teamA.id : teamB.id),
       tieBreak: decided.tieBreak
     };
   }
@@ -289,7 +286,12 @@
     teams.forEach(function (team) { byId[team.id] = team; });
     const pairs = drawBracket(teams.map(function (team) { return team.id; }), rng);
     const play = function (aId, bId) {
-      return simulateMatch(byId[aId], byId[bId], Object.assign({}, opts, { rng: rng }));
+      // 全平（胜场/总点数/GMV 三连环）时离线模拟直接加赛重赛，直到分出胜负
+      let result = simulateMatch(byId[aId], byId[bId], Object.assign({}, opts, { rng: rng }));
+      while (result.winner === null) {
+        result = simulateMatch(byId[aId], byId[bId], Object.assign({}, opts, { rng: rng }));
+      }
+      return result;
     };
     const quarterfinals = pairs.map(function (pair) {
       const result = play(pair[0], pair[1]);

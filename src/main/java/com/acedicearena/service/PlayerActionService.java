@@ -41,9 +41,16 @@ public class PlayerActionService {
         if (user.isAfk()) throw new IllegalStateException("你当前处于挂机状态，请先取消挂机再操作");
         // 开盲盒结果按玩家独立成行（player_blind_box 表），不取 game_state 全局行锁
         if ("blind-box-open".equals(type)) {
-            int box = openBlindBoxIndependent(user);
+            var result = openBlindBoxIndependent(user, parseBoxIndex(selections));
             events.gameChanged();
-            return Map.of("ok", true, "blindBox", box);
+            Map<String, Object> body = new java.util.HashMap<>();
+            body.put("ok", true);
+            body.put("blindBox", result.value());
+            if (result.boxes() != null) {
+                body.put("boxes", java.util.Arrays.stream(result.boxes()).boxed().toList());
+                body.put("picked", result.picked());
+            }
+            return body;
         }
         GameStateRecord record = gameStates.findLockedById(1L)
                 .orElseThrow(() -> new IllegalStateException("主持人尚未创建比赛"));
@@ -68,24 +75,36 @@ public class PlayerActionService {
     /**
      * 独立开盒；唯一键冲突 = 同一玩家并发重复提交，读已有行返回同一结果（幂等）。
      */
-    private int openBlindBoxIndependent(UserAccount user) {
+    private ParallelTournamentService.BlindBoxResult openBlindBoxIndependent(UserAccount user, Integer boxIndex) {
         try {
-            return tournament.openBlindBoxIndependent(user);
+            return tournament.openBlindBoxIndependent(user, boxIndex);
         } catch (DataIntegrityViolationException duplicate) {
             Integer box = tournament.openedBlindBoxValue(user);
-            if (box != null) return box;
+            if (box != null) return new ParallelTournamentService.BlindBoxResult(box, null, -1);
             throw duplicate;
+        }
+    }
+
+    /** 解析可选的盒子序号（selections 首元素）；缺省为 null，由服务端随机选一个。 */
+    private Integer parseBoxIndex(List<String> selections) {
+        if (selections == null || selections.isEmpty()) return null;
+        try {
+            return Integer.parseInt(selections.getFirst());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("盲盒序号必须是数字");
         }
     }
 
     private void notifyPlayerAction(String type, String captainBefore, String gameStageBefore,
                                     ObjectNode root, String teamId) {
+        boolean stageChanged = !java.util.Objects.equals(gameStageBefore, root.path("stage").asText());
         if (!"role-vote".equals(type)) {
-            events.gameChanged();
+            if (stageChanged) events.gameChangedNow();
+            else events.gameChanged();
             return;
         }
-        if (!java.util.Objects.equals(gameStageBefore, root.path("stage").asText())) {
-            events.gameChanged();
+        if (stageChanged) {
+            events.gameChangedNow();
         } else if (!java.util.Objects.equals(captainBefore, captainOf(root, teamId))) {
             events.teamGameChanged(teamId);
         } else {
