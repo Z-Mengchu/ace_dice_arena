@@ -4,6 +4,7 @@ import com.acedicearena.domain.GameControl;
 import com.acedicearena.domain.UserAccount;
 import com.acedicearena.repository.GameControlRepository;
 import com.acedicearena.repository.GameStateRepository;
+import com.acedicearena.repository.PlayerBlindBoxRepository;
 import com.acedicearena.repository.UserAccountRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
@@ -21,6 +22,7 @@ public class AdminTestModeService {
     private final UserAccountRepository users;
     private final GameControlRepository controls;
     private final GameStateRepository states;
+    private final PlayerBlindBoxRepository blindBoxes;
     private final LobbyService lobby;
     private final ParallelTournamentService tournament;
     private final LobbyEventService events;
@@ -28,11 +30,19 @@ public class AdminTestModeService {
 
     public AdminTestModeService(@Value("${app.test-mode.enabled:false}") boolean enabled,
                                 UserAccountRepository users, GameControlRepository controls,
-                                GameStateRepository states, LobbyService lobby,
+                                GameStateRepository states, PlayerBlindBoxRepository blindBoxes,
+                                LobbyService lobby,
                                 ParallelTournamentService tournament, LobbyEventService events,
                                 ObjectMapper mapper) {
-        this.enabled = enabled; this.users = users; this.controls = controls; this.states = states;
-        this.lobby = lobby; this.tournament = tournament; this.events = events; this.mapper = mapper;
+        this.enabled = enabled;
+        this.users = users;
+        this.controls = controls;
+        this.states = states;
+        this.blindBoxes = blindBoxes;
+        this.lobby = lobby;
+        this.tournament = tournament;
+        this.events = events;
+        this.mapper = mapper;
     }
 
     @Transactional
@@ -52,13 +62,28 @@ public class AdminTestModeService {
                     "沙盘队员" + String.format("%03d", index + 1), frontEnd ? "销售部" : "技术部",
                     "USER", "test-mode", "00");
             user.setPerformance(frontEnd, frontEnd ? BigDecimal.valueOf(100_000L - index * 137L) : BigDecimal.ZERO);
-            user.assignTeam(LobbyService.TEAM_IDS.get(teamIndex)); user.setReady(true); testUsers.add(user);
+            user.assignTeam(LobbyService.TEAM_IDS.get(teamIndex));
+            user.setReady(true);
+            testUsers.add(user);
         }
         users.saveAll(testUsers);
         users.flush();
         control().changePhase("GROUPED");
-        lobby.start();
+        // 两天已打完且总冠军待加赛时，prepare 直接推进加赛而不是重新开赛
+        if (overtimePending()) lobby.startOvertime();
+        else lobby.start();
         return status();
+    }
+
+    private boolean overtimePending() {
+        return states.findById(1L).map(record -> {
+            try {
+                return "OVERTIME_PENDING".equals(
+                        mapper.readTree(record.getContent()).at("/overallResult/status").asText());
+            } catch (Exception ignored) {
+                return false;
+            }
+        }).orElse(false);
     }
 
     @Transactional
@@ -85,16 +110,19 @@ public class AdminTestModeService {
     public TestStatus assignSandboxPlayers(String firstUsername, String firstTeamId, String firstIdentity,
                                            String secondUsername, String secondTeamId, String secondIdentity) {
         requireEnabled();
-        if (firstUsername == null || firstUsername.equals(secondUsername)) throw new IllegalArgumentException("请选择两名不同的真实玩家");
+        if (firstUsername == null || firstUsername.equals(secondUsername))
+            throw new IllegalArgumentException("请选择两名不同的真实玩家");
         if (!LobbyService.TEAM_IDS.contains(firstTeamId) || !LobbyService.TEAM_IDS.contains(secondTeamId))
             throw new IllegalArgumentException("请选择有效队伍");
         int firstIndex = LobbyService.TEAM_IDS.indexOf(firstTeamId), secondIndex = LobbyService.TEAM_IDS.indexOf(secondTeamId);
         if (!firstTeamId.equals(secondTeamId) && firstIndex / 2 != secondIndex / 2)
             throw new IllegalArgumentException("两名玩家只能加入同一队伍，或加入同一对战组中的相对队伍");
-        validateIdentity(firstIdentity); validateIdentity(secondIdentity);
+        validateIdentity(firstIdentity);
+        validateIdentity(secondIdentity);
         TestStatus current = status();
         if (!current.active()) throw new IllegalStateException("请先建立管理员沙盘");
-        if (!current.sandboxPlayers().isEmpty()) throw new IllegalStateException("本次沙盘已经指定正式玩家，请清理后重新建立以更换");
+        if (!current.sandboxPlayers().isEmpty())
+            throw new IllegalStateException("本次沙盘已经指定正式玩家，请清理后重新建立以更换");
         UserAccount first = realPlayer(firstUsername), second = realPlayer(secondUsername);
         List<UserAccount> replacements = users.findAll().stream().filter(AdminTestModeService::isTestUser)
                 .filter(user -> firstTeamId.equals(user.getTeamId()) || secondTeamId.equals(user.getTeamId())).toList();
@@ -104,10 +132,14 @@ public class AdminTestModeService {
         UserAccount secondReplaced = replacements.stream().filter(user -> secondTeamId.equals(user.getTeamId())
                         && !user.getId().equals(firstReplaced.getId()) && identityMatches(user, secondIdentity)).findFirst()
                 .orElseThrow(() -> new IllegalStateException("第二支目标队伍没有可替换的沙盘队员"));
-        firstReplaced.assignTeam(null); secondReplaced.assignTeam(null);
-        first.assignTeam(firstTeamId); first.setReady(true);
-        second.assignTeam(secondTeamId); second.setReady(true);
-        users.saveAll(List.of(firstReplaced, secondReplaced, first, second)); users.flush();
+        firstReplaced.assignTeam(null);
+        secondReplaced.assignTeam(null);
+        first.assignTeam(firstTeamId);
+        first.setReady(true);
+        second.assignTeam(secondTeamId);
+        second.setReady(true);
+        users.saveAll(List.of(firstReplaced, secondReplaced, first, second));
+        users.flush();
         tournament.configureSandboxPlayers(List.of(
                 new ParallelTournamentService.SandboxAssignment(first, firstReplaced, firstTeamId, firstIdentity),
                 new ParallelTournamentService.SandboxAssignment(second, secondReplaced, secondTeamId, secondIdentity)));
@@ -115,7 +147,8 @@ public class AdminTestModeService {
     }
 
     private void validateIdentity(String identity) {
-        if (!("front".equals(identity) || "back".equals(identity))) throw new IllegalArgumentException("沙盘身份只能选择前端或后端");
+        if (!("front".equals(identity) || "back".equals(identity)))
+            throw new IllegalArgumentException("沙盘身份只能选择前端或后端");
     }
 
     private boolean identityMatches(UserAccount user, String identity) {
@@ -162,13 +195,17 @@ public class AdminTestModeService {
                 root.path("sandboxPlayers").forEach(player -> users.findByUsername(player.path("username").asText())
                         .ifPresent(user -> user.assignTeam(null)));
                 String legacyUsername = root.at("/sandboxSolo/username").asText(null);
-                if (legacyUsername != null) users.findByUsername(legacyUsername).ifPresent(user -> user.assignTeam(null));
-            } catch (Exception ignored) { }
+                if (legacyUsername != null)
+                    users.findByUsername(legacyUsername).ifPresent(user -> user.assignTeam(null));
+            } catch (Exception ignored) {
+            }
         });
         users.deleteAll(users.findAll().stream().filter(AdminTestModeService::isTestUser).toList());
         users.flush();
+        blindBoxes.deleteAll();
         if (states.existsById(1L)) states.deleteById(1L);
-        control().changePhase("PREPARING"); events.stateChanged();
+        control().changePhase("PREPARING");
+        events.stateChanged();
         return status();
     }
 
@@ -185,18 +222,33 @@ public class AdminTestModeService {
             root.path("sandboxPlayers").forEach(player -> sandboxPlayers.add(new SandboxPlayerStatus(
                     player.path("username").asText(), player.path("displayName").asText(), player.path("teamId").asText(),
                     player.path("identity").asText("front"))));
-            if (sandboxPlayers.isEmpty() && root.path("sandboxSolo").hasNonNull("username")) sandboxPlayers.add(new SandboxPlayerStatus(
-                root.at("/sandboxSolo/username").asText(), root.at("/sandboxSolo/displayName").asText(), root.at("/sandboxSolo/teamId").asText(), "front"));
-        } catch (Exception ignored) { }
+            if (sandboxPlayers.isEmpty() && root.path("sandboxSolo").hasNonNull("username"))
+                sandboxPlayers.add(new SandboxPlayerStatus(
+                        root.at("/sandboxSolo/username").asText(), root.at("/sandboxSolo/displayName").asText(), root.at("/sandboxSolo/teamId").asText(), "front"));
+        } catch (Exception ignored) {
+        }
         return new TestStatus(enabled, count > 0, phase, count, champion, sandboxPlayers);
     }
 
-    private GameControl control() { return controls.findById(1L).orElseGet(() -> controls.save(new GameControl(1L))); }
-    public static boolean isTestUser(UserAccount user) { return user.getUsername().startsWith(USERNAME_PREFIX); }
-    private void requireEnabled() { if (!enabled) throw new IllegalStateException("管理员测试模式未启用"); }
+    private GameControl control() {
+        return controls.findById(1L).orElseGet(() -> controls.save(new GameControl(1L)));
+    }
+
+    public static boolean isTestUser(UserAccount user) {
+        return user.getUsername().startsWith(USERNAME_PREFIX);
+    }
+
+    private void requireEnabled() {
+        if (!enabled) throw new IllegalStateException("管理员测试模式未启用");
+    }
 
     public record TestStatus(boolean enabled, boolean active, String phase, int testUsers, String champion,
-                             List<SandboxPlayerStatus> sandboxPlayers) {}
-    public record SandboxPlayerStatus(String username, String displayName, String teamId, String identity) {}
-    public record SoloCandidate(String username, String displayName, String department) {}
+                             List<SandboxPlayerStatus> sandboxPlayers) {
+    }
+
+    public record SandboxPlayerStatus(String username, String displayName, String teamId, String identity) {
+    }
+
+    public record SoloCandidate(String username, String displayName, String department) {
+    }
 }

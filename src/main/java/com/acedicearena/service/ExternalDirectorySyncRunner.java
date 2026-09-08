@@ -14,7 +14,8 @@ public class ExternalDirectorySyncRunner implements ApplicationRunner {
     private final AccountService accounts;
 
     public ExternalDirectorySyncRunner(ExternalDirectoryService directory, AccountService accounts) {
-        this.directory = directory; this.accounts = accounts;
+        this.directory = directory;
+        this.accounts = accounts;
     }
 
     @Override

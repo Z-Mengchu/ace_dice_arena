@@ -3,6 +3,7 @@ package com.acedicearena.service;
 import jakarta.annotation.PreDestroy;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
 import java.io.IOException;
 import java.time.Instant;
 import java.util.Set;
@@ -44,13 +45,23 @@ public class LobbyEventService {
         return emitter;
     }
 
-    /** 大厅资料变化：分组、准备状态等，需要客户端重新读取大厅和比赛状态。 */
-    public void stateChanged() { scheduleChange("lobby", lobbyChangePending); }
+    /**
+     * 大厅资料变化：分组、准备状态等，需要客户端重新读取大厅和比赛状态。
+     */
+    public void stateChanged() {
+        scheduleChange("lobby", lobbyChangePending);
+    }
 
-    /** 比赛状态变化：投票、骰子、比分等，只需要客户端重新读取比赛状态。 */
-    public void gameChanged() { scheduleChange("game", gameChangePending); }
+    /**
+     * 比赛状态变化：投票、骰子、比分等，只需要客户端重新读取比赛状态。
+     */
+    public void gameChanged() {
+        scheduleChange("game", gameChangePending);
+    }
 
-    /** 单张角色选票变化只刷新管理员监控，避免普通玩家的投票表单被反复重绘。 */
+    /**
+     * 单张角色选票变化只刷新管理员监控，避免普通玩家的投票表单被反复重绘。
+     */
     public void adminGameChanged() {
         if (!adminGameChangePending.compareAndSet(false, true)) return;
         broadcaster.schedule(() -> {
@@ -60,7 +71,9 @@ public class LobbyEventService {
         }, CHANGE_COALESCE_MS, TimeUnit.MILLISECONDS);
     }
 
-    /** 角色投票切换到下一角色时，只刷新本队和管理员。 */
+    /**
+     * 角色投票切换到下一角色时，只刷新本队和管理员。
+     */
     public void teamGameChanged(String teamId) {
         AtomicBoolean pending = teamGameChangePending.computeIfAbsent(teamId, ignored -> new AtomicBoolean());
         if (!pending.compareAndSet(false, true)) return;
@@ -78,13 +91,21 @@ public class LobbyEventService {
     }
 
     private void send(Client client, Object value) {
-        try { client.emitter().send(SseEmitter.event().data(value)); }
-        catch (IOException | IllegalStateException e) { clients.remove(client); client.emitter().complete(); }
+        try {
+            client.emitter().send(SseEmitter.event().data(value));
+        } catch (IOException | IllegalStateException e) {
+            clients.remove(client);
+            client.emitter().complete();
+        }
     }
 
     private void send(Client client, SseEmitter.SseEventBuilder event) {
-        try { client.emitter().send(event); }
-        catch (IOException | IllegalStateException e) { clients.remove(client); client.emitter().complete(); }
+        try {
+            client.emitter().send(event);
+        } catch (IOException | IllegalStateException e) {
+            clients.remove(client);
+            client.emitter().complete();
+        }
     }
 
     private void heartbeat() {
@@ -101,10 +122,16 @@ public class LobbyEventService {
     }
 
     @PreDestroy
-    public void close() { broadcaster.shutdownNow(); }
+    public void close() {
+        broadcaster.shutdownNow();
+    }
 
     private record Client(String username, String teamId, String role, SseEmitter emitter) {
-        private boolean admin() { return "ADMIN".equals(role); }
+        private boolean admin() {
+            return "ADMIN".equals(role);
+        }
     }
-    public record Event(String type, String sender, String content, String time) {}
+
+    public record Event(String type, String sender, String content, String time) {
+    }
 }

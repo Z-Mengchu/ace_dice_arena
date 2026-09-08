@@ -40,7 +40,8 @@ public class AccountService {
 
     @Transactional
     public UserAccount register(String username, String displayName, String department, String password) {
-        if (externalDirectory.isPresent()) throw new IllegalArgumentException("用户由公司组织数据库统一管理，无需在游戏中注册");
+        if (externalDirectory.isPresent())
+            throw new IllegalArgumentException("用户由公司组织数据库统一管理，无需在游戏中注册");
         validate(username, displayName, department, password);
         if (repository.existsByUsername(username)) throw new IllegalArgumentException("用户名已存在");
         return create(username, displayName, department, "123456", "USER");
@@ -74,7 +75,9 @@ public class AccountService {
         return user;
     }
 
-    public boolean isRegistrationEnabled() { return externalDirectory.isEmpty(); }
+    public boolean isRegistrationEnabled() {
+        return externalDirectory.isEmpty();
+    }
 
     @Transactional
     public UserAccount syncExternalUser(ExternalDirectoryService.DirectoryUser directoryUser) {
@@ -95,7 +98,9 @@ public class AccountService {
         return user;
     }
 
-    /** 将外部目录中已停用、删除或不再满足筛选条件的历史账号移出当前游戏名单。 */
+    /**
+     * 将外部目录中已停用、删除或不再满足筛选条件的历史账号移出当前游戏名单。
+     */
     @Transactional
     public void deactivateMissingExternalUsers(Set<String> activeUsernames) {
         var inactive = repository.findAll().stream()
@@ -111,10 +116,14 @@ public class AccountService {
     }
 
     private void validate(String username, String displayName, String department, String password) {
-        if (username == null || !username.matches("[A-Za-z0-9_]{3,32}")) throw new IllegalArgumentException("用户名需为 3-32 位字母、数字或下划线");
-        if (displayName == null || displayName.isBlank() || displayName.length() > 32) throw new IllegalArgumentException("显示名称需为 1-32 个字符");
-        if (department == null || department.isBlank() || department.length() > 64) throw new IllegalArgumentException("部门需为 1-64 个字符");
-        if (password == null || password.length() < 6 || password.length() > 64) throw new IllegalArgumentException("密码需为 6-64 个字符");
+        if (username == null || !username.matches("[A-Za-z0-9_]{3,32}"))
+            throw new IllegalArgumentException("用户名需为 3-32 位字母、数字或下划线");
+        if (displayName == null || displayName.isBlank() || displayName.length() > 32)
+            throw new IllegalArgumentException("显示名称需为 1-32 个字符");
+        if (department == null || department.isBlank() || department.length() > 64)
+            throw new IllegalArgumentException("部门需为 1-64 个字符");
+        if (password == null || password.length() < 6 || password.length() > 64)
+            throw new IllegalArgumentException("密码需为 6-64 个字符");
     }
 
     private String hash(String password, String salt) {

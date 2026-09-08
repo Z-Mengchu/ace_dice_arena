@@ -18,8 +18,8 @@ public class LobbyService {
     public static final String STAND_IN_PREFIX = "__arena_stand_in_";
     public static final int TEAM_SIZE = 30;
     public static final int PARTICIPANT_COUNT = TEAM_SIZE * 8;
-    public static final List<String> TEAM_IDS = List.of("t1","t2","t3","t4","t5","t6","t7","t8");
-    public static final List<String> TEAM_NAMES = List.of("雷霆战区","烈焰战区","飓风战区","磐石战区","星驰战区","锋芒战区","凌云战区","破晓战区");
+    public static final List<String> TEAM_IDS = List.of("t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8");
+    public static final List<String> TEAM_NAMES = List.of("雷霆战区", "烈焰战区", "飓风战区", "磐石战区", "星驰战区", "锋芒战区", "凌云战区", "破晓战区");
     private final UserAccountRepository users;
     private final GameControlRepository controls;
     private final GameStateRepository gameStates;
@@ -34,18 +34,34 @@ public class LobbyService {
                         GameStateRepository gameStates, LobbyEventService events, ObjectMapper objectMapper,
                         ParallelTournamentService tournament,
                         @Value("${app.cache.roster-ttl-ms:300}") long rosterCacheTtlMs) {
-        this.users = users; this.controls = controls; this.gameStates = gameStates;
-        this.events = events; this.objectMapper = objectMapper; this.tournament = tournament;
+        this.users = users;
+        this.controls = controls;
+        this.gameStates = gameStates;
+        this.events = events;
+        this.objectMapper = objectMapper;
+        this.tournament = tournament;
         this.rosterCacheTtlMs = Math.max(0, rosterCacheTtlMs);
     }
 
     @Transactional
-    public LobbyView view(String username) { return buildView(username, false); }
+    public LobbyView view(String username) {
+        return buildView(username, false, false);
+    }
+
+    /**
+     * 总控台视图：包含对阵副本（match-grid 在没有比赛状态时用它兜底渲染）。
+     */
+    @Transactional
+    public LobbyView adminView(String username) {
+        return buildView(username, false, true);
+    }
 
     @Transactional
-    public LobbyView sandboxPlayerView(String username) { return buildView(username, true); }
+    public LobbyView sandboxPlayerView(String username) {
+        return buildView(username, true, true);
+    }
 
-    private LobbyView buildView(String username, boolean sandboxPreview) {
+    private LobbyView buildView(String username, boolean sandboxPreview, boolean includeMatches) {
         UserAccount me = users.findByUsername(username).orElseThrow();
         GameControl control = control();
         JsonNode currentGame = savedGame();
@@ -54,7 +70,10 @@ public class LobbyService {
             if (username.equals(player.path("username").asText())) sandboxPlayer = true;
         }
         List<UserView> playerAccounts = playerRoster();
+        // 测试账号本身是沙盘参赛者，不按私密沙盘拦截（与正式比赛真实用户路径一致）；
+        // 私密沙盘只屏蔽真实用户的视图。
         boolean privateSandbox = !sandboxPreview && !sandboxPlayer && !"ADMIN".equals(me.getRole())
+                && !AdminTestModeService.isTestUser(me)
                 && playerAccounts.stream().anyMatch(user -> user.username().startsWith(AdminTestModeService.USERNAME_PREFIX));
         List<UserView> all = playerAccounts.stream()
                 .filter(user -> !privateSandbox || !user.username().startsWith(AdminTestModeService.USERNAME_PREFIX)).toList();
@@ -69,9 +88,11 @@ public class LobbyService {
                 && teams.stream().allMatch(t -> t.members().size() == TEAM_SIZE)
                 && participants.stream().allMatch(UserView::ready);
         JsonNode savedGame = privateSandbox ? objectMapper.createObjectNode() : currentGame;
-        List<MatchView> matches = List.of(
+        // 大厅页不需要对阵副本（前端从 /api/game-state 取比分），仅总控台与沙盘预览携带
+        List<MatchView> matches = includeMatches ? List.of(
                 match(1, teams.get(0), teams.get(1), savedGame), match(2, teams.get(2), teams.get(3), savedGame),
-                match(3, teams.get(4), teams.get(5), savedGame), match(4, teams.get(6), teams.get(7), savedGame));
+                match(3, teams.get(4), teams.get(5), savedGame), match(4, teams.get(6), teams.get(7), savedGame))
+                : List.of();
         List<UserView> spectators = all.stream().filter(u -> u.teamId() == null).toList();
         teams.add(new TeamView("spectator", "观战席 / 未分组", spectators,
                 (int) spectators.stream().filter(UserView::ready).count()));
@@ -81,7 +102,8 @@ public class LobbyService {
                 team.id().equals(me.getTeamId()) || team.id().equals(opponentTeamId)
                         ? team
                         : new TeamView(team.id(), team.name(), List.of(), team.readyCount())).toList();
-        boolean canReady = !privateSandbox && me.getTeamId() != null && !"PLAYING".equals(control.getPhase());
+        boolean canReady = !privateSandbox && me.getTeamId() != null
+                && !"PLAYING".equals(control.getPhase()) && !"FINISHED".equals(control.getPhase());
         return new LobbyView(privateSandbox ? "PREPARING" : control.getPhase(), userView(me), canReady,
                 visibleTeams, matches, allReady);
     }
@@ -108,10 +130,12 @@ public class LobbyService {
 
     @Transactional
     public void assign(long userId, String teamId) {
-        if (teamId != null && !teamId.isBlank() && !TEAM_IDS.contains(teamId)) throw new IllegalArgumentException("invalid team");
+        if (teamId != null && !teamId.isBlank() && !TEAM_IDS.contains(teamId))
+            throw new IllegalArgumentException("invalid team");
         UserAccount user = users.findById(userId).orElseThrow(() -> new IllegalArgumentException("user not found"));
         if (!"USER".equals(user.getRole())) throw new IllegalArgumentException("管理员不参加分组");
-        if (!AccountService.hasUsableDepartment(user.getDepartment())) throw new IllegalArgumentException("未配置部门的用户不能参加分组");
+        if (!AccountService.hasUsableDepartment(user.getDepartment()))
+            throw new IllegalArgumentException("未配置部门的用户不能参加分组");
         String targetTeam = teamId == null || teamId.isBlank() ? null : teamId;
         if (targetTeam != null && !targetTeam.equals(user.getTeamId())) {
             long memberCount = users.findAll().stream().filter(u -> targetTeam.equals(u.getTeamId())).count();
@@ -175,10 +199,14 @@ public class LobbyService {
     public void ready(String username, boolean ready) {
         UserAccount user = users.findByUsername(username).orElseThrow();
         if (user.getTeamId() == null) throw new IllegalStateException("你不在本轮分组中");
-        if ("PLAYING".equals(control().getPhase())) throw new IllegalStateException("比赛进行中不能修改准备状态");
+        String phase = control().getPhase();
+        if ("PLAYING".equals(phase) || "FINISHED".equals(phase))
+            throw new IllegalStateException("比赛已开始或已结束，不能修改准备状态");
         user.setReady(ready);
         if (ready) user.setAfk(false);
-        users.save(user); invalidateRoster(); events.stateChanged();
+        users.save(user);
+        invalidateRoster();
+        events.stateChanged();
     }
 
     @Transactional
@@ -201,7 +229,7 @@ public class LobbyService {
                         && u.getTeamId() != null).toList();
         boolean ready = participants.size() == PARTICIPANT_COUNT
                 && TEAM_IDS.stream().allMatch(teamId -> participants.stream()
-                    .filter(u -> teamId.equals(u.getTeamId())).count() == TEAM_SIZE)
+                .filter(u -> teamId.equals(u.getTeamId())).count() == TEAM_SIZE)
                 && participants.stream().allMatch(UserAccount::isReady);
         if (!ready) throw new IllegalStateException("需要 8 队各 " + TEAM_SIZE + " 人且 "
                 + PARTICIPANT_COUNT + " 名参赛用户全部准备");
@@ -249,19 +277,46 @@ public class LobbyService {
         events.stateChanged();
     }
 
-    public void readyAll() { readyAll(true); }
+    public void readyAll() {
+        readyAll(true);
+    }
 
     @Transactional
-    public void resetTwoDayTournament() { tournament.resetTwoDayTournament(); }
+    public void resetTwoDayTournament() {
+        tournament.resetTwoDayTournament();
+    }
 
-    public UserAccount requireUser(String username) { return users.findByUsername(username).orElseThrow(); }
-    private GameControl control() { return controls.findById(1L).orElseGet(() -> controls.save(new GameControl(1L))); }
-    public static boolean isStandIn(UserAccount user) { return user != null && user.getUsername().startsWith(STAND_IN_PREFIX); }
+    /**
+     * 总冠军加赛：紧随第 2 天进行，不要求重新点名，缺人由挂机/托管兜底；待加赛状态由比赛侧校验。
+     */
+    @Transactional
+    public void startOvertime() {
+        control().changePhase("PLAYING");
+        tournament.startOvertime("system");
+        events.stateChanged();
+    }
+
+    public UserAccount requireUser(String username) {
+        return users.findByUsername(username).orElseThrow();
+    }
+
+    private GameControl control() {
+        return controls.findById(1L).orElseGet(() -> controls.save(new GameControl(1L)));
+    }
+
+    public static boolean isStandIn(UserAccount user) {
+        return user != null && user.getUsername().startsWith(STAND_IN_PREFIX);
+    }
+
     private static Optional<Long> originalUserId(UserAccount user) {
         if (!isStandIn(user)) return Optional.empty();
-        try { return Optional.of(Long.parseLong(user.getUsername().substring(STAND_IN_PREFIX.length()))); }
-        catch (NumberFormatException ignored) { return Optional.empty(); }
+        try {
+            return Optional.of(Long.parseLong(user.getUsername().substring(STAND_IN_PREFIX.length())));
+        } catch (NumberFormatException ignored) {
+            return Optional.empty();
+        }
     }
+
     private UserView userView(UserAccount u) {
         Optional<Long> originalId = originalUserId(u);
         String originalName = originalId.flatMap(users::findById).map(UserAccount::getDisplayName).orElse(null);
@@ -269,10 +324,14 @@ public class LobbyService {
                 u.getDepartment(), u.getRole(), u.getTeamId(), u.isReady(), u.isAfk(), u.isFrontEnd(), u.getGmv(),
                 isStandIn(u), originalId.orElse(null), originalName);
     }
+
     private JsonNode savedGame() {
         return gameStates.findById(1L).map(record -> {
-            try { return objectMapper.readTree(record.getContent()); }
-            catch (Exception ignored) { return objectMapper.createObjectNode(); }
+            try {
+                return objectMapper.readTree(record.getContent());
+            } catch (Exception ignored) {
+                return objectMapper.createObjectNode();
+            }
         }).orElseGet(objectMapper::createObjectNode);
     }
 
@@ -283,7 +342,8 @@ public class LobbyService {
         synchronized (rosterCacheLock) {
             cached = rosterCache;
             now = System.currentTimeMillis();
-            if (rosterCacheTtlMs > 0 && cached != null && now - cached.loadedAt() < rosterCacheTtlMs) return cached.users();
+            if (rosterCacheTtlMs > 0 && cached != null && now - cached.loadedAt() < rosterCacheTtlMs)
+                return cached.users();
             List<UserView> loaded = users.findAll().stream()
                     .filter(user -> "USER".equals(user.getRole()) && AccountService.hasUsableDepartment(user.getDepartment()))
                     .map(this::userView).toList();
@@ -292,7 +352,9 @@ public class LobbyService {
         }
     }
 
-    private void invalidateRoster() { rosterCache = null; }
+    private void invalidateRoster() {
+        rosterCache = null;
+    }
 
     private MatchView match(int no, TeamView a, TeamView b, JsonNode savedGame) {
         int scoreA = 0, scoreB = 0;
@@ -304,9 +366,11 @@ public class LobbyService {
                 String left = record.path("a").asText();
                 String right = record.path("b").asText();
                 if (a.id().equals(left) && b.id().equals(right)) {
-                    scoreA = record.path("winsA").asInt(); scoreB = record.path("winsB").asInt();
+                    scoreA = record.path("winsA").asInt();
+                    scoreB = record.path("winsB").asInt();
                 } else if (a.id().equals(right) && b.id().equals(left)) {
-                    scoreA = record.path("winsB").asInt(); scoreB = record.path("winsA").asInt();
+                    scoreA = record.path("winsB").asInt();
+                    scoreB = record.path("winsA").asInt();
                 }
             }
         }
@@ -314,11 +378,22 @@ public class LobbyService {
     }
 
     public record UserView(Long id, String username, String displayName, String department, String role,
-                           String teamId, boolean ready, boolean afk, boolean frontEnd, java.math.BigDecimal gmv, boolean standIn,
-                           Long originalUserId, String originalDisplayName) {}
-    public record TeamView(String id, String name, List<UserView> members, int readyCount) {}
-    public record MatchView(int number, String teamA, String nameA, String teamB, String nameB, int scoreA, int scoreB) {}
+                           String teamId, boolean ready, boolean afk, boolean frontEnd, java.math.BigDecimal gmv,
+                           boolean standIn,
+                           Long originalUserId, String originalDisplayName) {
+    }
+
+    public record TeamView(String id, String name, List<UserView> members, int readyCount) {
+    }
+
+    public record MatchView(int number, String teamA, String nameA, String teamB, String nameB, int scoreA,
+                            int scoreB) {
+    }
+
     public record LobbyView(String phase, UserView me, boolean canReady, List<TeamView> teams,
-                            List<MatchView> matches, boolean allReady) {}
-    private record RosterCache(long loadedAt, List<UserView> users) {}
+                            List<MatchView> matches, boolean allReady) {
+    }
+
+    private record RosterCache(long loadedAt, List<UserView> users) {
+    }
 }

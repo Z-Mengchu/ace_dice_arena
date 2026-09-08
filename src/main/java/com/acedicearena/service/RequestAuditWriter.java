@@ -33,12 +33,19 @@ public class RequestAuditWriter {
     }
 
     @PostConstruct
-    void start() { worker.execute(this::writeLoop); }
+    void start() {
+        worker.execute(this::writeLoop);
+    }
 
-    /** 审计入队不占用请求线程；队列满时短暂等待，尽量保证现场请求不丢记录。 */
+    /**
+     * 审计入队不占用请求线程；队列满时短暂等待，尽量保证现场请求不丢记录。
+     */
     public void submit(RequestAudit audit) {
-        try { queue.offer(audit, 50, TimeUnit.MILLISECONDS); }
-        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        try {
+            queue.offer(audit, 50, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void writeLoop() {
@@ -57,8 +64,12 @@ public class RequestAuditWriter {
             } catch (RuntimeException e) {
                 batch.forEach(queue::offer);
                 batch.clear();
-                try { TimeUnit.SECONDS.sleep(1); }
-                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); break; }
+                try {
+                    TimeUnit.SECONDS.sleep(1);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
     }
@@ -67,7 +78,10 @@ public class RequestAuditWriter {
     void close() {
         running = false;
         worker.shutdown();
-        try { worker.awaitTermination(3, TimeUnit.SECONDS); }
-        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        try {
+            worker.awaitTermination(3, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

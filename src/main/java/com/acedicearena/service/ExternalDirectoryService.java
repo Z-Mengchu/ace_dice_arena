@@ -36,10 +36,15 @@ public class ExternalDirectoryService {
                                     @Value("${app.organization-datasource.password}") String password) {
         HikariConfig config = new HikariConfig();
         config.setPoolName("OrganizationReadOnlyPool");
-        config.setJdbcUrl(jdbcUrl); config.setUsername(username); config.setPassword(password);
+        config.setJdbcUrl(jdbcUrl);
+        config.setUsername(username);
+        config.setPassword(password);
         config.setDriverClassName("com.mysql.cj.jdbc.Driver");
-        config.setMaximumPoolSize(3); config.setMinimumIdle(0); config.setReadOnly(true);
-        config.setConnectionTimeout(5000); config.setValidationTimeout(3000);
+        config.setMaximumPoolSize(3);
+        config.setMinimumIdle(0);
+        config.setReadOnly(true);
+        config.setConnectionTimeout(5000);
+        config.setValidationTimeout(3000);
         this.dataSource = new HikariDataSource(config);
         this.jdbc = new JdbcTemplate(dataSource);
     }
@@ -73,7 +78,10 @@ public class ExternalDirectoryService {
     }
 
     @PreDestroy
-    void close() { dataSource.close(); }
+    void close() {
+        dataSource.close();
+    }
 
-    public record DirectoryUser(long id, String username, String displayName, String department) {}
+    public record DirectoryUser(long id, String username, String displayName, String department) {
+    }
 }

@@ -73,11 +73,13 @@ public class PerformanceImportService {
             style.setFillPattern(FillPatternType.SOLID_FOREGROUND);
             style.setAlignment(HorizontalAlignment.CENTER);
             Font font = workbook.createFont();
-            font.setBold(true); font.setColor(IndexedColors.BLACK.getIndex());
+            font.setBold(true);
+            font.setColor(IndexedColors.BLACK.getIndex());
             style.setFont(font);
             for (int i = 0; i < HEADERS.size(); i++) {
                 Cell cell = header.createCell(i);
-                cell.setCellValue(HEADERS.get(i)); cell.setCellStyle(style);
+                cell.setCellValue(HEADERS.get(i));
+                cell.setCellStyle(style);
                 sheet.setColumnWidth(i, i == 3 ? 18 * 256 : 16 * 256);
             }
             sheet.createFreezePane(0, 1);
@@ -90,7 +92,8 @@ public class PerformanceImportService {
                     else cell.setCellValue(values[column]);
                 }
             }
-            if (!sampleRows.isEmpty()) sheet.setAutoFilter(new CellRangeAddress(0, sampleRows.size(), 0, HEADERS.size() - 1));
+            if (!sampleRows.isEmpty())
+                sheet.setAutoFilter(new CellRangeAddress(0, sampleRows.size(), 0, HEADERS.size() - 1));
             workbook.write(output);
             return output.toByteArray();
         } catch (Exception e) {
@@ -125,12 +128,16 @@ public class PerformanceImportService {
             String status;
             Long userId = null;
             if (candidates.isEmpty()) {
-                status = "UNMATCHED"; unmatched.add(row.leader());
+                status = "UNMATCHED";
+                unmatched.add(row.leader());
             } else if (candidates.size() > 1) {
-                status = "AMBIGUOUS"; ambiguous.add(row.leader());
+                status = "AMBIGUOUS";
+                ambiguous.add(row.leader());
             } else {
                 UserAccount user = candidates.getFirst();
-                status = "MATCHED"; userId = user.getId(); matchedIds.add(userId);
+                status = "MATCHED";
+                userId = user.getId();
+                matchedIds.add(userId);
                 gmvByUser.merge(userId, row.salesAmount(), BigDecimal::add);
             }
             imported.add(row.toEntity(status, userId));
@@ -221,8 +228,10 @@ public class PerformanceImportService {
         String issue = null;
         int maxFrontEnds = TEAM_COUNT * (TEAM_SIZE - MIN_BACK_END);
         int participantCount = TEAM_COUNT * TEAM_SIZE;
-        if (matchedUsers > maxFrontEnds) issue = "前端超过 " + maxFrontEnds + " 人，无法保证每队至少 " + MIN_BACK_END + " 名后端";
-        else if (backendCount < requiredBackends) issue = "用户总数不足 " + participantCount + " 人，还缺 " + (requiredBackends - backendCount) + " 名后端";
+        if (matchedUsers > maxFrontEnds)
+            issue = "前端超过 " + maxFrontEnds + " 人，无法保证每队至少 " + MIN_BACK_END + " 名后端";
+        else if (backendCount < requiredBackends)
+            issue = "用户总数不足 " + participantCount + " 人，还缺 " + (requiredBackends - backendCount) + " 名后端";
         boolean clean = !imported.isEmpty() && matchedRows == imported.size() && issue == null;
         return new ImportResult(imported.size(), matchedUsers, total, unmatched, ambiguous, issue, clean);
     }
@@ -230,12 +239,14 @@ public class PerformanceImportService {
     private List<RowData> readRows(MultipartFile file) {
         try (Workbook workbook = WorkbookFactory.create(file.getInputStream())) {
             Sheet sheet = workbook.getSheetAt(0);
-            if (sheet == null || sheet.getPhysicalNumberOfRows() == 0) throw new IllegalArgumentException("Excel 缺少表头");
+            if (sheet == null || sheet.getPhysicalNumberOfRows() == 0)
+                throw new IllegalArgumentException("Excel 缺少表头");
             DataFormatter formatter = new DataFormatter(Locale.CHINA);
             FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
             Map<String, Integer> columns = new HashMap<>();
             Row header = sheet.getRow(sheet.getFirstRowNum());
-            for (Cell cell : header) columns.put(formatter.formatCellValue(cell, evaluator).trim(), cell.getColumnIndex());
+            for (Cell cell : header)
+                columns.put(formatter.formatCellValue(cell, evaluator).trim(), cell.getColumnIndex());
             List<String> missing = HEADERS.stream().filter(h -> !columns.containsKey(h)).toList();
             if (!missing.isEmpty()) throw new IllegalArgumentException("Excel 缺少表头：" + String.join("、", missing));
             List<RowData> rows = new ArrayList<>();
@@ -264,22 +275,34 @@ public class PerformanceImportService {
         Cell cell = row.getCell(column);
         return cell == null ? "" : formatter.formatCellValue(cell, evaluator).trim();
     }
+
     private BigDecimal number(Row row, int column, DataFormatter formatter, FormulaEvaluator evaluator) {
         String raw = text(row, column, formatter, evaluator).replace(",", "").replace("¥", "").trim();
         if (raw.isEmpty() || "-".equals(raw)) return BigDecimal.ZERO;
-        try { return new BigDecimal(raw); }
-        catch (NumberFormatException e) { throw new IllegalArgumentException("第 " + (row.getRowNum() + 1) + " 行存在非数字金额或数量"); }
+        try {
+            return new BigDecimal(raw);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("第 " + (row.getRowNum() + 1) + " 行存在非数字金额或数量");
+        }
     }
+
     private Integer integer(Row row, int column, DataFormatter formatter, FormulaEvaluator evaluator) {
         BigDecimal value = number(row, column, formatter, evaluator);
         return value.compareTo(BigDecimal.ZERO) == 0 ? null : value.intValue();
     }
+
     private boolean isPlayer(UserAccount user) {
         return "USER".equals(user.getRole()) && !LobbyService.isStandIn(user)
                 && AccountService.hasUsableDepartment(user.getDepartment());
     }
-    private GameControl control() { return controls.findById(1L).orElseGet(() -> controls.save(new GameControl(1L))); }
-    private String normalize(String value) { return value == null ? "" : value.replaceAll("\\s+", "").trim(); }
+
+    private GameControl control() {
+        return controls.findById(1L).orElseGet(() -> controls.save(new GameControl(1L)));
+    }
+
+    private String normalize(String value) {
+        return value == null ? "" : value.replaceAll("\\s+", "").trim();
+    }
 
     private record RowData(Integer ranking, String department, String group, String leader,
                            BigDecimal orderCount, BigDecimal salesQuantity, BigDecimal salesAmount,
@@ -295,18 +318,46 @@ public class PerformanceImportService {
         private final List<UserAccount> members = new ArrayList<>();
         private BigDecimal gmv = BigDecimal.ZERO;
         private int frontCount;
-        private TeamBucket(String id) { this.id = id; }
-        private void addFront(UserAccount user) { members.add(user); gmv = gmv.add(user.getGmv()); frontCount++; }
-        private void addBack(UserAccount user) { members.add(user); }
-        private int size() { return members.size(); }
-        private int frontCount() { return frontCount; }
-        private BigDecimal gmv() { return gmv; }
-        private TeamResult view() { return new TeamResult(id, gmv, frontCount, size() - frontCount, size()); }
+
+        private TeamBucket(String id) {
+            this.id = id;
+        }
+
+        private void addFront(UserAccount user) {
+            members.add(user);
+            gmv = gmv.add(user.getGmv());
+            frontCount++;
+        }
+
+        private void addBack(UserAccount user) {
+            members.add(user);
+        }
+
+        private int size() {
+            return members.size();
+        }
+
+        private int frontCount() {
+            return frontCount;
+        }
+
+        private BigDecimal gmv() {
+            return gmv;
+        }
+
+        private TeamResult view() {
+            return new TeamResult(id, gmv, frontCount, size() - frontCount, size());
+        }
     }
 
     public record ImportResult(int totalRows, int matchedUsers, BigDecimal totalGmv,
                                List<String> unmatchedNames, List<String> ambiguousNames,
-                               String groupingIssue, boolean canGroup) {}
-    public record TeamResult(String teamId, BigDecimal gmv, int frontEndCount, int backEndCount, int totalCount) {}
-    public record GroupingResult(List<TeamResult> teams, int frontEndCount, int backEndCount) {}
+                               String groupingIssue, boolean canGroup) {
+    }
+
+    public record TeamResult(String teamId, BigDecimal gmv, int frontEndCount, int backEndCount, int totalCount) {
+    }
+
+    public record GroupingResult(List<TeamResult> teams, int frontEndCount, int backEndCount) {
+    }
 }
