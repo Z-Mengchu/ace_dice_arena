@@ -346,7 +346,7 @@ function openLobbyBox(idx){
   boxEls.forEach(function(b){b.disabled=true;});
   playerAction('blind-box-open',[String(idx)]).then(function(res){
     var canAnimate=res&&res.blindBox!=null&&Array.isArray(res.boxes)&&res.boxes.length===3&&res.picked===idx&&window.gsap&&!window.BlindBoxUI.reducedMotion();
-    if(canAnimate){bbAnimating=true;window.BlindBoxUI.playBoxReveal(boxEls,idx,res.boxes.map(Number),function(){bbAnimating=false;myLobbyBox=Number(res.blindBox);repaint();});}
+    if(canAnimate){bbAnimating=true;window.BlindBoxUI.playBoxReveal(boxEls,idx,res.boxes.map(Number),function(){bbAnimating=false;myLobbyBox=Number(res.blindBox);repaint();},{koi:Number(res.blindBox)===5});}
     else{if(res&&res.blindBox!=null)myLobbyBox=Number(res.blindBox);repaint();}
   }).catch(function(error){boxEls.forEach(function(b){b.disabled=false;});showActionError(error);});
 }
