@@ -25,8 +25,7 @@ public class LoginFilter extends OncePerRequestFilter {
         boolean loggedIn = session != null && session.getAttribute(AuthController.SESSION_USER) != null;
         if (loggedIn) {
             boolean admin = "ADMIN".equals(session.getAttribute("role"));
-            boolean adminApi = path.startsWith("/api/admin/") || path.equals("/api/arm")
-                    || path.equals("/api/go") || path.equals("/api/reset")
+            boolean adminApi = path.startsWith("/api/admin/")
                     || path.equals("/api/game-state") && "PUT".equals(request.getMethod());
             boolean adminPage = path.equals("/admin") || path.equals("/admin.html")
                     || path.equals("/sandbox-player") || path.equals("/sandbox-player.html")
@@ -57,7 +56,9 @@ public class LoginFilter extends OncePerRequestFilter {
         }
     }
 
-    /** 使用相对 Location，避免反向代理未传递外部端口时把 3004 重定向成 80。 */
+    /**
+     * 使用相对 Location，避免反向代理未传递外部端口时把 3004 重定向成 80。
+     */
     private void redirectPreservingOrigin(HttpServletResponse response, String path) {
         response.setStatus(HttpServletResponse.SC_FOUND);
         response.setHeader("Location", path);

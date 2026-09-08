@@ -2,13 +2,17 @@ package com.acedicearena.web;
 
 import com.acedicearena.domain.BattleReport;
 import com.acedicearena.domain.GameStateRecord;
+import com.acedicearena.domain.UserAccount;
 import com.acedicearena.repository.BattleReportRepository;
 import com.acedicearena.repository.GameStateRepository;
+import com.acedicearena.repository.MatchReportRepository;
 import com.acedicearena.repository.UserAccountRepository;
 import com.acedicearena.service.AdminTestModeService;
 import com.acedicearena.service.LobbyEventService;
+import com.acedicearena.service.ParallelTournamentService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.servlet.http.HttpSession;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
@@ -28,6 +32,8 @@ public class GameDataController {
     private final ObjectMapper objectMapper;
     private final LobbyEventService lobbyEvents;
     private final UserAccountRepository users;
+    private final ParallelTournamentService tournament;
+    private final MatchReportRepository matchReports;
     private final long stateCacheTtlMs;
     private final Object stateCacheLock = new Object();
     private volatile StateSnapshot stateCache;
@@ -38,12 +44,16 @@ public class GameDataController {
                               ObjectMapper objectMapper,
                               LobbyEventService lobbyEvents,
                               UserAccountRepository users,
+                              ParallelTournamentService tournament,
+                              MatchReportRepository matchReports,
                               @Value("${app.cache.game-state-ttl-ms:250}") long stateCacheTtlMs) {
         this.gameStateRepository = gameStateRepository;
         this.battleReportRepository = battleReportRepository;
         this.objectMapper = objectMapper;
         this.lobbyEvents = lobbyEvents;
         this.users = users;
+        this.tournament = tournament;
+        this.matchReports = matchReports;
         this.stateCacheTtlMs = Math.max(0, stateCacheTtlMs);
     }
 
@@ -51,20 +61,69 @@ public class GameDataController {
     public ResponseEntity<?> getGameState(HttpSession session) {
         StateSnapshot snapshot = gameState();
         boolean ordinaryUser = "USER".equals(session.getAttribute("role"));
-        if (ordinaryUser && hasTestUsers()) {
-            String username = (String) session.getAttribute(AuthController.SESSION_USER);
-            boolean sandboxPlayer = false;
-            if (snapshot.present()) {
-                for (JsonNode player : snapshot.state().path("sandboxPlayers"))
-                    if (username.equals(player.path("username").asText())) sandboxPlayer = true;
-                if (username.equals(snapshot.state().at("/sandboxSolo/username").asText(null))) sandboxPlayer = true;
-            }
-            if (!sandboxPlayer) return ResponseEntity.noContent().build();
-        }
+        String username = (String) session.getAttribute(AuthController.SESSION_USER);
+        if (ordinaryUser && sandboxHidden(username, snapshot)) return ResponseEntity.noContent().build();
         if (!snapshot.present()) return ResponseEntity.noContent().build();
-        return ResponseEntity.ok(Map.of(
-                "state", snapshot.state(), "version", snapshot.version(),
-                "updatedAt", snapshot.updatedAt(), "updatedBy", snapshot.updatedBy()));
+        JsonNode state = snapshot.state();
+        if (ordinaryUser) {
+            UserAccount account = users.findByUsername(username).orElse(null);
+            state = tournament.publicStateView(state,
+                    account == null ? null : account.getTeamId(),
+                    account == null ? null : "u" + account.getId());
+        }
+        return ResponseEntity.ok(Map.of("state", state, "version", snapshot.version()));
+    }
+
+    /**
+     * 单场对局详情（含 rounds 完整战力明细）：/api/game-state 只下发摘要，
+     * 前端在用户点开某场对局时才调用本接口。完赛场次的明细已从 GameState
+     * 行内移出（只留 {round, winner} 摘要），按 (day, matchId) 从归档表读取。
+     */
+    @GetMapping("/game-state/matches/{matchId}")
+    public ResponseEntity<?> getMatchDetail(@PathVariable String matchId, HttpSession session) {
+        StateSnapshot snapshot = gameState();
+        boolean ordinaryUser = "USER".equals(session.getAttribute("role"));
+        String username = (String) session.getAttribute(AuthController.SESSION_USER);
+        if (ordinaryUser && sandboxHidden(username, snapshot)) return ResponseEntity.noContent().build();
+        if (!snapshot.present()) return ResponseEntity.noContent().build();
+        JsonNode match = snapshot.state().path("matches").path(matchId);
+        if (match.isMissingNode()) return ResponseEntity.notFound().build();
+        if (match instanceof ObjectNode stateMatch && !hasDetailedRounds(stateMatch)) {
+            int day = snapshot.state().path("day").asInt(1);
+            JsonNode archived = matchReports.findTopByDayAndMatchIdOrderByIdDesc(day, matchId)
+                    .map(report -> parse(report.getContent()))
+                    .filter(node -> node instanceof ObjectNode && node.has("rounds"))
+                    .orElse(null);
+            if (archived != null) {
+                // 归档是结算时刻快照，status/phase 之后还会推进（RESULT → done），以当前状态为准
+                ((ObjectNode) archived).put("status", stateMatch.path("status").asText());
+                ((ObjectNode) archived).put("phase", stateMatch.path("phase").asText());
+                match = archived;
+            }
+        }
+        if (ordinaryUser) match = tournament.publicMatchView(match);
+        return ResponseEntity.ok(match);
+    }
+
+    /** state 里的 rounds 是否还带战力明细；完赛场次行内只留摘要，首条无 powerA 即摘要。 */
+    private static boolean hasDetailedRounds(JsonNode match) {
+        JsonNode rounds = match.path("rounds");
+        return rounds.isArray() && !rounds.isEmpty() && rounds.get(0).has("powerA");
+    }
+
+    /**
+     * 私密沙盘拦截：测试账号（__arena_test_ 前缀）本身就是沙盘参赛者，放行走正常脱敏视图，
+     * 与正式比赛真实用户路径一致；只有真实用户才被私密沙盘拦截。
+     */
+    private boolean sandboxHidden(String username, StateSnapshot snapshot) {
+        if (!hasTestUsers()) return false;
+        boolean sandboxPlayer = username != null && username.startsWith(AdminTestModeService.USERNAME_PREFIX);
+        if (!sandboxPlayer && snapshot.present()) {
+            for (JsonNode player : snapshot.state().path("sandboxPlayers"))
+                if (username.equals(player.path("username").asText())) sandboxPlayer = true;
+            if (username.equals(snapshot.state().at("/sandboxSolo/username").asText(null))) sandboxPlayer = true;
+        }
+        return !sandboxPlayer;
     }
 
     @PutMapping("/game-state")
@@ -107,8 +166,13 @@ public class GameDataController {
             if (stateCacheTtlMs > 0 && cached != null && now - cached.loadedAt() < stateCacheTtlMs) return cached;
             long loadedAt = now;
             StateSnapshot loaded = gameStateRepository.findById(STATE_ID)
-                    .map(record -> new StateSnapshot(true, parse(record.getContent()), record.getVersion(),
-                            record.getUpdatedAt(), record.getUpdatedBy() == null ? "" : record.getUpdatedBy(), loadedAt))
+                    .map(record -> {
+                        JsonNode state = parse(record.getContent());
+                        // BLIND_BOX 阶段开盒结果在 player_blind_box 表，注入后再入缓存
+                        tournament.injectBlindBoxResults(state);
+                        return new StateSnapshot(true, state, record.getVersion(),
+                                record.getUpdatedAt(), record.getUpdatedBy() == null ? "" : record.getUpdatedBy(), loadedAt);
+                    })
                     .orElseGet(() -> new StateSnapshot(false, objectMapper.createObjectNode(), 0,
                             Instant.EPOCH, "", loadedAt));
             stateCache = loaded;
