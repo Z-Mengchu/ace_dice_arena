@@ -1,56 +1,28 @@
 package com.acedicearena;
 
 import com.acedicearena.service.OnlineGameService;
+import com.acedicearena.service.ParallelTournamentService;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
-import org.springframework.context.ApplicationEventPublisher;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
-/** 时钟校准与同步判定的防伪造约束：偏移由服务端计算，点击时刻必须落在服务端可验证的窗口内。 */
+/**
+ * 时钟校准的防伪造约束：偏移由服务端根据自己的探测样本计算，客户端报多大的 rtt
+ * 也只能在被限幅的半程范围内移动偏移；伪造的点击时刻由状态机侧夹取窗口兜底
+ * （见 ParallelTournamentServiceTest 的 recordLiveRoll 用例）。
+ */
 class ClockCalibrationSecurityTest {
 
     @Test
-    void fiveClientsReportingOneColludedTimestampDoNotEarnTheSyncBonus() throws Exception {
-        ApplicationEventPublisher publisher = mock(ApplicationEventPublisher.class);
-        OnlineGameService service = new OnlineGameService(publisher);
-        String[] tokens = joinAndCalibrate(service, "t1");
-        service.arm("t1");
-        service.go("t1");
-
-        // 五人实际点击时间散得很开（跨度约 800ms），但客户端串通后统一上报同一个伪造时刻。
-        double forged = System.currentTimeMillis() - 5_000d;
-        for (int i = 0; i < 5; i++) {
-            service.roll(tokens[i], forged);
-            if (i < 4) Thread.sleep(200);
-        }
-
-        OnlineGameService.DiceTimingReadyEvent timing = timingReady(publisher);
-        assertThat(timing.syncOk()).isFalse();
-        assertThat(timing.spreadMs()).isGreaterThan(500d);
-    }
-
-    @Test
-    void honestClicksInsideTheWindowStillEarnTheSyncBonus() throws Exception {
-        ApplicationEventPublisher publisher = mock(ApplicationEventPublisher.class);
-        OnlineGameService service = new OnlineGameService(publisher);
-        String[] tokens = joinAndCalibrate(service, "t1");
-        service.arm("t1");
-        service.go("t1");
-        Thread.sleep(40); // 口令下达到五人真正按下之间的反应时间，正常局都不会是 0
-        for (int i = 0; i < 5; i++) service.roll(tokens[i], (double) System.currentTimeMillis());
-
-        OnlineGameService.DiceTimingReadyEvent timing = timingReady(publisher);
-        assertThat(timing.syncOk()).isTrue();
-        assertThat(timing.spreadMs()).isLessThanOrEqualTo(500d);
-    }
-
-    @Test
     void calibrationRequiresServerRecordedProbes() {
-        OnlineGameService service = new OnlineGameService(mock(ApplicationEventPublisher.class));
-        String token = service.join("t1", 1, "队员1", "u1").token();
+        OnlineGameService service = new OnlineGameService(eligibleTournament());
+        String token = service.join("alice", "u1").token();
         assertThatThrownBy(() -> service.calibrate(token, 20d))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("时钟探测样本不足，请重新校准");
@@ -58,8 +30,8 @@ class ClockCalibrationSecurityTest {
 
     @Test
     void oversizedRoundTripHintIsCappedSoItCannotDragTheOffset() {
-        OnlineGameService service = new OnlineGameService(mock(ApplicationEventPublisher.class));
-        String token = service.join("t1", 1, "队员1", "u1").token();
+        OnlineGameService service = new OnlineGameService(eligibleTournament());
+        String token = service.join("alice", "u1").token();
         long c0 = System.currentTimeMillis();
         service.ping(token, (double) c0);
         var honest = service.calibrate(token, 0d);
@@ -70,30 +42,37 @@ class ClockCalibrationSecurityTest {
     }
 
     @Test
-    void aDeviceBoundToAPlayerCannotBeCalibratedByAnotherAccount() {
-        OnlineGameService service = new OnlineGameService(mock(ApplicationEventPublisher.class));
-        String token = service.join("t1", 1, "队员1", "u1").token();
+    void aTokenBoundToAPlayerCannotBeCalibratedByAnotherAccount() {
+        OnlineGameService service = new OnlineGameService(eligibleTournament());
+        String token = service.join("alice", "u1").token();
         assertThat(service.ownsDevice(token, "u1")).isTrue();
         assertThat(service.ownsDevice(token, "u2")).isFalse();
     }
 
-    /** publishEvent(Object) 会收到进度和判定两类事件，这里只取同步判定结果。 */
-    private OnlineGameService.DiceTimingReadyEvent timingReady(ApplicationEventPublisher publisher) {
-        ArgumentCaptor<Object> captor = ArgumentCaptor.forClass(Object.class);
-        verify(publisher, atLeastOnce()).publishEvent(captor.capture());
-        return captor.getAllValues().stream()
-                .filter(OnlineGameService.DiceTimingReadyEvent.class::isInstance)
-                .map(OnlineGameService.DiceTimingReadyEvent.class::cast)
-                .findFirst().orElseThrow();
+    @Test
+    void colludedClientTimestampsAreNotClampedLocallyButDelegatedForServerSideClamping() {
+        ParallelTournamentService tournament = eligibleTournament();
+        when(tournament.recordLiveRoll(eq("alice"), anyLong()))
+                .thenReturn(new ParallelTournamentService.LiveRoll(3, 1L));
+        OnlineGameService service = new OnlineGameService(tournament);
+        String token = service.join("alice", "u1").token();
+        service.ping(token, (double) System.currentTimeMillis());
+        var calibration = service.calibrate(token, 20d);
+
+        // 客户端上报一个远古的伪造时刻：令牌层只加偏移，夹取交给状态机窗口守卫
+        double forged = System.currentTimeMillis() - 5_000d;
+        service.roll(token, forged);
+
+        ArgumentCaptor<Long> captor = ArgumentCaptor.forClass(Long.class);
+        verify(tournament).recordLiveRoll(eq("alice"), captor.capture());
+        assertThat(captor.getValue()).isEqualTo(Math.round(forged + calibration.offset()));
     }
 
-    private String[] joinAndCalibrate(OnlineGameService service, String team) {
-        String[] tokens = new String[5];
-        for (int i = 0; i < 5; i++) {
-            tokens[i] = service.join(team, i + 1, team + "-" + (i + 1), "u" + (i + 1)).token();
-            service.ping(tokens[i], (double) System.currentTimeMillis());
-            service.calibrate(tokens[i], 20d);
-        }
-        return tokens;
+    private ParallelTournamentService eligibleTournament() {
+        ParallelTournamentService tournament = mock(ParallelTournamentService.class);
+        when(tournament.rollAssignment(anyString())).thenReturn(
+                new ParallelTournamentService.RollAssignmentView(true, "ROLL", 1_000L, 31_000L, false, "t1",
+                        0, 1_000L, 16_000L));
+        return tournament;
     }
 }

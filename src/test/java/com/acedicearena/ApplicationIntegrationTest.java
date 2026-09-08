@@ -2,14 +2,15 @@ package com.acedicearena;
 
 import com.acedicearena.domain.GameStateRecord;
 import com.acedicearena.domain.GameControl;
+import com.acedicearena.domain.UserAccount;
 import com.acedicearena.repository.BattleReportRepository;
 import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.GameControlRepository;
 import com.acedicearena.repository.RequestAuditRepository;
 import com.acedicearena.repository.UserAccountRepository;
-import com.acedicearena.service.OnlineGameService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.servlet.http.HttpSession;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -19,11 +20,16 @@ import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockHttpSession;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
-@SpringBootTest
+// 测试库默认是固定名共享 H2，其他存活的测试上下文的 500ms 定时扫描（advanceDueResults）会消费本测试
+// 写入的阶段状态并提前推进；给本测试类独立的内存库，隔离其他上下文的调度器（与 SandboxFullBracketE2ETest 同理）。
+@SpringBootTest(properties = {"spring.datasource.url=jdbc:h2:mem:app-integration;DB_CLOSE_DELAY=-1"})
 @AutoConfigureMockMvc
 class ApplicationIntegrationTest {
     @Autowired MockMvc mockMvc;
@@ -32,7 +38,6 @@ class ApplicationIntegrationTest {
     @Autowired GameControlRepository gameControlRepository;
     @Autowired BattleReportRepository battleReportRepository;
     @Autowired RequestAuditRepository requestAuditRepository;
-    @Autowired OnlineGameService onlineGameService;
     @Autowired UserAccountRepository userAccountRepository;
 
     @Test
@@ -64,6 +69,8 @@ class ApplicationIntegrationTest {
 
     @Test
     void gameStateAndBattleReportsArePersisted() throws Exception {
+        // H2 跨用例共享，新建语义（版本从 1 起）只在记录不存在时成立
+        gameStateRepository.deleteAll();
         MockHttpSession session = login();
         mockMvc.perform(put("/api/game-state").session(session)
                         .contentType(MediaType.APPLICATION_JSON)
@@ -240,173 +247,190 @@ class ApplicationIntegrationTest {
     }
 
     @Test
-    void preparingPlayerCanRecoverAfterRestartAndReplaceAnOlderTab() throws Exception {
-        onlineGameService.reset();
-        MockHttpSession session = registerAssignedPlayer("restarted_ready_player", "t1");
-        var user = userAccountRepository.findByUsername("restarted_ready_player").orElseThrow();
-        String playerId = "u" + user.getId();
+    void playerCanRejoinDuringRollAndTheOldTokenStopsWorking() throws Exception {
+        MockHttpSession session = registerAssignedPlayer("rejoining_roller", "t1");
+        var user = userAccountRepository.findByUsername("rejoining_roller").orElseThrow();
+        saveRollState(List.of(user), List.of());
 
-        var root = objectMapper.createObjectNode();
-        root.put("mode", "parallel");
-        var teams = root.putArray("teams");
-        var teamA = teams.addObject(); teamA.put("id", "t1");
-        teamA.putArray("players").addObject().put("id", playerId).put("name", user.getDisplayName());
-        teams.addObject().put("id", "t2").putArray("players");
-        var lineup = objectMapper.createArrayNode();
-        lineup.add(playerId).add("u-dummy-2").add("u-dummy-3").add("u-dummy-4").add("u-dummy-5");
-        var match = root.putObject("matches").putObject("restart-match");
-        match.put("id", "restart-match"); match.put("a", "t1"); match.put("b", "t2");
-        match.put("status", "active"); match.put("phase", "ATTACKING");
-        match.putObject("lineups").set("A", lineup);
-        match.putObject("sidePhases").put("A", "PREPARING").put("B", "PREPARING");
-        GameStateRecord state = gameStateRepository.findById(1L).orElse(null);
-        if (state == null) state = new GameStateRecord(1L, root.toString(), "test");
-        else state.update(root.toString(), "test");
-        gameStateRepository.saveAndFlush(state);
+        String first = join(session);
+        String second = join(session);
+        assertThat(second).isNotEqualTo(first);
 
-        String joined = mockMvc.perform(post("/api/join").session(session)
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
-        String token = objectMapper.readTree(joined).path("token").asText();
-        mockMvc.perform(post("/api/ping").session(session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + token + "\",\"c0\":" + System.currentTimeMillis() + "}"))
-                .andExpect(status().isOk());
         mockMvc.perform(post("/api/calibrate").session(session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + token + "\",\"rtt\":20}"))
-                .andExpect(status().isOk());
-        mockMvc.perform(post("/api/player-ready").session(session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + token + "\",\"ready\":true}"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.ready").value(true));
-
-        String replacement = mockMvc.perform(post("/api/join").session(session)
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
-        String replacementToken = objectMapper.readTree(replacement).path("token").asText();
-        assertThat(replacementToken).isNotEqualTo(token);
-
-        mockMvc.perform(post("/api/player-ready").session(session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + token + "\",\"ready\":true}"))
+                        .content("{\"token\":\"" + first + "\",\"rtt\":20}"))
                 .andExpect(status().isForbidden());
-        mockMvc.perform(post("/api/ping").session(session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + replacementToken + "\",\"c0\":" + System.currentTimeMillis() + "}"))
-                .andExpect(status().isOk());
-        mockMvc.perform(post("/api/calibrate").session(session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + replacementToken + "\",\"rtt\":20}"))
-                .andExpect(status().isOk());
-        mockMvc.perform(post("/api/player-ready").session(session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + replacementToken + "\",\"ready\":true}"))
-                .andExpect(status().isOk());
+        pingAndCalibrate(session, second);
+
+        String rolled = roll(session, second);
+        JsonNode dice = objectMapper.readTree(rolled);
+        assertThat(dice.path("die").asInt()).isBetween(1, 6);
+        assertThat(dice.path("rollTs").asLong()).isPositive();
+
+        mockMvc.perform(get("/api/roll-assignment").session(session))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.eligible").value(true))
+                .andExpect(jsonPath("$.stage").value("ROLL"))
+                .andExpect(jsonPath("$.alreadyRolled").value(true))
+                .andExpect(jsonPath("$.teamId").value("t1"))
+                .andExpect(jsonPath("$.rollGoAt").isNumber())
+                .andExpect(jsonPath("$.stageDeadlineAt").isNumber())
+                .andExpect(jsonPath("$.squadIndex").value(0))
+                .andExpect(jsonPath("$.rollOpenAt").isNumber())
+                .andExpect(jsonPath("$.rollDeadlineAt").isNumber());
     }
 
     @Test
-    void preparationSessionIsRebuiltWhenTheRoundIdentityChanges() throws Exception {
-        onlineGameService.reset();
-        MockHttpSession firstSession = registerAssignedPlayer("round_switch_1", "t1");
-        MockHttpSession secondSession = registerAssignedPlayer("round_switch_2", "t1");
-        var firstUser = userAccountRepository.findByUsername("round_switch_1").orElseThrow();
-        var secondUser = userAccountRepository.findByUsername("round_switch_2").orElseThrow();
-        String firstId = "u" + firstUser.getId(), secondId = "u" + secondUser.getId();
+    void laterSquadsKeepTheirOwnFullFifteenSecondWindow() throws Exception {
+        MockHttpSession squad0Session = registerAssignedPlayer("squad0_roller", "t1");
+        MockHttpSession squad5Session = registerAssignedPlayer("squad5_roller", "t1");
+        var squad0User = userAccountRepository.findByUsername("squad0_roller").orElseThrow();
+        var squad5User = userAccountRepository.findByUsername("squad5_roller").orElseThrow();
 
-        var root = objectMapper.createObjectNode(); root.put("mode", "parallel");
-        var teams = root.putArray("teams");
-        var team = teams.addObject(); team.put("id", "t1");
-        var players = team.putArray("players");
-        players.addObject().put("id", firstId).put("name", firstUser.getDisplayName());
-        players.addObject().put("id", secondId).put("name", secondUser.getDisplayName());
-        teams.addObject().put("id", "t2").putArray("players");
-        var lineup = objectMapper.createArrayNode()
-                .add(firstId).add(secondId).add("u-dummy-3").add("u-dummy-4").add("u-dummy-5");
-        var match = root.putObject("matches").putObject("round-switch");
-        match.put("id", "round-switch"); match.put("round", 1);
-        match.put("a", "t1"); match.put("b", "t2");
-        match.put("status", "active"); match.put("phase", "ATTACKING");
-        match.putObject("lineups").set("A", lineup);
-        match.putObject("sidePhases").put("A", "PREPARING").put("B", "PREPARING");
-        GameStateRecord state = gameStateRepository.findById(1L).orElse(null);
-        if (state == null) state = new GameStateRecord(1L, root.toString(), "test");
-        else state.update(root.toString(), "test");
-        gameStateRepository.saveAndFlush(state);
+        // go 已过去 17s：1 号小队窗口（go..go+15s）刚关闭，6 号小队窗口（go+5s..go+20s）仍开放约 3s。
+        // 若所有小队共用同一个截止时刻，6 号小队的掷骰也会被一并拒掉——这正是要锁住的回归。
+        ObjectNode root = rollStateRoot(List.of(), List.of());
+        long go = System.currentTimeMillis() - 17_000L;
+        root.put("rollGoAt", go);
+        var rollOpenAts = root.putArray("rollOpenAts");
+        for (int k = 0; k < 6; k++) rollOpenAts.add(go + k * 1_000L);
+        root.put("stageDeadlineAt", go + 20_000L);
+        placeInSquad(root, "t1", 0, "u" + squad0User.getId(), squad0User.getDisplayName());
+        placeInSquad(root, "t1", 5, "u" + squad5User.getId(), squad5User.getDisplayName());
+        saveState(root);
 
-        String firstToken = joinCalibrateAndReady(firstSession);
-        joinCalibrateAndReady(secondSession);
-        @SuppressWarnings("unchecked")
-        var readyDevices = (java.util.List<OnlineGameService.DeviceView>) onlineGameService.stateView().get("devices");
-        assertThat(readyDevices).filteredOn(device -> device.teamId().equals("t1") && device.ready()).hasSize(2);
+        String token0 = join(squad0Session);
+        pingAndCalibrate(squad0Session, token0);
+        String token5 = join(squad5Session);
+        pingAndCalibrate(squad5Session, token5);
 
-        match.put("round", 2);
-        state.update(root.toString(), "test");
-        gameStateRepository.saveAndFlush(state);
-        mockMvc.perform(post("/api/player-ready").session(firstSession).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + firstToken + "\",\"ready\":true}"))
-                .andExpect(status().isOk());
+        JsonNode assign0 = objectMapper.readTree(mockMvc.perform(get("/api/roll-assignment").session(squad0Session))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        JsonNode assign5 = objectMapper.readTree(mockMvc.perform(get("/api/roll-assignment").session(squad5Session))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        assertThat(assign0.path("squadIndex").asInt()).isEqualTo(0);
+        assertThat(assign5.path("squadIndex").asInt()).isEqualTo(5);
+        // 每个小队有独立的 15s 窗口：6 号小队的开掷与截止都比 1 号小队晚 5s（错峰补偿）
+        assertThat(assign5.path("rollOpenAt").asLong() - assign0.path("rollOpenAt").asLong()).isEqualTo(5_000L);
+        assertThat(assign5.path("rollDeadlineAt").asLong() - assign0.path("rollDeadlineAt").asLong()).isEqualTo(5_000L);
+        assertThat(assign0.path("rollDeadlineAt").asLong()).isLessThan(System.currentTimeMillis());
+        assertThat(assign5.path("rollDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
 
-        @SuppressWarnings("unchecked")
-        var devices = (java.util.List<OnlineGameService.DeviceView>) onlineGameService.stateView().get("devices");
-        assertThat(devices).filteredOn(device -> device.teamId().equals("t1") && device.ready()).hasSize(1);
-        assertThat(devices).filteredOn(device -> secondId.equals(device.playerId())).allMatch(device -> !device.ready());
+        // 1 号小队窗口已关闭 → 409（窗口已结束或被扫描代掷）；6 号小队窗口仍开放 → 200
+        mockMvc.perform(post("/api/roll").session(squad0Session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token0 + "\",\"clientTs\":" + System.currentTimeMillis() + "}"))
+                .andExpect(status().isConflict());
+        roll(squad5Session, token5);
+    }
+
+    @Test
+    void blindBoxOpenWorksWithJustALoginSessionInsideTheWindow() throws Exception {
+        // 大厅原地开盒链路：/api/lobby/player-action 只需登录会话，不依赖掷骰令牌与时钟校准
+        MockHttpSession session = registerAssignedPlayer("lobby_box_opener", "t1");
+        var user = userAccountRepository.findByUsername("lobby_box_opener").orElseThrow();
+        ObjectNode root = rollStateRoot(List.of(user), List.of());
+        root.put("stage", "BLIND_BOX");
+        root.put("stageDeadlineAt", System.currentTimeMillis() + 15_000L);
+        saveState(root);
+
+        // 开盒结果写入 player_blind_box 独立行并随响应返回，不改写 game_state 行
+        int box = objectMapper.readTree(mockMvc.perform(post("/api/lobby/player-action").session(session)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"type\":\"blind-box-open\",\"selections\":[]}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.ok").value(true))
+                .andExpect(jsonPath("$.blindBox").isNumber())
+                .andReturn().getResponse().getContentAsString()).path("blindBox").asInt();
+        assertThat(box).isBetween(-2, 3);
+
+        // game_state 行内不落盲盒字段；/api/game-state 读取层注入本轮已开结果
+        JsonNode saved = objectMapper.readTree(gameStateRepository.findById(1L).orElseThrow().getContent());
+        JsonNode meInRow = null;
+        for (JsonNode player : saved.path("teams").get(0).path("players"))
+            if (("u" + user.getId()).equals(player.path("id").asText())) meInRow = player;
+        assertThat(meInRow).isNotNull();
+        assertThat(meInRow.has("blindBox")).isFalse();
+        JsonNode view = objectMapper.readTree(mockMvc.perform(get("/api/game-state").session(session))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        JsonNode me = null;
+        for (JsonNode player : view.path("state").path("teams").get(0).path("players"))
+            if (("u" + user.getId()).equals(player.path("id").asText())) me = player;
+        assertThat(me).isNotNull();
+        assertThat(me.path("blindBox").asInt()).isEqualTo(box);
+        assertThat(me.path("blindBoxOpened").asBoolean()).isTrue();
+
+        // 重复开盒幂等：返回同一结果，「每人限开一次」由唯一键保证
+        mockMvc.perform(post("/api/lobby/player-action").session(session)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"type\":\"blind-box-open\",\"selections\":[]}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.blindBox").value(box));
+    }
+
+    @Test
+    void rollAssignmentReportsIneligibleInsteadOfConflictOutsideTheRollWindow() throws Exception {
+        MockHttpSession squadFormPlayer = registerAssignedPlayer("squad_form_player", "t1");
+        var squadForm = rollStateRoot(List.of(), List.of());
+        squadForm.put("stage", "SQUAD_FORM");
+        squadForm.remove("rollGoAt");
+        squadForm.remove("stageDeadlineAt");
+        // 真实的 SQUAD_FORM 状态下各队尚未分队；带着 squads 会被 500ms 扫描立刻推进到 ROLL
+        squadForm.path("teams").forEach(team -> ((ObjectNode) team).remove("squads"));
+        saveState(squadForm);
+        mockMvc.perform(get("/api/roll-assignment").session(squadFormPlayer))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.eligible").value(false))
+                .andExpect(jsonPath("$.stage").value("SQUAD_FORM"));
+
+        MockHttpSession benched = registerAssignedPlayer("benched_player", "t3");
+        saveState(rollStateRoot(List.of(), List.of()));
+        mockMvc.perform(get("/api/roll-assignment").session(benched))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.eligible").value(false))
+                .andExpect(jsonPath("$.stage").value("ROLL"))
+                .andExpect(jsonPath("$.teamId").value("t3"));
+        mockMvc.perform(post("/api/join").session(benched)
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isConflict());
     }
 
     @Test
     void fiveCalibratedPlayersCanCompleteAnOnlineRoll() throws Exception {
-        onlineGameService.reset();
-        MockHttpSession admin = login();
         MockHttpSession[] sessions = new MockHttpSession[5];
-        var root = objectMapper.createObjectNode(); root.put("mode", "parallel");
-        var teams = root.putArray("teams"); var team = teams.addObject(); team.put("id", "t1"); var players = team.putArray("players");
-        var selected = objectMapper.createArrayNode();
+        List<UserAccount> rollers = new ArrayList<>();
         for (int slot = 1; slot <= 5; slot++) {
-            sessions[slot - 1] = registerAssignedPlayer("roller" + slot, "t1");
-            var user = userAccountRepository.findByUsername("roller" + slot).orElseThrow();
-            String playerId = "u" + user.getId(); selected.add(playerId);
-            players.addObject().put("id", playerId).put("name", user.getDisplayName());
+            sessions[slot - 1] = registerAssignedPlayer("online_roller" + slot, "t1");
+            rollers.add(userAccountRepository.findByUsername("online_roller" + slot).orElseThrow());
         }
-        teams.addObject().put("id", "t2").putArray("players");
-        var match = root.putObject("matches").putObject("g1");
-        match.put("id", "g1"); match.put("a", "t1"); match.put("b", "t2");
-        match.put("status", "active"); match.put("phase", "ROLL_A"); match.putObject("lineups").set("A", selected);
-        GameStateRecord state = gameStateRepository.findById(1L).orElse(null);
-        if (state == null) state = new GameStateRecord(1L, root.toString(), "test"); else state.update(root.toString(), "test");
-        gameStateRepository.save(state);
+        saveRollState(rollers, List.of());
 
-        String[] tokens = new String[5];
-        for (int slot = 1; slot <= 5; slot++) {
-            String joined = mockMvc.perform(post("/api/join").session(sessions[slot - 1])
+        for (MockHttpSession rollerSession : sessions) {
+            String token = join(rollerSession);
+            pingAndCalibrate(rollerSession, token);
+            String rolled = roll(rollerSession, token);
+            assertThat(objectMapper.readTree(rolled).path("die").asInt()).isBetween(1, 6);
+            mockMvc.perform(post("/api/roll").session(rollerSession)
                             .contentType(MediaType.APPLICATION_JSON)
-                            .content("{\"teamId\":\"t1\",\"slot\":" + slot + ",\"name\":\"ignored\"}"))
-                    .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
-            assertThat(objectMapper.readTree(joined).get("slot").asInt()).isEqualTo(slot);
-            tokens[slot - 1] = objectMapper.readTree(joined).get("token").asText();
-            mockMvc.perform(post("/api/ping").session(sessions[slot - 1])
-                            .contentType(MediaType.APPLICATION_JSON)
-                            .content("{\"token\":\"" + tokens[slot - 1] + "\",\"c0\":" + System.currentTimeMillis() + "}"))
-                    .andExpect(status().isOk());
-            mockMvc.perform(post("/api/calibrate").session(sessions[slot - 1])
-                            .contentType(MediaType.APPLICATION_JSON)
-                            .content("{\"token\":\"" + tokens[slot - 1] + "\",\"offset\":0,\"rtt\":20}"))
-                    .andExpect(status().isOk());
+                            .content("{\"token\":\"" + token + "\",\"clientTs\":" + System.currentTimeMillis() + "}"))
+                    .andExpect(status().isConflict());
         }
-        mockMvc.perform(post("/api/arm").session(admin).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"teamId\":\"t1\"}"))
-                .andExpect(status().isOk());
-        String goResult = mockMvc.perform(post("/api/go").session(admin).contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
-        long goTs = objectMapper.readTree(goResult).get("goTs").asLong();
-        for (int i = 0; i < 5; i++) {
-            mockMvc.perform(post("/api/roll").session(sessions[i])
-                            .contentType(MediaType.APPLICATION_JSON)
-                            .content("{\"token\":\"" + tokens[i] + "\",\"clientTs\":" + (goTs + i * 50) + "}"))
-                    .andExpect(status().isOk());
+
+        JsonNode state = objectMapper.readTree(gameStateRepository.findById(1L).orElseThrow().getContent());
+        JsonNode team1 = null;
+        for (JsonNode team : state.path("teams")) if ("t1".equals(team.path("id").asText())) team1 = team;
+        assertThat(team1).isNotNull();
+        for (var roller : rollers) {
+            String playerId = "u" + roller.getId();
+            JsonNode player = null;
+            for (JsonNode candidate : team1.path("players"))
+                if (playerId.equals(candidate.path("id").asText())) player = candidate;
+            assertThat(player).as("队员 %s 的掷骰数据", playerId).isNotNull();
+            assertThat(player.path("dice").asInt()).isBetween(1, 6);
+            assertThat(player.path("rollTs").isNumber()).isTrue();
+            assertThat(player.has("autoRolled")).isFalse();
         }
-        assertThat(onlineGameService.stateView().get("rolling")).isEqualTo(false);
-        JsonNode timed = objectMapper.readTree(gameStateRepository.findById(1L).orElseThrow().getContent());
-        assertThat(timed.at("/matches/g1/phase").asText()).isEqualTo("ATTACKING");
-        assertThat(timed.at("/matches/g1/sidePhases/A").asText()).isEqualTo("PITCHER_ROLL");
-        onlineGameService.finalRoll("t1");
-        JsonNode revealed = objectMapper.readTree(gameStateRepository.findById(1L).orElseThrow().getContent());
-        assertThat(revealed.at("/matches/g1/rolls/A/dice").size()).isEqualTo(5);
-        assertThat(revealed.at("/matches/g1/sidePhases/A").asText()).isEqualTo("WAITING");
-        assertThat(revealed.at("/matches/g1/phase").asText()).isEqualTo("ATTACKING");
+
+        // 旧的 OnlineGameService SSE 通道已退役
+        mockMvc.perform(get("/api/events").session(sessions[0])).andExpect(status().isNotFound());
     }
 
     private MockHttpSession login() throws Exception {
@@ -417,22 +441,6 @@ class ApplicationIntegrationTest {
         return (MockHttpSession) session;
     }
 
-    private String joinCalibrateAndReady(MockHttpSession session) throws Exception {
-        String joined = mockMvc.perform(post("/api/join").session(session)
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
-        String token = objectMapper.readTree(joined).path("token").asText();
-        mockMvc.perform(post("/api/ping").session(session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + token + "\",\"c0\":" + System.currentTimeMillis() + "}"))
-                .andExpect(status().isOk());
-        mockMvc.perform(post("/api/calibrate").session(session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + token + "\",\"rtt\":20}"))
-                .andExpect(status().isOk());
-        mockMvc.perform(post("/api/player-ready").session(session).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"token\":\"" + token + "\",\"ready\":true}"))
-                .andExpect(status().isOk());
-        return token;
-    }
 
     private MockHttpSession registerAssignedPlayer(String username, String teamId) throws Exception {
         HttpSession session = (HttpSession) mockMvc.perform(post("/api/auth/register")
@@ -443,5 +451,92 @@ class ApplicationIntegrationTest {
         user.assignTeam(teamId);
         userAccountRepository.save(user);
         return (MockHttpSession) session;
+    }
+
+    /* ---------- ROLL 阶段夹具与 HTTP 工具 ---------- */
+
+    private void saveRollState(List<UserAccount> t1Users, List<UserAccount> t2Users) {
+        saveState(rollStateRoot(t1Users, t2Users));
+    }
+
+    /** ROLL 阶段：t1 vs t2 的 g1 进行中，go 已过、窗口未闭；小队错峰时刻表与真实状态一致。 */
+    private ObjectNode rollStateRoot(List<UserAccount> t1Users, List<UserAccount> t2Users) {
+        ObjectNode root = objectMapper.createObjectNode();
+        root.put("mode", "parallel"); root.put("stage", "ROLL");
+        long go = System.currentTimeMillis() - 1_000L;
+        root.put("rollGoAt", go);
+        var rollOpenAts = root.putArray("rollOpenAts");
+        for (int k = 0; k < 6; k++) rollOpenAts.add(go + k * 1_000L);
+        root.put("stageDeadlineAt", go + 20_000L);
+        var teams = root.putArray("teams");
+        addTeam(teams.addObject(), "t1", t1Users);
+        addTeam(teams.addObject(), "t2", t2Users);
+        var match = root.putObject("matches").putObject("g1");
+        match.put("id", "g1"); match.put("a", "t1"); match.put("b", "t2");
+        match.put("status", "active"); match.put("phase", "PENDING");
+        return root;
+    }
+
+    private void addTeam(ObjectNode team, String teamId, List<UserAccount> members) {
+        team.put("id", teamId); team.put("name", teamId);
+        var players = team.putArray("players");
+        List<String> ids = new ArrayList<>();
+        for (UserAccount member : members) {
+            players.addObject().put("id", "u" + member.getId()).put("name", member.getDisplayName());
+            ids.add("u" + member.getId());
+        }
+        // 候补凑满 30 人：贴近真实状态，也避免少量真人掷齐就触发全员快速通道
+        for (int i = ids.size(); i < 30; i++) {
+            String filler = teamId + "-filler" + i;
+            players.addObject().put("id", filler).put("name", filler);
+            ids.add(filler);
+        }
+        var squads = team.putArray("squads");
+        for (int s = 0; s < 6; s++) {
+            var squad = squads.addArray();
+            for (int i = s * 5; i < s * 5 + 5; i++) squad.add(ids.get(i));
+        }
+    }
+
+    /** 把真人玩家塞进指定小队（替换该小队首位的候补 id），名册同步追加。 */
+    private void placeInSquad(ObjectNode root, String teamId, int squadIndex, String playerId, String displayName) {
+        ObjectNode team = null;
+        for (JsonNode node : root.path("teams"))
+            if (teamId.equals(node.path("id").asText())) team = (ObjectNode) node;
+        assertThat(team).as("队伍 %s 存在", teamId).isNotNull();
+        ((com.fasterxml.jackson.databind.node.ArrayNode) team.path("players"))
+                .addObject().put("id", playerId).put("name", displayName);
+        ((com.fasterxml.jackson.databind.node.ArrayNode) team.path("squads").path(squadIndex))
+                .set(0, com.fasterxml.jackson.databind.node.TextNode.valueOf(playerId));
+    }
+
+    private void saveState(ObjectNode root) {
+        GameStateRecord state = gameStateRepository.findById(1L).orElse(null);
+        if (state == null) state = new GameStateRecord(1L, root.toString(), "test");
+        else state.update(root.toString(), "test");
+        gameStateRepository.saveAndFlush(state);
+    }
+
+    private String join(MockHttpSession session) throws Exception {
+        String joined = mockMvc.perform(post("/api/join").session(session)
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        return objectMapper.readTree(joined).path("token").asText();
+    }
+
+    private void pingAndCalibrate(MockHttpSession session, String token) throws Exception {
+        mockMvc.perform(post("/api/ping").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"c0\":" + System.currentTimeMillis() + "}"))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/calibrate").session(session).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"rtt\":20}"))
+                .andExpect(status().isOk());
+    }
+
+    private String roll(MockHttpSession session, String token) throws Exception {
+        return mockMvc.perform(post("/api/roll").session(session)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"clientTs\":" + System.currentTimeMillis() + "}"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
     }
 }

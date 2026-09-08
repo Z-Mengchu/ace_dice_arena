@@ -22,7 +22,9 @@ class GameDataControllerCacheTest {
         GameStateRecord record = new GameStateRecord(1L, "{\"stage\":\"ACCUMULATION\"}", "test");
         when(states.findById(1L)).thenReturn(Optional.of(record));
         GameDataController controller = new GameDataController(states, mock(BattleReportRepository.class),
-                new ObjectMapper(), mock(LobbyEventService.class), mock(UserAccountRepository.class), 1000);
+                new ObjectMapper(), mock(LobbyEventService.class), mock(UserAccountRepository.class),
+                mock(com.acedicearena.service.ParallelTournamentService.class),
+                mock(com.acedicearena.repository.MatchReportRepository.class), 1000);
         MockHttpSession admin = new MockHttpSession();
         admin.setAttribute("role", "ADMIN");
 

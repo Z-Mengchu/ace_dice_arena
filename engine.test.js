@@ -1,7 +1,10 @@
 /**
- * 「王牌攻守擂·骰子大亨」引擎测试
+ * 「骰子擂台·田忌赛马」引擎测试（新版规则）
  * 直接运行：node engine.test.js
  * 全部通过打印成功摘要并以退出码 0 结束；任一失败以非 0 退出
+ *
+ * 本测试与后端 ParallelTournamentServiceTest 使用同一组常量与手算期望值，
+ * 用于对拍关键公式，防止 engine.js 与服务端数值规则漂移。
  */
 'use strict';
 
@@ -12,7 +15,6 @@ const GameEngine = require('./frontend/engine.js');
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
-/** 浮点数近似相等 */
 function almostEqual(actual, expected, eps = 1e-9) {
   assert.ok(
     Math.abs(actual - expected) < eps,
@@ -32,396 +34,258 @@ function makeRng(seed) {
 /* ---------- API 完整性与默认配置 ---------- */
 
 test('API 导出与规格一致', () => {
-  const fns = ['createTeams', 'rollDie', 'rollDiceSet', 'isLeopard', 'syncMultiplier',
-    'computeAttack', 'decideRound', 'quotaFor', 'drawBracket', 'checkProphetGuess', 'standings'];
+  const fns = ['createTeams', 'rollDie', 'drawBlindBox', 'round2', 'personalPoints',
+    'guessBonus', 'syncCrit', 'squadPower', 'rerollQuotaFor', 'compareMatchTieBreak',
+    'decideMatchWinner', 'decideRoundWinner', 'drawBracket', 'buildSquads',
+    'simulateMatch', 'simulateBracket', 'standings'];
   for (const name of fns) {
     assert.equal(typeof GameEngine[name], 'function', `缺少函数 ${name}`);
   }
   assert.ok(Array.isArray(GameEngine.MOCK_TEAMS), 'MOCK_TEAMS 应为数组');
-  assert.deepStrictEqual(GameEngine.DEFAULT_CONFIG, {
-    gmvPerDice: 100000,
-    playersPerTeam: 30,
-    backendCount: 5,
-    matchWinRounds: 1,
-    syncWindowMs: 500,
-    syncMultiplier: 1.5,
-    leopardMultiplier: 3,
-    prophetBonus: 2,
-    fatigueMultiplier: 1,
-    days: 2
-  });
+  assert.equal(GameEngine.DEFAULT_CONFIG.rerollLimitPerMatch, 5);
+  assert.equal(GameEngine.DEFAULT_CONFIG.guessBonusPerHit, 0.4);
+  assert.equal(GameEngine.DEFAULT_CONFIG.guessBonusCap, 10);
+  assert.equal(GameEngine.DEFAULT_CONFIG.syncWindowMs, 500);
+  assert.equal(GameEngine.DEFAULT_CONFIG.syncCritMultiplier, 1.5);
+  assert.equal(GameEngine.DEFAULT_CONFIG.gmvPerReroll, 100000);
+  assert.deepStrictEqual(GameEngine.DEFAULT_CONFIG.blindBoxValues, [5, 4, 3, 2, 1, -1, -2]);
+  assert.deepStrictEqual(GameEngine.DEFAULT_CONFIG.blindBoxWeights, [1, 3, 8, 20, 28, 22, 18]);
 });
 
-/* ---------- MOCK_TEAMS 与 createTeams ---------- */
+/* ---------- 数值规则（与服务端 ParallelTournamentServiceTest 对拍） ---------- */
 
-test('MOCK_TEAMS 数据与规格一致', () => {
+test('createTeams 生成 8 队各 30 人且不被污染', () => {
   assert.equal(GameEngine.MOCK_TEAMS.length, 8);
-  const t1 = GameEngine.MOCK_TEAMS[0];
-  assert.deepStrictEqual(t1, {
-    id: 't1', name: '雷霆战区', shortName: '雷霆',
-    gmv: { day1: 331500, day2: 338200 },
-    growth: { day1: 8.6, day2: 7.9 }
-  });
-});
-
-test('createTeams 生成 8 队 × 30 人，角色/队长/命名正确', () => {
   const teams = GameEngine.createTeams();
   assert.equal(teams.length, 8);
-  for (let i = 0; i < 8; i++) {
-    const team = teams[i];
-    assert.equal(team.id, `t${i + 1}`);
-    assert.equal(team.players.length, 30);
-    assert.equal(team.captainId, `${team.id}-p01`);
-    assert.equal(team.viceCaptainId, `${team.id}-p18`);
-    const fronts = team.players.filter(p => p.role === 'front');
-    const backs = team.players.filter(p => p.role === 'back');
-    assert.equal(fronts.length, 25);
-    assert.equal(backs.length, 5);
-    // p01-p25 前端，p26-p30 后端
-    team.players.forEach((p, idx) => {
-      const num = String(idx + 1).padStart(2, '0');
-      assert.equal(p.id, `${team.id}-p${num}`);
-      assert.equal(p.name, `${team.shortName}-${num}`);
-      assert.equal(p.role, idx + 1 >= 26 ? 'back' : 'front');
-    });
-  }
-  assert.equal(teams[0].players[0].name, '雷霆-01');
-  assert.equal(teams[0].players[17].name, '雷霆-18');
+  teams.forEach(team => {
+    assert.equal(team.players.length, 30, `${team.id} 应有 30 人`);
+    assert.equal(team.players[0].id, team.id + '-p01');
+  });
+  teams[0].players[0].name = '被修改';
+  assert.notEqual(GameEngine.MOCK_TEAMS[0], teams[0]);
 });
 
-test('createTeams 每次返回全新对象（深拷贝互不影响）', () => {
-  const a = GameEngine.createTeams();
-  a[0].players[0].name = '被篡改';
-  a[0].gmv.day1 = 1;
-  const b = GameEngine.createTeams();
-  assert.equal(b[0].players[0].name, '雷霆-01');
-  assert.equal(b[0].gmv.day1, 331500);
-  assert.equal(GameEngine.MOCK_TEAMS[0].gmv.day1, 331500, 'MOCK_TEAMS 不应被污染');
-});
-
-/* ---------- 配额 ---------- */
-
-test('8 队 mock 配额：day1 按每 10 万 GMV 兑换一次', () => {
-  const quotas = GameEngine.MOCK_TEAMS.map(t => GameEngine.quotaFor(t.gmv.day1));
-  assert.deepStrictEqual(quotas, [3, 2, 3, 2, 3, 3, 3, 2]);
-});
-
-test('8 队 mock 配额：day2 按每 10 万 GMV 兑换一次', () => {
-  const quotas = GameEngine.MOCK_TEAMS.map(t => GameEngine.quotaFor(t.gmv.day2));
-  assert.deepStrictEqual(quotas, [3, 3, 3, 2, 3, 3, 3, 2]);
-});
-
-test('quotaFor 向下取整且支持自定义 config', () => {
-  assert.equal(GameEngine.quotaFor(299999), 2);
-  assert.equal(GameEngine.quotaFor(300000), 3);
-  assert.equal(GameEngine.quotaFor(331500, { gmvPerDice: 50000 }), 6);
-});
-
-/* ---------- 掷骰 ---------- */
-
-test('rollDie 返回 1-6 整数', () => {
+test('rollDie 返回 1-6 且边界正确', () => {
   assert.equal(GameEngine.rollDie(() => 0), 1);
   assert.equal(GameEngine.rollDie(() => 0.9999999999), 6);
-  const rng = makeRng(42);
-  for (let i = 0; i < 2000; i++) {
+  const rng = makeRng(7);
+  for (let i = 0; i < 1000; i++) {
     const v = GameEngine.rollDie(rng);
-    assert.ok(Number.isInteger(v) && v >= 1 && v <= 6, `非法骰子点数 ${v}`);
+    assert.ok(v >= 1 && v <= 6, `骰子越界 ${v}`);
   }
 });
 
-test('rollDiceSet 长度正确、范围 1-6', () => {
-  const rng = makeRng(7);
-  const d5 = GameEngine.rollDiceSet(5, rng);
-  assert.equal(d5.length, 5);
-  d5.forEach(v => assert.ok(Number.isInteger(v) && v >= 1 && v <= 6));
-  const d3 = GameEngine.rollDiceSet(3, rng);
-  assert.equal(d3.length, 3);
-  // 默认参数 n=5
-  assert.equal(GameEngine.rollDiceSet(undefined, makeRng(1)).length, 5);
+test('personalPoints 为最终骰子值加盲盒', () => {
+  assert.equal(GameEngine.personalPoints({ diceFinal: 4, blindBox: -2 }), 2);
+  assert.equal(GameEngine.personalPoints({ diceFinal: 6, blindBox: 3 }), 9);
+  assert.equal(GameEngine.personalPoints({ diceFinal: 5 }), 5); // 盲盒缺省按 0
 });
 
-test('isLeopard 判定', () => {
-  assert.equal(GameEngine.isLeopard([5, 5, 5, 5, 5]), true);
-  assert.equal(GameEngine.isLeopard([5, 5, 5, 5, 4]), false);
-  assert.equal(GameEngine.isLeopard([1, 2, 3, 4, 5]), false);
-  assert.equal(GameEngine.isLeopard([]), false);
+test('guessBonus 每人次 0.4 且封顶 10', () => {
+  assert.equal(GameEngine.guessBonus(0), 0);
+  assert.equal(GameEngine.guessBonus(3), 1.2);
+  assert.equal(GameEngine.guessBonus(25), 10);
+  assert.equal(GameEngine.guessBonus(30), 10);
 });
 
-/* ---------- 同步倍率 ---------- */
-
-test('syncMultiplier：null/undefined 按 1，≤500 为 1.5，>500 为 1', () => {
-  assert.equal(GameEngine.syncMultiplier(null), 1);
-  assert.equal(GameEngine.syncMultiplier(undefined), 1);
-  assert.equal(GameEngine.syncMultiplier(0), 1.5);
-  assert.equal(GameEngine.syncMultiplier(500), 1.5);
-  assert.equal(GameEngine.syncMultiplier(501), 1);
-  assert.equal(GameEngine.syncMultiplier(300, { syncWindowMs: 200, syncMultiplier: 2 }), 1);
+test('squadPower 先对暴击乘积四舍五入再加猜阵加成', () => {
+  assert.equal(GameEngine.squadPower(20, true, 0), 30);
+  assert.equal(GameEngine.squadPower(20, false, 0), 20);
+  assert.equal(GameEngine.squadPower(13, true, 1), 19.9);
+  assert.equal(GameEngine.squadPower(7, false, 30), 17);
 });
 
-/* ---------- computeAttack ---------- */
-
-test('computeAttack 返回字段齐全', () => {
-  const r = GameEngine.computeAttack({ dice: [1, 2, 3, 4, 5], growthCoef: 8.6 });
-  assert.deepStrictEqual(
-    Object.keys(r).sort(),
-    ['diceSum', 'fatigueMult', 'growthCoef', 'isLeopard', 'leopardMult', 'prophetBonus', 'syncMult', 'total'].sort()
-  );
+test('syncCrit 需 5 人且首尾差 ≤500ms', () => {
+  assert.equal(GameEngine.syncCrit([1000, 1100, 1200, 1300, 1500], false), true);
+  assert.equal(GameEngine.syncCrit([1000, 1100, 1200, 1300, 1501], false), false);
+  assert.equal(GameEngine.syncCrit([1000, 1100, 1200, 1300], false), false); // 不足 5 人
 });
 
-test('computeAttack 基础值：(15+8.6)×1×1×1+0 = 23.6', () => {
-  const r = GameEngine.computeAttack({ dice: [1, 2, 3, 4, 5], growthCoef: 8.6 });
-  assert.equal(r.diceSum, 15);
-  assert.equal(r.growthCoef, 8.6);
-  assert.equal(r.syncMult, 1);
-  assert.equal(r.leopardMult, 1);
-  assert.equal(r.fatigueMult, 1);
-  assert.equal(r.prophetBonus, 0);
-  assert.equal(r.isLeopard, false);
-  almostEqual(r.total, 23.6);
+test('含代掷队员的小队必无暴击（不依赖时刻差）', () => {
+  const aligned = [2000, 2000, 2000, 2000, 2000];
+  assert.equal(GameEngine.syncCrit(aligned, true), false);
+  assert.equal(GameEngine.syncCrit(aligned, false), true);
 });
 
-test('computeAttack 同步加成 ×1.5', () => {
-  const r = GameEngine.computeAttack({ dice: [1, 2, 3, 4, 5], growthCoef: 8.6, spreadMs: 300 });
-  assert.equal(r.syncMult, 1.5);
-  almostEqual(r.total, 23.6 * 1.5); // 35.4
+test('rerollQuotaFor 为 GMV 除以 10 万向下取整', () => {
+  assert.equal(GameEngine.rerollQuotaFor(331500), 3);
+  assert.equal(GameEngine.rerollQuotaFor(299999), 2);
+  assert.equal(GameEngine.rerollQuotaFor(300000), 3);
 });
 
-test('computeAttack 豹子 ×3', () => {
-  const r = GameEngine.computeAttack({ dice: [4, 4, 4, 4, 4], growthCoef: 0 });
-  assert.equal(r.isLeopard, true);
-  assert.equal(r.leopardMult, 3);
-  almostEqual(r.total, 20 * 3); // 60
+test('drawBlindBox 只落在声明档位且覆盖全部档位', () => {
+  const values = GameEngine.DEFAULT_CONFIG.blindBoxValues;
+  const counts = {};
+  const total = 20000;
+  const rng = makeRng(1234);
+  for (let i = 0; i < total; i++) {
+    const v = GameEngine.drawBlindBox(rng);
+    assert.ok(values.indexOf(v) >= 0, `盲盒越界 ${v}`);
+    counts[v] = (counts[v] || 0) + 1;
+  }
+  assert.deepStrictEqual(Object.keys(counts).map(Number).sort((a, b) => a - b), values.slice().sort((a, b) => a - b));
+  for (const v of values) {
+    const ratio = counts[v] / total;
+    assert.ok(ratio > 0.005 && ratio < 0.35, `档位 ${v} 占比 ${ratio} 超出 0.5%~35%`);
+  }
 });
 
-test('computeAttack 军师 +2（乘法之后再加）', () => {
-  const r = GameEngine.computeAttack({ dice: [1, 2, 3, 4, 5], growthCoef: 0, spreadMs: 100, prophetHit: true });
-  assert.equal(r.prophetBonus, 2);
-  almostEqual(r.total, 15 * 1.5 + 2); // 24.5
+/* ---------- 平局链（与服务端 compareMatchTieBreak / decideMatchWinner 对拍） ---------- */
+
+test('平局链：总点数 → 增长系数 → 队伍 ID 字典序', () => {
+  assert.ok(GameEngine.compareMatchTieBreak(100, 99, 1.0, 2.0, 't1', 't2') > 0);
+  assert.ok(GameEngine.compareMatchTieBreak(99, 100, 2.0, 1.0, 't1', 't2') < 0);
+  assert.ok(GameEngine.compareMatchTieBreak(100, 100, 1.2, 1.1, 't1', 't2') > 0);
+  assert.ok(GameEngine.compareMatchTieBreak(100, 100, 1.1, 1.2, 't1', 't2') < 0);
+  assert.ok(GameEngine.compareMatchTieBreak(100, 100, 1.0, 1.0, 't1', 't2') > 0);
+  assert.ok(GameEngine.compareMatchTieBreak(100, 100, 1.0, 1.0, 't2', 't1') < 0);
 });
 
-test('computeAttack 当前流程不启用疲劳惩罚', () => {
-  const r = GameEngine.computeAttack({ dice: [1, 2, 3, 4, 5], growthCoef: 8.6, fatigued: true });
-  assert.equal(r.fatigueMult, 1);
-  almostEqual(r.total, 23.6);
+test('比赛胜负链走完全程', () => {
+  const base = { totalPointsA: 180, totalPointsB: 30, coefficientA: 1.2, coefficientB: 1.0, idA: 't1', idB: 't2' };
+
+  let r = GameEngine.decideMatchWinner(Object.assign({}, base, { winsA: 4, winsB: 2 }));
+  assert.equal(r.winnerSide, 'A');
+  assert.equal(r.tieBreak, '胜场');
+
+  r = GameEngine.decideMatchWinner(Object.assign({}, base, { winsA: 3, winsB: 3 }));
+  assert.equal(r.winnerSide, 'A');
+  assert.equal(r.tieBreak, '总点数');
+
+  r = GameEngine.decideMatchWinner({ winsA: 3, winsB: 3, totalPointsA: 180, totalPointsB: 180, coefficientA: 1.2, coefficientB: 1.0, idA: 't1', idB: 't2' });
+  assert.equal(r.winnerSide, 'A');
+  assert.equal(r.tieBreak, '增长系数');
+
+  r = GameEngine.decideMatchWinner({ winsA: 3, winsB: 3, totalPointsA: 180, totalPointsB: 180, coefficientA: 1.2, coefficientB: 1.2, idA: 't1', idB: 't2' });
+  assert.equal(r.winnerSide, 'A');
+  assert.equal(r.tieBreak, '队伍ID');
+
+  r = GameEngine.decideMatchWinner({ winsA: 3, winsB: 3, totalPointsA: 180, totalPointsB: 180, coefficientA: 1.2, coefficientB: 1.2, idA: 't2', idB: 't1' });
+  assert.equal(r.winnerSide, 'B');
+  assert.equal(r.tieBreak, '队伍ID');
 });
 
-test('computeAttack 全部叠加：(10+5)×1.5×3+2 = 69.5', () => {
-  const r = GameEngine.computeAttack({
-    dice: [2, 2, 2, 2, 2], growthCoef: 5, spreadMs: 100, prophetHit: true, fatigued: true
-  });
-  assert.equal(r.syncMult, 1.5);
-  assert.equal(r.leopardMult, 3);
-  assert.equal(r.fatigueMult, 1);
-  assert.equal(r.prophetBonus, 2);
-  almostEqual(r.total, 69.5);
+test('单局胜负：战力高者胜，相等平局', () => {
+  assert.equal(GameEngine.decideRoundWinner(40, 5), 'A');
+  assert.equal(GameEngine.decideRoundWinner(5, 40), 'B');
+  assert.equal(GameEngine.decideRoundWinner(20, 20), null);
 });
 
-/* ---------- decideRound ---------- */
+/* ---------- 分队与抽签 ---------- */
 
-test('decideRound 单方豹子直接胜（即使 total 更低）', () => {
-  const leopardLow = GameEngine.computeAttack({ dice: [1, 1, 1, 1, 1], growthCoef: 0 }); // total 15
-  const normalHigh = GameEngine.computeAttack({ dice: [6, 6, 6, 6, 5], growthCoef: 0 }); // total 29
-  assert.ok(leopardLow.total < normalHigh.total);
-  assert.equal(GameEngine.decideRound(leopardLow, normalHigh), 'A');
-  assert.equal(GameEngine.decideRound(normalHigh, leopardLow), 'B');
+test('buildSquads 按名册顺序均分 6×5', () => {
+  const players = GameEngine.createTeams()[0].players;
+  const squads = GameEngine.buildSquads(players);
+  assert.equal(squads.length, 6);
+  squads.forEach(squad => assert.equal(squad.length, 5));
+  assert.equal(squads[0][0].id, players[0].id);
+  assert.equal(squads[5][4].id, players[29].id);
 });
 
-test('decideRound 双方豹子比 total', () => {
-  const a = GameEngine.computeAttack({ dice: [1, 1, 1, 1, 1], growthCoef: 0 }); // 15
-  const b = GameEngine.computeAttack({ dice: [6, 6, 6, 6, 6], growthCoef: 0 }); // 90
-  assert.equal(GameEngine.decideRound(a, b), 'B');
-  assert.equal(GameEngine.decideRound(b, a), 'A');
-});
-
-test('decideRound 无豹子比 total', () => {
-  const a = GameEngine.computeAttack({ dice: [1, 2, 3, 4, 5], growthCoef: 0 }); // 15
-  const b = GameEngine.computeAttack({ dice: [2, 3, 4, 5, 6], growthCoef: 0 }); // 20
-  assert.equal(GameEngine.decideRound(a, b), 'B');
-  assert.equal(GameEngine.decideRound(b, a), 'A');
-});
-
-test('decideRound total 相等为 tie', () => {
-  const a = GameEngine.computeAttack({ dice: [1, 2, 3, 4, 5], growthCoef: 0 });
-  const b = GameEngine.computeAttack({ dice: [5, 4, 3, 2, 1], growthCoef: 0 });
-  assert.equal(GameEngine.decideRound(a, b), 'tie');
-});
-
-/* ---------- drawBracket ---------- */
-
-test('drawBracket 生成 4 对、8 个不重复队伍、不修改入参', () => {
+test('drawBracket 生成 4 组两两配对且不修改入参', () => {
   const input = ['t1', 't2', 't3', 't4', 't5', 't6', 't7', 't8'];
-  const snapshot = input.slice();
   const bracket = GameEngine.drawBracket(input, makeRng(99));
   assert.equal(bracket.length, 4);
-  bracket.forEach(pair => assert.equal(pair.length, 2));
-  const flat = bracket.reduce((acc, p) => acc.concat(p), []);
-  assert.deepStrictEqual(flat.slice().sort(), snapshot.slice().sort());
-  assert.equal(new Set(flat).size, 8);
-  assert.deepStrictEqual(input, snapshot, '入参数组不应被修改');
+  const flat = bracket.flat();
+  assert.equal(flat.length, 8);
+  assert.deepStrictEqual(flat.slice().sort(), input.slice().sort());
+  assert.deepStrictEqual(input, ['t1', 't2', 't3', 't4', 't5', 't6', 't7', 't8']);
 });
 
-/* ---------- checkProphetGuess ---------- */
+/* ---------- 整场模拟（确定性） ---------- */
 
-test('checkProphetGuess 顺序不同也算中', () => {
-  const lineup = ['t2-p01', 't2-p02', 't2-p03', 't2-p18', 't2-p19'];
-  const guess = ['t2-p19', 't2-p01', 't2-p18', 't2-p03', 't2-p02'];
-  assert.equal(GameEngine.checkProphetGuess(guess, lineup), true);
+test('simulateMatch 用同一随机种子可复现且结构完整', () => {
+  const teams = GameEngine.createTeams();
+  const a = GameEngine.simulateMatch(teams[0], teams[1], { rng: makeRng(42), day: 1 });
+  const b = GameEngine.simulateMatch(teams[0], teams[1], { rng: makeRng(42), day: 1 });
+  assert.deepStrictEqual(a, b);
+
+  assert.equal(a.rounds.length, 6);
+  assert.equal(a.winsA + a.winsB <= 6, true);
+  assert.ok(a.winnerSide === 'A' || a.winnerSide === 'B');
+  assert.ok(['胜场', '总点数', '增长系数', '队伍ID'].indexOf(a.tieBreak) >= 0);
+  a.rounds.forEach((round, i) => {
+    assert.equal(round.round, i + 1);
+    assert.equal(round.powerA, GameEngine.squadPower(round.baseA, round.critA, round.guessHitsA));
+    assert.equal(round.powerB, GameEngine.squadPower(round.baseB, round.critB, round.guessHitsB));
+    assert.ok(round.winner === 'A' || round.winner === 'B' || round.winner === null);
+  });
 });
 
-test('checkProphetGuess 差 1 人不算中', () => {
-  const lineup = ['t2-p01', 't2-p02', 't2-p03', 't2-p18', 't2-p19'];
-  const guess = ['t2-p01', 't2-p02', 't2-p03', 't2-p18', 't2-p20'];
-  assert.equal(GameEngine.checkProphetGuess(guess, lineup), false);
-  assert.equal(GameEngine.checkProphetGuess(['t2-p01'], lineup), false);
-  assert.equal(GameEngine.checkProphetGuess(null, lineup), false);
+test('simulateMatch 注入猜阵命中与重掷会正确反映进战力', () => {
+  const teams = GameEngine.createTeams();
+  // 每局 A 方 25 人次命中 → 封顶 10；B 方 0
+  const guessHits = [0, 1, 2, 3, 4, 5].map(() => ({ A: 25, B: 0 }));
+  const result = GameEngine.simulateMatch(teams[0], teams[1], { rng: makeRng(7), day: 1, guessHits });
+  result.rounds.forEach(round => {
+    assert.equal(round.guessHitsA, 25);
+    assert.equal(round.guessBonusA, 10);
+    assert.equal(round.guessBonusB, 0);
+  });
 });
 
-/* ---------- standings ---------- */
+test('simulateBracket 跑通 8 队单败并产生冠军', () => {
+  const teams = GameEngine.createTeams();
+  const bracket = GameEngine.simulateBracket(teams, { rng: makeRng(5), day: 1 });
+  assert.equal(bracket.quarterfinals.length, 4);
+  assert.equal(bracket.semifinals.length, 2);
+  assert.ok(bracket.final);
+  assert.ok(bracket.champion);
+  assert.ok(teams.some(team => team.id === bracket.champion));
+});
 
-test('standings：胜场优先 → 增长率之和 → GMV 之和，rank 从 1 无并列', () => {
+/* ---------- 总冠军排名 ---------- */
+
+test('standings 按胜场 → GMV 之和 → 队伍 ID 排序', () => {
   const rows = [
-    { teamId: 'h', winsDay1: 0, winsDay2: 1, gmvDay1: 100, gmvDay2: 100, growthDay1: 6, growthDay2: 6 },
-    { teamId: 'e', winsDay1: 2, winsDay2: 2, gmvDay1: 5000, gmvDay2: 4999, growthDay1: 15, growthDay2: 15 },
-    { teamId: 'a', winsDay1: 3, winsDay2: 3, gmvDay1: 50, gmvDay2: 50, growthDay1: 1, growthDay2: 1 },
-    { teamId: 'd', winsDay1: 3, winsDay2: 2, gmvDay1: 100, gmvDay2: 200, growthDay1: 5, growthDay2: 5 },
-    { teamId: 'c', winsDay1: 2, winsDay2: 3, gmvDay1: 300, gmvDay2: 200, growthDay1: 5, growthDay2: 5 },
-    { teamId: 'b', winsDay1: 3, winsDay2: 2, gmvDay1: 50, gmvDay2: 50, growthDay1: 9.1, growthDay2: 8.9 },
-    { teamId: 'g', winsDay1: 1, winsDay2: 1, gmvDay1: 100, gmvDay2: 100, growthDay1: 7, growthDay2: 7 },
-    { teamId: 'f', winsDay1: 1, winsDay2: 2, gmvDay1: 100, gmvDay2: 100, growthDay1: 8, growthDay2: 8 }
+    { id: 't2', winsDay1: 2, winsDay2: 2, gmvDay1: 6, gmvDay2: 2 },
+    { id: 't1', winsDay1: 2, winsDay2: 2, gmvDay1: 5, gmvDay2: 5 },
+    { id: 't3', winsDay1: 3, winsDay2: 0, gmvDay1: 100, gmvDay2: 0 }
   ];
   const result = GameEngine.standings(rows);
-  assert.equal(result.length, 8);
-  // a 胜场 6 第一（尽管增长率最低）；b/c/d 同 5 胜，b 增长率和最高，
-  // c 与 d 增长率和相同，c 的 GMV 之和更高；e 胜场 4 即使增长率/GMV 最高也排第 5
-  assert.deepStrictEqual(result.map(r => r.teamId), ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']);
-  assert.deepStrictEqual(result.map(r => r.rank), [1, 2, 3, 4, 5, 6, 7, 8]);
-  assert.equal(result[0].totalWins, 6);
-  almostEqual(result[1].growthSum, 18);
-  assert.equal(result[2].totalWins, 5);
-  // 保留原始字段
-  assert.equal(result[0].gmvDay1, 50);
-  assert.equal(result[0].winsDay2, 3);
+  assert.equal(result[0].id, 't1'); // 同为 4 胜，GMV 之和 10 > 8
+  assert.equal(result[1].id, 't2');
+  assert.equal(result[2].id, 't3'); // 胜场优先于 GMV，3 胜排在 4 胜之后
+  assert.deepStrictEqual(result.map(r => r.rank), [1, 2, 3]);
 });
 
-/* ---------- 联机模式：时钟偏移估算与同步判定 ---------- */
+/* ---------- 时钟校准（保留，兼容旧 server.js） ---------- */
 
-test('estimateClockOffset 选中 rtt 最小样本的 offset（真实 offset +50ms）', () => {
-  const samples = [
-    { c0: 10000, s: 10150, c1: 10200 }, // offset=50,  rtt=200
-    { c0: 20000, s: 20120, c1: 20150 }, // offset=45,  rtt=150
-    { c0: 30000, s: 30065, c1: 30030 }, // offset=50,  rtt=30 ← 最小 rtt
-    { c0: 40000, s: 40300, c1: 40200 }, // offset=200, rtt=200
-    { c0: 50000, s: 50140, c1: 50100 }  // offset=90,  rtt=100
-  ];
-  assert.deepStrictEqual(GameEngine.estimateClockOffset(samples), { offset: 50, rtt: 30 });
-});
-
-test('estimateClockOffset 空数组返回 { offset: 0, rtt: null }', () => {
+test('estimateClockOffset 取 rtt 最小的样本', () => {
+  assert.deepStrictEqual(GameEngine.estimateClockOffset([{ c0: 1000, s: 1060, c1: 1040 }]), { offset: 40, rtt: 40 });
   assert.deepStrictEqual(GameEngine.estimateClockOffset([]), { offset: 0, rtt: null });
+  assert.deepStrictEqual(GameEngine.estimateClockOffset([{ c0: 1000, s: 1060, c1: 1040 }, { c0: 2000, s: 2020, c1: 2010 }]), { offset: 15, rtt: 10 });
 });
 
-test('estimateClockOffset 单样本直接返回其值', () => {
-  // offset = 1060 - (1000+1040)/2 = 40，rtt = 1040 - 1000 = 40
-  assert.deepStrictEqual(
-    GameEngine.estimateClockOffset([{ c0: 1000, s: 1060, c1: 1040 }]),
-    { offset: 40, rtt: 40 }
-  );
-});
-
-test('normalizeTime 基本换算', () => {
+test('normalizeTime 与 computeSpread', () => {
   assert.equal(GameEngine.normalizeTime(1000, 50), 1050);
   assert.equal(GameEngine.normalizeTime(1000, -30), 970);
-  assert.equal(GameEngine.normalizeTime(1000, 0), 1000);
-});
-
-test('computeSpread 5 个乱序时间戳的极差与首尾值', () => {
-  assert.deepStrictEqual(
-    GameEngine.computeSpread([1300, 1000, 1200, 1100, 1250]),
-    { spreadMs: 300, earliest: 1000, latest: 1300 }
-  );
-});
-
-test('computeSpread 空数组与单元素边界', () => {
+  assert.deepStrictEqual(GameEngine.computeSpread([1300, 1000, 1200, 1100, 1250]), { spreadMs: 300, earliest: 1000, latest: 1300 });
   assert.deepStrictEqual(GameEngine.computeSpread([]), { spreadMs: null, earliest: null, latest: null });
-  assert.deepStrictEqual(GameEngine.computeSpread([42]), { spreadMs: 0, earliest: 42, latest: 42 });
 });
 
-test('checkSync 5 个时间戳极差 200ms → syncOk true', () => {
-  assert.deepStrictEqual(
-    GameEngine.checkSync([10000, 10080, 10120, 10160, 10200]),
-    { syncOk: true, spreadMs: 200, earlyCount: 0 }
-  );
-});
-
-test('checkSync 极差 900ms → syncOk false', () => {
-  assert.deepStrictEqual(
-    GameEngine.checkSync([10000, 10080, 10120, 10160, 10900]),
-    { syncOk: false, spreadMs: 900, earlyCount: 0 }
-  );
-});
-
-test('checkSync 仅 4 个时间戳 → syncOk false', () => {
-  assert.deepStrictEqual(
-    GameEngine.checkSync([10000, 10080, 10120, 10160]),
-    { syncOk: false, spreadMs: 160, earlyCount: 0 }
-  );
-});
-
-test('checkSync 含 1 个早于 goTs 的抢跑 → syncOk false 且 earlyCount=1', () => {
-  assert.deepStrictEqual(
-    GameEngine.checkSync([9900, 10050, 10080, 10120, 10160], 10000),
-    { syncOk: false, spreadMs: 260, earlyCount: 1 }
-  );
-});
-
-test('checkSync goTs 传 null 时不判抢跑', () => {
-  assert.deepStrictEqual(
-    GameEngine.checkSync([9900, 10050, 10080, 10120, 10160], null),
-    { syncOk: true, spreadMs: 260, earlyCount: 0 }
-  );
-});
-
-test('checkSync 边界：极差恰为 syncWindowMs(500) → true；空数组 → false', () => {
-  assert.equal(GameEngine.checkSync([10000, 10100, 10200, 10300, 10500]).syncOk, true);
+test('checkSync 需 5 人、无抢跑且首尾差 ≤500ms', () => {
+  assert.equal(GameEngine.checkSync([10000, 10080, 10120, 10160, 10200]).syncOk, true);
+  assert.equal(GameEngine.checkSync([10000, 10080, 10120, 10160, 10900]).syncOk, false);
+  assert.equal(GameEngine.checkSync([9900, 10050, 10080, 10120, 10160], 10000).syncOk, false); // 抢跑
   assert.deepStrictEqual(GameEngine.checkSync([]), { syncOk: false, spreadMs: null, earlyCount: 0 });
-});
-
-test('联机校准流程：不同偏移的设备校准到服务器时间轴后再判定', () => {
-  const goServer = 50000;
-  // 服务器时间轴上 5 人都在口令后 100ms 内点击（真实物理同时）
-  const serverClicks = [goServer + 20, goServer + 45, goServer + 60, goServer + 80, goServer + 95];
-  const offsets = [1200, -800, 3000, -1500, 0]; // 各设备本地时钟相对服务器的偏移
-  // 设备本地时间戳 = 服务器时刻 - offset；后台校准 normalizeTime(local, offset) 还原
-  const localClicks = serverClicks.map((t, i) => t - offsets[i]);
-  const normalized = localClicks.map((t, i) => GameEngine.normalizeTime(t, offsets[i]));
-  assert.deepStrictEqual(
-    GameEngine.checkSync(normalized, goServer),
-    { syncOk: true, spreadMs: 75, earlyCount: 0 }
-  );
-  // 未校准直接比：各设备时钟差异导致极差巨大，误判为不同步
-  assert.equal(GameEngine.checkSync(localClicks, goServer).syncOk, false);
 });
 
 /* ---------- 运行器 ---------- */
 
 let passed = 0;
-let failed = 0;
-for (const { name, fn } of tests) {
+for (const t of tests) {
   try {
-    fn();
+    t.fn();
     passed++;
-    console.log(`✓ ${name}`);
-  } catch (err) {
-    failed++;
-    console.error(`✗ ${name}`);
-    console.error(err && err.message ? err.message : err);
+    console.log('✓ ' + t.name);
+  } catch (error) {
+    console.error('✗ ' + t.name);
+    console.error(error && error.stack ? error.stack : error);
+    process.exitCode = 1;
+    break;
   }
 }
-
-console.log(`\n共 ${tests.length} 项测试：通过 ${passed}，失败 ${failed}`);
-if (failed > 0) {
-  console.error('存在失败用例，测试未通过');
-  process.exit(1);
-}
-console.log('全部测试通过 ✔');
-process.exit(0);
+console.log(`\n${passed} / ${tests.length} 通过`);
+if (passed !== tests.length) process.exit(1);

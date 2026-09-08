@@ -1,193 +1,379 @@
 package com.acedicearena.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 
-import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
 
 /** 任何一个环节都不能因为某个玩家不操作而永久卡住整届赛事。 */
 class DeadlockTimeoutTest {
     private final ObjectMapper mapper = new ObjectMapper();
 
     @Test
-    void captainWhoNeverSubmitsALineupDoesNotStallTheMatch() {
-        ObjectNode root = state();
-        ObjectNode match = (ObjectNode) root.path("matches").path("g1");
-        match.put("phase", "LINEUP");
-        match.put("lineupDeadlineAt", System.currentTimeMillis() - 1);
-        List<Runnable> actions = new ArrayList<>();
+    void captainVoteTimeoutElectsByRosterOrderAndMovesToSquadForm() {
+        ObjectNode root = state("CAPTAIN_VOTE");
+        root.path("teams").forEach(team ->
+                ((ObjectNode) team).put("roleVoteDeadlineAt", System.currentTimeMillis() - 1));
 
-        assertThat(service().expireLineups(root, System.currentTimeMillis(), actions)).isTrue();
+        assertThat(service().expireVoting(root, System.currentTimeMillis())).isTrue();
 
-        assertThat(match.at("/lineups/A").size()).isEqualTo(5);
-        assertThat(match.at("/lineups/B").size()).isEqualTo(5);
-        assertThat(match.at("/lineupTimedOut/A").asBoolean()).isTrue();
-        assertThat(match.path("phase").asText()).isEqualTo("ATTACKING");
-        assertThat(actions).hasSize(1);   // 需要把补齐后的阵容同步给联机端
+        root.path("teams").forEach(team ->
+                assertThat(team.at("/roles/captain").asText()).isEqualTo(team.path("players").get(0).path("id").asText()));
+        assertThat(root.path("stage").asText()).isEqualTo("SQUAD_FORM");
+        assertThat(root.path("stageDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
     }
 
     @Test
-    void autoFilledLineupAlwaysContainsABackEndPlayer() {
-        ObjectNode root = state();
-        ObjectNode match = (ObjectNode) root.path("matches").path("g1");
-        match.put("phase", "LINEUP");
-        match.put("lineupDeadlineAt", System.currentTimeMillis() - 1);
-        service().expireLineups(root, System.currentTimeMillis(), new ArrayList<>());
+    void squadFormTimeoutSplitsThirtyPlayersIntoSixSquadsOfFive() {
+        ObjectNode root = state("SQUAD_FORM");
+        root.put("stageDeadlineAt", System.currentTimeMillis() - 1);
 
-        List<String> lineup = new ArrayList<>();
-        match.at("/lineups/A").forEach(id -> lineup.add(id.asText()));
-        assertThat(lineup).contains("t1-back");
+        assertThat(service().expireSquadForm(root, System.currentTimeMillis())).isTrue();
+
+        root.path("teams").forEach(team -> {
+            JsonNodeSquadsAssert.assertSixByFive(team.path("squads"));
+            Set<String> all = new HashSet<>();
+            team.path("squads").forEach(squad -> squad.forEach(id -> all.add(id.asText())));
+            Set<String> roster = new HashSet<>();
+            team.path("players").forEach(player -> roster.add(player.path("id").asText()));
+            assertThat(all).isEqualTo(roster);
+        });
+        assertThat(root.path("stage").asText()).isEqualTo("ROLL");
+        assertThat(root.has("rollGoAt")).isTrue();
     }
 
     @Test
-    void aPlayerWhoNeverClicksReadyDoesNotBlockTheAttack() {
-        ObjectNode match = attacking("PREPARING");
-        List<Runnable> actions = new ArrayList<>();
+    void squadFormCompletesEarlyWhenEveryTeamHasFormed() {
+        ObjectNode root = state("SQUAD_FORM");
+        root.put("stageDeadlineAt", System.currentTimeMillis() + 60_000L);
+        root.path("teams").forEach(team -> formSquads((ObjectNode) team));
 
-        assertThat(service().expireAttackSides(rootOf(match), System.currentTimeMillis(), actions)).isTrue();
-
-        assertThat(match.at("/sidePhases/A").asText()).isEqualTo("ROLL");
-        assertThat(match.at("/sideTimedOut/A").asText()).isEqualTo("prepare");
-        assertThat(actions).hasSize(1);
+        assertThat(service().expireSquadForm(root, System.currentTimeMillis())).isTrue();
+        assertThat(root.path("stage").asText()).isEqualTo("ROLL");
     }
 
     @Test
-    void aPlayerWhoNeverClicksRollDoesNotBlockTheReveal() {
-        ObjectNode match = attacking("ROLL");
+    void rollTimeoutAutoRollsPerSquadWithSquadOpenPlusOneSecondTimestamp() {
+        ObjectNode root = state("ROLL");
+        root.path("teams").forEach(team -> formSquads((ObjectNode) team));
+        root.put("rollGoAt", 10_000L);
+        ArrayNode rollOpenAts = root.putArray("rollOpenAts");
+        for (int k = 0; k < 6; k++) rollOpenAts.add(10_000L + k * 1_000L);
+        root.put("stageDeadlineAt", System.currentTimeMillis() - 1);
+
+        assertThat(service().expireRoll(root, System.currentTimeMillis())).isTrue();
+
+        root.path("teams").forEach(team -> {
+            for (int k = 0; k < 6; k++) {
+                long expectedRollTs = 10_000L + k * 1_000L + 1_000L;
+                team.path("squads").get(k).forEach(idNode -> {
+                    JsonNode player = findPlayer(team, idNode.asText());
+                    assertThat(player.path("dice").asInt()).isBetween(1, 6);
+                    assertThat(player.path("diceFinal").asInt()).isEqualTo(player.path("dice").asInt());
+                    assertThat(player.path("rollTs").asLong()).isEqualTo(expectedRollTs);
+                    assertThat(player.path("autoRolled").asBoolean()).isTrue();
+                });
+            }
+        });
+        assertThat(root.path("stage").asText()).isEqualTo("BLIND_BOX");
+        assertThat(root.path("stageDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
+    }
+
+    @Test
+    void squadWindowExpiryAutoRollsOnlyThatSquad() {
+        ObjectNode root = state("ROLL");
+        root.path("teams").forEach(team -> formSquads((ObjectNode) team));
+        // 1 号小队窗口刚结束 500ms，2 号小队窗口还剩 500ms，全局截止仍在将来
         long now = System.currentTimeMillis();
-        List<Runnable> actions = new ArrayList<>();
+        long go = now - 15_500L;
+        root.put("rollGoAt", go);
+        ArrayNode rollOpenAts = root.putArray("rollOpenAts");
+        for (int k = 0; k < 6; k++) rollOpenAts.add(go + k * 1_000L);
+        root.put("stageDeadlineAt", go + 20_000L);
 
-        assertThat(service().expireAttackSides(rootOf(match), now, actions)).isTrue();
+        assertThat(service().expireRoll(root, now)).isTrue();
 
-        assertThat(match.at("/sideTimedOut/A").asText()).isEqualTo("roll");
-        assertThat(actions).hasSize(1);
-        // 必须在本次事务里直接推进到投骰阶段：联机事件监听器有自己的事务，写回不可靠
-        assertThat(match.at("/sidePhases/A").asText()).isEqualTo("PITCHER_ROLL");
-        // 人不齐，同步增益当场失效
-        assertThat(match.at("/timing/syncOkA").asBoolean()).isFalse();
-        assertThat(match.at("/sideDeadlines/A").asLong()).isGreaterThan(now);
+        assertThat(root.path("stage").asText()).isEqualTo("ROLL");
+        root.path("teams").forEach(team -> {
+            team.path("squads").get(0).forEach(idNode -> {
+                JsonNode player = findPlayer(team, idNode.asText());
+                assertThat(player.path("dice").asInt()).isBetween(1, 6);
+                assertThat(player.path("rollTs").asLong()).isEqualTo(go + 1_000L);
+                assertThat(player.path("autoRolled").asBoolean()).isTrue();
+            });
+            for (int k = 1; k < 6; k++)
+                team.path("squads").get(k).forEach(idNode ->
+                        assertThat(findPlayer(team, idNode.asText()).has("dice")).isFalse());
+        });
     }
 
     @Test
-    void aPitcherWhoNeverRollsDoesNotBlockTheMatch() {
-        ObjectNode match = attacking("PITCHER_ROLL");
-        List<Runnable> actions = new ArrayList<>();
+    void everyoneRolledMovesToBlindBoxBeforeTheStageDeadline() {
+        ObjectNode root = state("ROLL");
+        root.path("teams").forEach(team -> formSquads((ObjectNode) team));
+        long now = System.currentTimeMillis();
+        long go = now - 2_000L;
+        root.put("rollGoAt", go);
+        ArrayNode rollOpenAts = root.putArray("rollOpenAts");
+        for (int k = 0; k < 6; k++) rollOpenAts.add(go + k * 1_000L);
+        root.put("stageDeadlineAt", go + 20_000L);
+        giveDice(root);
 
-        assertThat(service().expireAttackSides(rootOf(match), System.currentTimeMillis(), actions)).isTrue();
+        assertThat(service().expireRoll(root, now)).isTrue();
 
-        assertThat(match.at("/sideTimedOut/A").asText()).isEqualTo("pitcher");
-        assertThat(actions).hasSize(1);
+        assertThat(root.path("stage").asText()).isEqualTo("BLIND_BOX");
+        root.path("teams").forEach(team -> team.path("players").forEach(player ->
+                assertThat(player.has("autoRolled")).isFalse()));
+    }
+
+    @Test
+    void blindBoxTimeoutForfeitsUnopenedBoxesAndMovesToTactics() {
+        ObjectNode root = state("BLIND_BOX");
+        root.put("stageDeadlineAt", System.currentTimeMillis() - 1);
+        // 全员已掷骰但都还没开盲盒
+        root.path("teams").forEach(team -> team.path("players").forEach(playerNode -> {
+            ObjectNode player = (ObjectNode) playerNode;
+            player.put("dice", 3).put("diceFinal", 3).put("rollTs", 1_000L);
+        }));
+        // t1 一名队员已经自己开过
+        ObjectNode opened = (ObjectNode) root.path("teams").get(0).path("players").get(0);
+        opened.put("blindBox", 3).put("blindBoxOpened", true);
+
+        assertThat(service().expireBlindBox(root, System.currentTimeMillis())).isTrue();
+
+        assertThat(opened.path("blindBox").asInt()).isEqualTo(3);
+        // 未开者按放弃处理：不写入盲盒字段，个人点数按 0 计
+        root.path("teams").forEach(team -> team.path("players").forEach(player -> {
+            if (player == opened) return;
+            assertThat(player.has("blindBox")).isFalse();
+            assertThat(player.has("blindBoxOpened")).isFalse();
+        }));
+        assertThat(root.path("stage").asText()).isEqualTo("TACTICS");
+        assertThat(root.path("stageDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
+    }
+
+    @Test
+    void tacticsTimeoutLocksDefaultOrderAndStartsBattle() {
+        ObjectNode root = state("TACTICS");
+        root.put("stageDeadlineAt", System.currentTimeMillis() - 1);
+        root.path("teams").forEach(team -> formSquads((ObjectNode) team));
+        giveDice(root);
+
+        assertThat(service().expireTactics(root, System.currentTimeMillis())).isTrue();
+
+        assertThat(root.path("stage").asText()).isEqualTo("BATTLE");
+        assertThat(root.has("stageDeadlineAt")).isFalse();
+        ObjectNode match = match(root);
+        assertThat(match.path("phase").asText()).isEqualTo("BATTLE");
+        assertThat(match.path("round").asInt()).isEqualTo(1);
+        assertThat(match.path("roundPhase").asText()).isEqualTo("GUESS");
+        assertThat(match.path("guessDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
+        assertThat(match.path("rounds")).isEmpty();
+    }
+
+    @Test
+    void guessTimeoutRevealsTheRoundWithZeroHits() {
+        ObjectNode root = battleState(1);
+        ObjectNode match = match(root);
+        match.put("guessDeadlineAt", System.currentTimeMillis() - 1);
+
+        assertThat(service().expireGuesses(root, System.currentTimeMillis())).isTrue();
+
+        assertThat(match.path("roundPhase").asText()).isEqualTo("REVEAL");
+        assertThat(match.path("revealUntil").asLong()).isGreaterThan(System.currentTimeMillis());
+        assertThat(match.has("guessDeadlineAt")).isFalse();
+        JsonNode round = match.path("rounds").get(0);
+        assertThat(round.path("round").asInt()).isEqualTo(1);
+        assertThat(round.path("guessHitsA").asInt()).isZero();
+        assertThat(round.path("guessHitsB").asInt()).isZero();
+        // t1 全 6 无暴击（时刻拉得很开），t2 全 1
+        assertThat(round.path("powerA").asDouble()).isEqualTo(30d);
+        assertThat(round.path("powerB").asDouble()).isEqualTo(5d);
+        assertThat(round.path("critA").asBoolean()).isFalse();
+        assertThat(round.path("winner").asText()).isEqualTo("A");
+        assertThat(match.path("winsA").asInt()).isEqualTo(1);
+    }
+
+    @Test
+    void autoRolledSquadCannotCritEvenWithPerfectlyAlignedTimestamps() {
+        ObjectNode root = battleState(1);
+        ObjectNode match = match(root);
+        // 两队时刻都完全对齐，但 t2 是系统代掷
+        root.path("teams").forEach(team -> {
+            boolean auto = "t2".equals(team.path("id").asText());
+            int index = 0;
+            for (var player : team.path("players")) {
+                ObjectNode node = (ObjectNode) player;
+                node.put("rollTs", 5_000L);
+                if (auto) node.put("autoRolled", true);
+                index++;
+            }
+        });
+
+        service().revealRound(root, match);
+
+        JsonNode round = match.path("rounds").get(0);
+        assertThat(round.path("critA").asBoolean()).isTrue();
+        assertThat(round.path("critB").asBoolean()).isFalse();
+        assertThat(round.path("powerA").asDouble()).isEqualTo(45d);   // 30 × 1.5
+        assertThat(round.path("powerB").asDouble()).isEqualTo(5d);
+    }
+
+    @Test
+    void revealTimeoutAdvancesToTheNextRoundAndTheSixthRevealProducesTheResult() {
+        ObjectNode root = battleState(1);
+        ObjectNode match = match(root);
+        match.put("roundPhase", "REVEAL");
+        match.put("revealUntil", System.currentTimeMillis() - 1);
+
+        assertThat(service().completeRoundReveals(root, System.currentTimeMillis())).isTrue();
+        assertThat(match.path("round").asInt()).isEqualTo(2);
+        assertThat(match.path("roundPhase").asText()).isEqualTo("GUESS");
+        assertThat(match.path("guessDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
+
+        match.put("round", 6);
+        match.put("roundPhase", "REVEAL");
+        match.put("revealUntil", System.currentTimeMillis() - 1);
+        match.put("winsA", 4).put("winsB", 1);
+        assertThat(service().completeRoundReveals(root, System.currentTimeMillis())).isTrue();
+        assertThat(match.path("phase").asText()).isEqualTo("RESULT");
+        assertThat(match.path("winner").asText()).isEqualTo("t1");
+        assertThat(match.path("resultReadyAt").asLong()).isGreaterThan(System.currentTimeMillis());
+    }
+
+    @Test
+    void resultDisplayExpiryMarksTheMatchDone() {
+        ObjectNode root = battleState(1);
+        ObjectNode match = match(root);
+        match.put("phase", "RESULT");
+        match.remove("roundPhase");
+        match.put("winner", "t1");
+        match.put("resultReadyAt", System.currentTimeMillis() - 1);
+
+        assertThat(service().completeDueResults(root, System.currentTimeMillis())).isTrue();
+        assertThat(match.path("status").asText()).isEqualTo("done");
+        assertThat(match.path("phase").asText()).isEqualTo("FINISHED");
     }
 
     @Test
     void nothingIsForcedWhileThereIsStillTimeLeft() {
-        ObjectNode match = attacking("PREPARING");
-        match.withObject("/sideDeadlines").put("A", System.currentTimeMillis() + 60_000);
-        match.withObject("/sideDeadlines").put("B", System.currentTimeMillis() + 60_000);
-        List<Runnable> actions = new ArrayList<>();
+        long future = System.currentTimeMillis() + 60_000L;
+        ObjectNode root = state("ROLL");
+        root.put("stageDeadlineAt", future);
+        var service = service();
+        assertThat(service.expireRoll(root, System.currentTimeMillis())).isFalse();
+        assertThat(root.path("stage").asText()).isEqualTo("ROLL");
 
-        assertThat(service().expireAttackSides(rootOf(match), System.currentTimeMillis(), actions)).isFalse();
-        assertThat(match.at("/sidePhases/A").asText()).isEqualTo("PREPARING");
-        assertThat(actions).isEmpty();
-    }
+        root.put("stage", "BLIND_BOX");
+        assertThat(service.expireBlindBox(root, System.currentTimeMillis())).isFalse();
 
-    @Test
-    void missingPlayersStillGetADiceRollButTheTeamLosesTheSyncBonus() {
-        org.springframework.context.ApplicationEventPublisher publisher =
-                mock(org.springframework.context.ApplicationEventPublisher.class);
-        OnlineGameService online = new OnlineGameService(publisher);
-        String[] tokens = new String[5];
-        for (int slot = 1; slot <= 5; slot++) {
-            tokens[slot - 1] = online.join("t1", slot, "队员" + slot, "u" + slot).token();
-            online.ping(tokens[slot - 1], (double) System.currentTimeMillis());
-            online.calibrate(tokens[slot - 1], 20d);
-        }
-        online.forceStart("t1");
+        root.put("stage", "TACTICS");
+        assertThat(service.expireTactics(root, System.currentTimeMillis())).isFalse();
 
-        // 只有 3 个人点了【掷！】，另外 2 个位置的人始终没出现
-        for (int i = 0; i < 3; i++) online.roll(tokens[i], (double) System.currentTimeMillis());
-        assertThat(online.isTimingReady("t1")).isFalse();   // 按原逻辑到这里就永远卡住了
-
-        online.forceTiming("t1");
-        assertThat(online.isTimingReady("t1")).isTrue();
-
-        org.mockito.ArgumentCaptor<Object> captor = org.mockito.ArgumentCaptor.forClass(Object.class);
-        verify(publisher, atLeastOnce()).publishEvent(captor.capture());
-        OnlineGameService.DiceTimingReadyEvent timing = captor.getAllValues().stream()
-                .filter(OnlineGameService.DiceTimingReadyEvent.class::isInstance)
-                .map(OnlineGameService.DiceTimingReadyEvent.class::cast).findFirst().orElseThrow();
-        assertThat(timing.syncOk()).isFalse();             // 人不齐，同步增益失效
-
-        online.finalRoll("t1");
-        OnlineGameService.DiceRevealEvent reveal = captor.getAllValues().stream()
-                .filter(OnlineGameService.DiceRevealEvent.class::isInstance)
-                .map(OnlineGameService.DiceRevealEvent.class::cast).findFirst().orElse(null);
-        if (reveal == null) {
-            verify(publisher, atLeastOnce()).publishEvent(captor.capture());
-            reveal = captor.getAllValues().stream()
-                    .filter(OnlineGameService.DiceRevealEvent.class::isInstance)
-                    .map(OnlineGameService.DiceRevealEvent.class::cast).findFirst().orElseThrow();
-        }
-        assertThat(reveal.dice()).hasSize(5);              // 缺席的 2 个位置由服务端补掷
-        assertThat(reveal.dice()).allMatch(d -> d.die() >= 1 && d.die() <= 6);
-        assertThat(reveal.dice().stream().filter(d -> d.ts() == null)).hasSize(2);
-        assertThat(reveal.syncOk()).isFalse();
+        ObjectNode battleRoot = battleState(1);
+        assertThat(service.expireGuesses(battleRoot, System.currentTimeMillis())).isFalse();
+        assertThat(service.completeRoundReveals(battleRoot, System.currentTimeMillis())).isFalse();
+        assertThat(match(battleRoot).path("rounds")).isEmpty();
     }
 
     /* ---------- 构造 ---------- */
 
     private ParallelTournamentService service() {
         return new ParallelTournamentService(
-                org.mockito.Mockito.mock(com.acedicearena.repository.GameStateRepository.class),
-                org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
-                org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
-                org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                org.mockito.Mockito.mock(LobbyEventService.class), 6_000L,
-                org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class),
-                org.mockito.Mockito.mock(OnlineGameService.class));
+                mock(com.acedicearena.repository.GameStateRepository.class),
+                mock(com.acedicearena.repository.UserAccountRepository.class),
+                mock(com.acedicearena.repository.PerformanceRecordRepository.class),
+                mock(com.acedicearena.repository.GameControlRepository.class), mapper,
+                mock(LobbyEventService.class), 6_000L,
+                mock(com.acedicearena.repository.BattleReportRepository.class),
+                mock(com.acedicearena.repository.MatchReportRepository.class),
+                mock(com.acedicearena.repository.PlayerBlindBoxRepository.class));
     }
 
-    private ObjectNode state() {
+    /** t1/t2 各 30 人，一场 g1 进行中。 */
+    private ObjectNode state(String stage) {
         ObjectNode root = mapper.createObjectNode();
-        root.put("mode", "parallel"); root.put("stage", "ATTACK");
+        root.put("mode", "parallel"); root.put("stage", stage);
         ArrayNode teams = root.putArray("teams");
         for (String id : List.of("t1", "t2")) {
             ObjectNode team = teams.addObject();
-            team.put("id", id); team.put("name", id); team.put("accumulationPoints", 10);
+            team.put("id", id); team.put("name", id);
             team.put("growthCoefficient", 1.0);
+            team.put("rerollQuota", 10); team.put("rerollUsed", 0);
+            team.putObject("roles"); team.putObject("roleVotes");
             ArrayNode players = team.putArray("players");
-            players.addObject().put("id", id + "-back").put("name", "后端").put("role", "back").put("managed", false);
-            for (int i = 1; i <= 6; i++)
-                players.addObject().put("id", id + "-p" + i).put("name", "前端" + i).put("role", "front").put("managed", false);
+            for (int i = 1; i <= 30; i++)
+                players.addObject().put("id", id + "-p" + i).put("name", id + "队员" + i)
+                        .put("role", i <= 15 ? "front" : "back").put("managed", false);
         }
         ObjectNode match = root.putObject("matches").putObject("g1");
         match.put("id", "g1"); match.put("a", "t1"); match.put("b", "t2");
-        match.put("status", "active"); match.put("winsA", 0); match.put("winsB", 0);
-        match.putObject("submitted"); match.putObject("lineups"); match.putObject("prophet");
+        match.put("winsA", 0); match.put("winsB", 0); match.put("round", 1);
+        match.put("status", "active"); match.put("phase", "PENDING");
+        match.putArray("rounds");
         return root;
     }
 
-    /** 造一个 A 方停在指定阶段、且截止时间已过的进行中场次。 */
-    private ObjectNode attacking(String sidePhase) {
-        ObjectNode root = state();
-        ObjectNode match = (ObjectNode) root.path("matches").path("g1");
-        match.put("phase", "ATTACKING");
-        match.putObject("sidePhases").put("A", sidePhase).put("B", "WAITING");
-        match.putObject("sideDeadlines").put("A", System.currentTimeMillis() - 1);
-        return match;
+    /** BATTLE 阶段第 round 局：两队已分队且有掷骰数据（t1 全 6、t2 全 1，时刻都拉得很开不暴击）。 */
+    private ObjectNode battleState(int round) {
+        ObjectNode root = state("BATTLE");
+        root.path("teams").forEach(team -> formSquads((ObjectNode) team));
+        giveDice(root);
+        ObjectNode match = match(root);
+        match.put("phase", "BATTLE").put("round", round).put("roundPhase", "GUESS");
+        match.put("guessDeadlineAt", System.currentTimeMillis() + 30_000L);
+        match.putObject("guesses").putObject("A");
+        ((ObjectNode) match.path("guesses")).putObject("B");
+        return root;
     }
 
-    private ObjectNode rootOf(ObjectNode match) {
-        ObjectNode root = state();
-        ((ObjectNode) root.path("matches")).set("g1", match);
-        return root;
+    private void formSquads(ObjectNode team) {
+        List<String> roster = new java.util.ArrayList<>();
+        team.path("players").forEach(player -> roster.add(player.path("id").asText()));
+        ArrayNode squads = team.putArray("squads");
+        for (int s = 0; s < 6; s++) {
+            ArrayNode squad = squads.addArray();
+            for (int i = s * 5; i < s * 5 + 5; i++) squad.add(roster.get(i));
+        }
+    }
+
+    private void giveDice(ObjectNode root) {
+        root.path("teams").forEach(team -> {
+            int die = "t1".equals(team.path("id").asText()) ? 6 : 1;
+            int index = 0;
+            for (var playerNode : team.path("players")) {
+                ObjectNode player = (ObjectNode) playerNode;
+                player.put("dice", die).put("diceFinal", die);
+                player.put("rollTs", 1_000L + index * 600L);
+                player.put("blindBox", 0).put("blindBoxOpened", true);
+                index++;
+            }
+        });
+    }
+
+    private ObjectNode match(ObjectNode root) {
+        return (ObjectNode) root.path("matches").path("g1");
+    }
+
+    private JsonNode findPlayer(JsonNode team, String playerId) {
+        for (JsonNode player : team.path("players"))
+            if (playerId.equals(player.path("id").asText())) return player;
+        throw new AssertionError("player not found: " + playerId);
+    }
+
+    /** 结构断言助手，避免在每个用例里重复两层 size 检查。 */
+    private static final class JsonNodeSquadsAssert {
+        static void assertSixByFive(JsonNode squads) {
+            assertThat(squads).hasSize(6);
+            squads.forEach(squad -> assertThat(squad).hasSize(5));
+        }
     }
 }
