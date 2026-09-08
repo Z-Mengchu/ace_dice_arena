@@ -1,29 +1,258 @@
-(function(){'use strict';
-var phaseNames={PROPHET:'军师预言',LINEUP:'队长选择阵容',CONFIRM_A:'A 队进攻确认',ROLL_A:'A 队五人同步点击',PITCHER_ROLL_A:'A 队王牌投手最终投骰',CONFIRM_B:'B 队进攻确认',ROLL_B:'B 队五人同步点击',PITCHER_ROLL_B:'B 队王牌投手最终投骰',RESULT:'本局结果',FINISHED:'比赛结束'};
-function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
-function team(state,id){return(state.teams||[]).find(function(t){return t.id===id;})||{name:id};}
-function rollHtml(match,side){var roll=match.rolls&&match.rolls[side];if(!roll)return'<span class="feed-empty">等待投骰</span>';var attack=roll.finalAttack==null?roll.attack:roll.finalAttack;return'<span class="feed-dice">'+(roll.dice||[]).map(function(v){return'<i>'+v+'</i>';}).join('')+'</span><small>攻击 '+attack+(roll.syncOk?' · 同步加成':'')+(Number(roll.attackBoostMultiplier||1)>1?' · 盲盒 ×'+Number(roll.attackBoostMultiplier).toFixed(2):'')+(roll.sandboxAssisted?' · 沙盘助攻':'')+'</small>';}
-function prophetHtml(state,match,side){var guess=match.prophet&&match.prophet[side],opponent=team(state,side==='A'?match.b:match.a),hit=match.prophetResults&&match.prophetResults[side];if(!Array.isArray(guess)||!guess.length)return'<span>未预言</span>';return'<span>'+guess.map(function(id){var player=(opponent.players||[]).find(function(item){return item.id===id;});return esc(player?player.name:id);}).join('、')+' · '+(hit?'命中 +2':'未命中')+'</span>';}
-function accumulationCard(item,index){var quota=item.accumulationQuota||0,rolled=item.accumulationRolled||0,done=rolled>=quota;return'<article class="accumulation-watch '+(done?'complete':'')+'"><header><span>TEAM 0'+(index+1)+'</span><b>'+esc(item.name)+'</b></header><div class="accumulation-watch-gmv">¥'+Number(item.gmv||0).toLocaleString('zh-CN')+'</div><div class="accumulation-watch-progress"><i style="width:'+(quota?Math.min(100,rolled/quota*100):100)+'%"></i></div><div class="feed-meta"><span>'+rolled+' / '+quota+' 次</span><span>累计 '+(item.accumulationPoints||0)+' 点</span><span>'+(done?'已完成':'投骰中')+'</span></div><div class="feed-dice">'+(item.accumulationDice||[]).slice(-12).map(function(value){return'<i>'+value+'</i>';}).join('')+'</div></article>';}
-function card(state,match,index){var a=team(state,match.a),b=team(state,match.b),done=match.status==='done',result=match.phase==='RESULT',voting=!done&&(!(a.roles&&a.roles.strategist)||!(b.roles&&b.roles.strategist)),stage=TournamentUI.stage(match);var roundWinner=team(state,match[match.roundWinner==='A'?'a':'b']).name+' 拿下本场';return'<article class="live-feed '+(done?'finished ':'')+(result?'showing-result':'')+'"><header><span>'+esc(stage.label)+' · '+(match.status==='active'?'LIVE':'ARCHIVE')+'</span><b>'+esc(voting?'队内角色投票':phaseNames[match.phase]||match.phase)+'</b></header><div class="feed-score"><div><strong>'+esc(a.name)+'</strong><em>'+match.winsA+'</em></div><span>:</span><div><em>'+match.winsB+'</em><strong>'+esc(b.name)+'</strong></div></div><div class="feed-meta"><span>积累攻击 '+(a.accumulationPoints||0)+' / '+(b.accumulationPoints||0)+'</span><span>系数 ×'+Number(a.growthCoefficient||1).toFixed(4)+' / ×'+Number(b.growthCoefficient||1).toFixed(4)+'</span><span>'+(done?'已完赛':voting?'等待全员投票':result?'结果展示中':'一轮定胜负')+'</span></div><div class="feed-rolls"><div><b>'+esc(a.name)+'</b>'+rollHtml(match,'A')+'</div><div><b>'+esc(b.name)+'</b>'+rollHtml(match,'B')+'</div></div>'+((result||done)?'<div class="feed-prophet"><b>'+esc(a.name)+'预言</b>'+prophetHtml(state,match,'A')+'<b>'+esc(b.name)+'预言</b>'+prophetHtml(state,match,'B')+'</div>':'')+(result?'<div class="feed-round-result">'+esc(roundWinner)+' · 本场胜负已定</div>':'')+(done?'<div class="feed-winner">胜者 · '+esc(team(state,match.winner).name)+'</div>':'')+'</article>';}
-function render(state){
-  var root=document.getElementById('spectator-root');
-  if(!state||state.mode!=='parallel'){root.innerHTML='<section class="spectator-empty"><b>等待管理员开始游戏</b><p>开赛后先选出三名核心角色，再进入积累期和攻擂战。</p></section>';return;}
-  if(state.stage==='ROLE_VOTE'){
-    document.getElementById('tb-status').textContent='核心角色投票';
-    root.innerHTML='<section class="wall-head"><div><small>PHASE ONE · ROLE ELECTION</small><h1>八队核心角色投票</h1></div><p>各队依次选出队长、军师和王牌投手，三项投票全部完成后进入积累期。</p></section>';
-    return;
+(function () {
+  'use strict';
+
+  var STAGE_TITLES = {
+    CAPTAIN_VOTE: ['第一阶段 · 队长投票', '八队投票选出队长'],
+    SQUAD_FORM: ['第二阶段 · 分队', '队长编排 6 支 5 人小队'],
+    ROLL: ['第三阶段 · 全员掷骰', '321 倒计时后 30 人各掷 1 枚'],
+    BLIND_BOX: ['第四阶段 · 开盲盒', '每人手动开启个人盲盒'],
+    TACTICS: ['第五阶段 · 战术窗口', '队长重掷 + 排出场顺序'],
+    BATTLE: ['第六阶段 · 六局对局', '6 局胜场制 · 逐局猜阵揭晓']
+  };
+
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function team(state, id) { return (state.teams || []).find(function (t) { return t.id === id; }) || { id: id, name: id, players: [] }; }
+  function playerName(teamNode, id) { var p = (teamNode.players || []).find(function (x) { return x.id === id; }); return p ? p.name : id; }
+  function countdown(deadlineAt) {
+    if (deadlineAt == null) return '';
+    var s = Math.max(0, Math.ceil((Number(deadlineAt) - Date.now()) / 1000));
+    return '<i class="feed-countdown">剩余 ' + s + ' 秒</i>';
   }
-  if(state.stage==='ACCUMULATION'){
-    var quota=(state.teams||[]).reduce(function(sum,item){return sum+(item.accumulationQuota||0);},0),rolled=(state.teams||[]).reduce(function(sum,item){return sum+(item.accumulationRolled||0);},0);
-    document.getElementById('tb-status').textContent='积累期 · '+rolled+'/'+quota;
-    root.innerHTML='<section class="wall-head"><div><small>PHASE TWO · ACCUMULATION</small><h1>八队积累投骰</h1></div><p>赛前一日每 10 万元 GMV 兑换 1 次机会。所有队伍必须投完全部次数，系统才会进入攻擂战。</p></section><section class="accumulation-watch-grid">'+state.teams.map(accumulationCard).join('')+'</section>';
-    return;
+  function wallHead(kicker, title, sub) {
+    return '<section class="wall-head"><div><small>' + esc(kicker) + '</small><h1>' + esc(title) + '</h1></div><p>' + esc(sub) + '</p></section>';
   }
-  var matches=TournamentUI.matches(state),finished=matches.filter(function(m){return m.status==='done';}).length;
-  document.getElementById('tb-status').textContent=TournamentUI.currentStage(state)+' · '+finished+' 场已完赛';
-  root.innerHTML='<section class="wall-head"><div><small>PHASE THREE · LIVE BRACKET</small><h1>当前赛程 · '+esc(TournamentUI.currentStage(state))+'</h1></div><p>当前对阵优先显示，下方保留半决赛与首轮历史。每两支队伍只完成一轮攻擂，本轮结果直接决定本场胜负。</p></section><section class="feed-grid">'+matches.map(function(m,i){return card(state,m,i);}).join('')+'</section>';
-}
-function load(){fetch('/api/game-state').then(function(r){if(r.status===401){location.replace('/login');throw new Error();}return r.status===204?null:r.json();}).then(function(d){render(d&&d.state);}).catch(function(){});}
-document.getElementById('btn-logout').onclick=function(){fetch('/api/auth/logout',{method:'POST'}).finally(function(){location.replace('/login');});};load();setInterval(load,1000);
+  function progressBar(done, total) {
+    var pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
+    return '<div class="accumulation-watch-progress"><i style="width:' + pct + '%"></i></div>';
+  }
+
+  /* ---------- 各阶段全队进度卡 ---------- */
+
+  function teamCard(teamNode, index, bodyHtml, doneText) {
+    return '<article class="live-feed team-watch"><header><span>TEAM 0' + (index + 1) + '</span><b>' + esc(teamNode.name) + '</b></header>' + bodyHtml + '</article>';
+  }
+
+  function voteBody(teamNode) {
+    var votes = Object.keys(teamNode.roleVotes || {}).length;
+    var eligible = (teamNode.players || []).filter(function (p) { return !p.managed; }).length;
+    var captain = teamNode.roles && teamNode.roles.captain;
+    return '<div class="feed-meta"><span>已投票 ' + votes + ' / ' + eligible + '</span><span>' + (captain ? '队长 ' + esc(playerName(teamNode, captain)) : '等待计票') + '</span></div>' + progressBar(votes, eligible);
+  }
+
+  function squadBody(teamNode) {
+    var squads = teamNode.squads;
+    var done = Array.isArray(squads) && squads.length === 6;
+    var roster = (squads || []).map(function (s) { return s.length; }).join(' / ');
+    return '<div class="feed-meta"><span>' + (done ? '已分队 · 每队 ' + roster + ' 人' : '等待队长分队') + '</span><span>' + (done ? '完成' : '进行中') + '</span></div>' + progressBar(done ? 6 : 0, 6);
+  }
+
+  function rollBody(teamNode, state) {
+    var total = (teamNode.players || []).length;
+    var rolled = (teamNode.players || []).filter(function (p) { return p.dice != null; }).length;
+    return '<div class="feed-meta"><span>已掷 ' + rolled + ' / ' + total + '</span>' + countdown(state.rollGoAt ? state.rollGoAt : state.stageDeadlineAt) + '</div>' + progressBar(rolled, total);
+  }
+
+  function blindBoxBody(teamNode) {
+    var total = (teamNode.players || []).length;
+    var opened = (teamNode.players || []).filter(function (p) { return p.blindBox != null; }).length;
+    return '<div class="feed-meta"><span>已开 ' + opened + ' / ' + total + '</span><span>' + (opened >= total ? '完成' : '开盒中') + '</span></div>' + progressBar(opened, total);
+  }
+
+  function tacticsBody(teamNode) {
+    var limit = Math.min(teamNode.rerollQuota || 0, 5);
+    var used = teamNode.rerollUsed || 0;
+    var locked = teamNode.squadOrderLocked;
+    return '<div class="feed-meta"><span>重掷 ' + used + ' / ' + limit + '</span><span>' + (locked ? '出场顺序已锁定' : '待锁定顺序') + '</span></div>' + progressBar(used, limit);
+  }
+
+  /* ---------- 对局卡：6 局比分 + 每轮明细 ---------- */
+
+  var matchDetails = {}, matchDetailPending = {};
+  var lastState = null;
+
+  function detailKey(match) { return match.id + ':' + (match.rounds || []).length; }
+  function hasFullRounds(match) { var rounds = match.rounds || []; return rounds.length > 0 && rounds[0].powerA != null; }
+  function loadMatchDetail(match, onDone) {
+    var key = detailKey(match);
+    if (matchDetails[key]) { if (onDone) onDone(matchDetails[key]); return; }
+    var pending = matchDetailPending[key];
+    if (!pending) {
+      pending = fetch('/api/game-state/matches/' + encodeURIComponent(match.id))
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) matchDetails[key] = d; return d; })
+        .catch(function () { return null; })
+        .finally(function () { delete matchDetailPending[key]; });
+      matchDetailPending[key] = pending;
+    }
+    if (onDone) pending.then(function (d) { if (d) onDone(d); });
+  }
+
+  /* 管理员/大屏视角的 game-state 自带完整 rounds，直接渲染；普通用户视角只有局号与胜负，点击展开时再拉详情。 */
+  function roundsSectionHtml(match, a, b) {
+    var rounds = match.rounds || [];
+    if (!rounds.length) return '';
+    if (hasFullRounds(match)) return roundsListHtml(match, a, b);
+    return '<div class="rounds-detail-slot" data-rounds-slot="' + esc(match.id) + '">'
+      + '<button type="button" class="btn btn-ghost rounds-toggle-btn" data-rounds-match="' + esc(match.id) + '">查看逐局战况（' + rounds.length + ' 局）</button></div>';
+  }
+
+  function scoreCells(match, a, b) {
+    var rounds = match.rounds || [];
+    return '<div class="score-cells">' + [1, 2, 3, 4, 5, 6].map(function (n) {
+      var entry = rounds.find(function (r) { return r.round === n; });
+      var current = match.phase === 'BATTLE' && match.round === n;
+      var cls = entry ? (entry.winner ? 'is-' + String(entry.winner).toLowerCase() : 'is-draw') : current ? 'is-current' : '';
+      return '<div class="score-cell ' + cls + '"><i>' + n + '</i><b>' + (entry ? (entry.winner ? esc((entry.winner === 'A' ? a : b).name) : '平') : current ? '…' : '') + '</b></div>';
+    }).join('') + '</div>';
+  }
+
+  function roundSideHtml(name, entry, side, won) {
+    var crit = entry['crit' + side];
+    return '<div class="round-side' + (won ? ' is-winner' : '') + '"><b>' + esc(name) + '</b><span>基础 ' + Number(entry['base' + side] || 0) + (crit ? ' <em>暴击 ×1.5</em>' : '') + '</span><span>猜中 ' + Number(entry['guessHits' + side] || 0) + ' · +' + Number(entry['guessBonus' + side] || 0) + '</span><strong>' + Number(entry['power' + side] || 0) + '</strong></div>';
+  }
+  function roundEntryHtml(entry, a, b) {
+    var w = entry.winner, winnerName = w ? (w === 'A' ? a : b).name : '';
+    return '<div class="round-entry"><div class="round-entry-head"><b>第 ' + Number(entry.round) + ' 局</b><span>' + (w ? esc(winnerName) + ' 胜' : '平局') + '</span></div><div class="round-entry-sides">' + roundSideHtml(a.name, entry, 'A', w === 'A') + roundSideHtml(b.name, entry, 'B', w === 'B') + '</div></div>';
+  }
+  function roundsListHtml(match, a, b) {
+    var rounds = match.rounds || [];
+    if (!rounds.length) return '';
+    return '<div class="rounds-list">' + rounds.map(function (entry) { return roundEntryHtml(entry, a, b); }).join('') + '</div>';
+  }
+
+  function rerollLine(state, match) {
+    var parts = [];
+    ['A', 'B'].forEach(function (side) {
+      var t = team(state, match[side === 'A' ? 'a' : 'b']);
+      (t.rerollLog || []).forEach(function (log) {
+        parts.push(esc(t.name) + '·' + esc(log.playerName || log.playerId) + ' ' + (log.from != null ? log.from : '?') + '→' + (log.to != null ? log.to : '?'));
+      });
+    });
+    return parts.length ? '<div class="feed-meta"><span>重掷：' + parts.map(esc).join('，') + '</span></div>' : '';
+  }
+
+  function matchCard(state, match) {
+    var a = team(state, match.a), b = team(state, match.b);
+    var stage = TournamentUI.stage(match);
+    var done = match.status === 'done';
+    var result = match.phase === 'RESULT';
+    var headerText = done ? '已完赛' : result ? '结果结算中' : match.phase === 'BATTLE' ? ('第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中')) : '等待开赛';
+    var winnerName = done && match.winner ? esc(team(state, match.winner).name) : '';
+    var tieLine = result || done ? '<div class="feed-meta"><span>判定依据：' + esc(match.tieBreak || '胜场') + '</span>' + (match.totalPointsA != null ? '<span>总点数 ' + match.totalPointsA + ' : ' + match.totalPointsB + '</span>' : '') + '</div>' : '';
+    var live = match.status === 'active';
+    return '<article class="live-feed ' + (done ? 'finished ' : '') + (result ? 'showing-result ' : '') + 'match-card">'
+      + '<header><span>' + esc(stage.label) + ' · ' + (live ? 'LIVE' : 'ARCHIVE') + '</span><b>' + esc(headerText) + '</b></header>'
+      + '<div class="feed-score"><div><strong>' + esc(a.name) + '</strong><em>' + Number(match.winsA || 0) + '</em></div><span>:</span><div><em>' + Number(match.winsB || 0) + '</em><strong>' + esc(b.name) + '</strong></div></div>'
+      + scoreCells(match, a, b)
+      + roundsSectionHtml(match, a, b)
+      + rerollLine(state, match)
+      + tieLine
+      + (done ? '<div class="feed-winner">胜者 · ' + winnerName + '</div>' : '')
+      + '</article>';
+  }
+
+  /* ---------- 顶层渲染 ---------- */
+
+  function renderStage(state, stageTitle) {
+    var teams = state.teams || [];
+    var label = STAGE_TITLES[state.stage] || stageTitle;
+    document.getElementById('tb-status').textContent = label[0];
+    var body;
+    if (state.stage === 'CAPTAIN_VOTE') body = teams.map(function (t, i) { return teamCard(t, i, voteBody(t)); }).join('');
+    else if (state.stage === 'SQUAD_FORM') body = teams.map(function (t, i) { return teamCard(t, i, squadBody(t)); }).join('');
+    else if (state.stage === 'ROLL') body = teams.map(function (t, i) { return teamCard(t, i, rollBody(t, state)); }).join('');
+    else if (state.stage === 'BLIND_BOX') body = teams.map(function (t, i) { return teamCard(t, i, blindBoxBody(t)); }).join('');
+    else if (state.stage === 'TACTICS') body = teams.map(function (t, i) { return teamCard(t, i, tacticsBody(t)); }).join('');
+    else body = '';
+    document.getElementById('spectator-root').innerHTML = wallHead(label[0], label[1], STAGE_TITLES[state.stage] ? '八支队伍按同一时间轴并行推进，超时由系统自动兜底。' : '') + (body ? '<section class="feed-grid">' + body + '</section>' : '');
+  }
+
+  function render(state) {
+    var root = document.getElementById('spectator-root');
+    if (!state || state.mode !== 'parallel') {
+      root.innerHTML = '<section class="spectator-empty"><b>等待管理员开始游戏</b><p>开赛后依次进入队长投票、分队、掷骰、盲盒、战术与六局对局。</p></section>';
+      document.getElementById('tb-status').textContent = '等待开赛';
+      return;
+    }
+    if (state.champion) {
+      document.getElementById('tb-status').textContent = '第 ' + state.day + ' 天冠军已产生';
+      var champion = team(state, state.champion);
+      root.innerHTML = wallHead('CHAMPION · DAY ' + state.day, '今日冠军 · ' + champion.name, '总决赛已结束，比赛结果已同步保存。');
+      return;
+    }
+    if (state.stage === 'BATTLE') {
+      var matches = TournamentUI.matches(state);
+      document.getElementById('tb-status').textContent = '六局对局 · ' + matches.filter(function (m) { return m.status === 'done'; }).length + ' 场已完赛';
+      root.innerHTML = wallHead('PHASE SIX · LIVE BRACKET', '六局对局 · 实时赛程', '当前对阵优先显示，下方保留半决赛与首轮历史。每队按 1~6 号小队逐局对垒，胜场多者晋级。')
+        + '<section class="feed-grid">' + matches.map(function (m) { return matchCard(state, m); }).join('') + '</section>';
+      return;
+    }
+    renderStage(state, null);
+  }
+
+  function load() {
+    fetch('/api/game-state').then(function (r) {
+      if (r.status === 401) { location.replace('/login'); throw new Error(); }
+      return r.status === 204 ? null : r.json();
+    }).then(function (d) { lastState = d && d.state; render(lastState); refreshExpanded(lastState); }).catch(function () {});
+  }
+
+  /* 逐局战况按需展开：事件委托，展开状态跨刷新保留 */
+  var expandedRounds = {};
+  document.addEventListener('click', function (event) {
+    var btn = event.target && event.target.closest ? event.target.closest('[data-rounds-match]') : null;
+    if (!btn) return;
+    var matchId = btn.getAttribute('data-rounds-match');
+    var slot = btn.closest('[data-rounds-slot]');
+    var match = lastState && lastState.matches ? lastState.matches[matchId] : null;
+    if (!slot || !match) return;
+    if (expandedRounds[matchId]) { expandedRounds[matchId] = false; render(lastState); return; }
+    expandedRounds[matchId] = true;
+    btn.disabled = true; btn.textContent = '战况加载中…';
+    loadMatchDetail(match, function (detail) {
+      if (!expandedRounds[matchId]) return;
+      var a = team(lastState, detail.a), b = team(lastState, detail.b);
+      slot.innerHTML = '<button type="button" class="btn btn-ghost rounds-toggle-btn" data-rounds-match="' + esc(matchId) + '">收起逐局战况</button>' + roundsListHtml(detail, a, b);
+    });
+  });
+
+  /* 展开过的场次在每次刷新后自动补拉最新明细 */
+  function refreshExpanded(state) {
+    if (!state || !state.matches) return;
+    Object.keys(expandedRounds).forEach(function (matchId) {
+      if (!expandedRounds[matchId]) return;
+      var match = state.matches[matchId];
+      if (!match || hasFullRounds(match)) return;
+      var slot = document.querySelector('[data-rounds-slot="' + matchId + '"]');
+      if (!slot) return;
+      loadMatchDetail(match, function (detail) {
+        if (!expandedRounds[matchId]) return;
+        var a = team(state, detail.a), b = team(state, detail.b);
+        slot.innerHTML = '<button type="button" class="btn btn-ghost rounds-toggle-btn" data-rounds-match="' + esc(matchId) + '">收起逐局战况</button>' + roundsListHtml(detail, a, b);
+      });
+    });
+  }
+
+  document.getElementById('btn-logout').onclick = function () {
+    fetch('/api/auth/logout', { method: 'POST' }).finally(function () { location.replace('/login'); });
+  };
+
+  /* SSE 驱动刷新 + 15 秒兜底慢轮询；页面隐藏时暂停，恢复可见立即补拉 */
+  var refreshTimer = null;
+  function queueLoad() {
+    if (document.hidden || refreshTimer) return;
+    refreshTimer = setTimeout(function () { refreshTimer = null; load(); }, 300);
+  }
+  function connectEvents() {
+    var source = new EventSource('/api/lobby/events');
+    source.onmessage = function (e) {
+      var m;
+      try { m = JSON.parse(e.data); } catch (err) { return; }
+      if (m.type === 'game' || m.type === 'lobby') queueLoad();
+    };
+  }
+  setInterval(function () { if (!document.hidden) load(); }, 15000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) load(); });
+  load();
+  connectEvents();
 })();

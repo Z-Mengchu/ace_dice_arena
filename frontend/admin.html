@@ -9,7 +9,7 @@
     <div class="next-day-dialog-copy"><small>READY ALL PLAYERS</small><h2>如何处理未准备玩家？</h2><p>两种方式都会将已分组玩家设为准备，请根据现场到场情况选择。</p></div>
     <div class="next-day-dialog-actions"><button id="ready-all-afk" class="btn btn-primary" type="button">设为准备并标记挂机</button><button id="ready-all-only" class="btn btn-subtle" type="button">仅设为准备</button><button id="ready-all-cancel" class="btn btn-ghost" type="button">取消</button></div>
   </dialog>
-  <section class="hub-card control-deck"><p class="hub-eyebrow">GAME CONTROL</p><h1>八队就位<br><em>一键开擂</em></h1><div id="phase-lights" class="phase-lights"></div><div id="ready-summary"></div><button id="ready-all" class="btn btn-subtle" title="可选择是否将未准备玩家标记为挂机托管">一键全员准备</button><button id="start-game" class="btn btn-primary btn-xl">开始第 1 天比赛</button><button id="reset-ready" class="btn btn-ghost">进入下一天准备</button><button id="reset-tournament" class="btn btn-danger-quiet">重置两天赛事与战况</button><p id="admin-error" class="login-error hidden"></p></section>
+  <section class="hub-card control-deck"><p class="hub-eyebrow">GAME CONTROL</p><h1>八队就位<br><em>一键开擂</em></h1><div id="phase-lights" class="phase-lights"></div><div id="ready-summary"></div><button id="ready-all" class="btn btn-subtle" title="可选择是否将未准备玩家标记为挂机托管">一键全员准备</button><button id="start-game" class="btn btn-primary btn-xl">开始第 1 天比赛</button><button id="reset-ready" class="btn btn-ghost">进入下一天准备</button><button id="start-overtime" class="btn btn-primary hidden">开始加赛总决赛</button><button id="reset-tournament" class="btn btn-danger-quiet">重置两天赛事与战况</button><p id="admin-error" class="login-error hidden"></p></section>
   <div class="admin-main-stack">
     <section id="test-mode-deck" class="hub-card test-mode-deck hidden">
       <div class="test-mode-copy">
@@ -58,12 +58,12 @@
     </section>
     <section class="hub-card two-day-deck">
       <div class="hub-section-title"><div><small>TWO-DAY RECORD</small><h2>两日战况带</h2></div><span id="two-day-progress">0 / 2 天</span></div>
-      <p class="two-day-rule">每日可重新载入业绩并重新分组。单场由一轮总攻击直接定胜负；历史只有“重置两天赛事与战况”才会清除。</p>
+      <p class="two-day-rule">每日可重新载入业绩并重新分组。单场由 6 局胜场制定胜负（平局依次比总点数、增长系数、队伍 ID）；历史只有“重置两天赛事与战况”才会清除。</p>
       <div id="two-day-records" class="two-day-records"></div>
     </section>
     <section class="hub-card game-flow-monitor">
       <div class="hub-section-title"><div><small>LIVE PROCESS MONITOR</small><h2>八队游戏流程总览</h2></div><span id="flow-monitor-stage">等待开赛</span></div>
-      <p class="game-flow-note">实时展示角色计票、积累骰点数、预言与阵容，以及攻擂骰子和攻击力。</p>
+      <p class="game-flow-note">实时展示队长投票、6×5 分队、掷骰、盲盒、重掷与六局对局。</p>
       <div id="team-flow-grid" class="team-flow-grid"></div>
     </section>
     <section><div class="hub-section-title"><div><small id="admin-stage-kicker">4 个对战组 · 每组 60 人</small><h2 id="admin-stage-title">分组与观战</h2></div></div><div id="match-grid" class="match-watch-grid"></div></section>

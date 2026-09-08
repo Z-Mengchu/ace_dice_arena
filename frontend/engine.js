@@ -1,7 +1,14 @@
 /**
- * 「王牌攻守擂·骰子大亨」纯逻辑引擎
+ * 「骰子擂台·田忌赛马」纯逻辑引擎（新版规则）
  * 不依赖任何 DOM / 浏览器 API，可在 node 中直接 require
  * UMD 风格：浏览器挂到 window.GameEngine，node 下 module.exports = GameEngine
+ *
+ * 与后端 ParallelTournamentService 的数值规则保持一致：
+ *  - 个人点数 = diceFinal + blindBox
+ *  - 小队战力 = round2(base × (同步暴击 ? 1.5 : 1)) + guessBonus
+ *  - guessBonus = min(命中人次 × 0.4, 10)
+ *  - 同步暴击 = 小队 5 人掷骰时刻首尾差 ≤ 500ms 且无系统代掷
+ *  - 比赛胜负链 = 6 局胜场 → 30 人总点数 → 增长系数 → 队伍 ID 字典序
  */
 (function (root, factory) {
   const GameEngine = factory();
@@ -15,18 +22,20 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  /** 默认配置 */
+  /** 默认配置：与服务端 ParallelTournamentService 常量一一对应 */
   const DEFAULT_CONFIG = {
-    gmvPerDice: 100000,     // 积累期：每多少 GMV 兑换 1 次掷骰机会
-    playersPerTeam: 30,     // 每队队员数
-    backendCount: 5,        // 每队后端人数（p26-p30）
-    matchWinRounds: 1,      // 每两队只进行一轮攻擂，一轮直接定胜负
-    syncWindowMs: 500,      // 同步点击首尾时差阈值（毫秒）
-    syncMultiplier: 1.5,    // 同步加成倍率
-    leopardMultiplier: 3,   // 豹子（5 骰全同）倍率
-    prophetBonus: 2,        // 军师猜中对方全部 5 名出战队员的加分（乘法之后再加）
-    fatigueMultiplier: 1,   // 新流程不在攻擂战中使用 GMV 疲劳惩罚
-    days: 2                 // 比赛天数
+    gmvPerReroll: 100000,     // 每 10 万元 GMV 兑换 1 次重掷配额
+    playersPerTeam: 30,       // 每队队员数
+    squadsPerTeam: 6,         // 每队小队数（1~6 号出场位）
+    squadSize: 5,             // 每小队人数
+    rerollLimitPerMatch: 5,   // 每场重掷次数上限
+    guessBonusPerHit: 0.4,    // 猜阵每命中一人次的加成
+    guessBonusCap: 10,        // 猜阵单局加成上限
+    syncWindowMs: 500,        // 同步暴击首尾时差阈值（毫秒）
+    syncCritMultiplier: 1.5,  // 同步暴击倍率
+    days: 2,                  // 比赛天数
+    blindBoxValues: [5, 4, 3, 2, 1, -1, -2],           // 盲盒点数档（不含 0）
+    blindBoxWeights: [1, 3, 8, 20, 28, 22, 18]         // 对应概率（百分比）
   };
 
   /** 8 个战区 mock 数据（gmv / growth 均为 day1 / day2 两天，growth 为增长率百分数值） */
@@ -43,27 +52,20 @@
 
   /**
    * 生成单支队伍的 30 名队员
-   * id 格式 t{n}-p{01..30}；最后 5 人为后端(back)
-   * name 形如 `雷霆-01`
+   * id 格式 t{n}-p{01..30}；name 形如 `雷霆-01`
    */
   function buildPlayers(team) {
     const players = [];
-    const frontCount = DEFAULT_CONFIG.playersPerTeam - DEFAULT_CONFIG.backendCount; // 25
     for (let i = 1; i <= DEFAULT_CONFIG.playersPerTeam; i++) {
       const num = String(i).padStart(2, '0');
-      players.push({
-        id: team.id + '-p' + num,
-        name: team.shortName + '-' + num,
-        role: i > frontCount ? 'back' : 'front'
-      });
+      players.push({ id: team.id + '-p' + num, name: team.shortName + '-' + num });
     }
     return players;
   }
 
   /**
-   * 基于 MOCK_TEAMS 生成完整队伍数组（含 players、队长/副队长字段）
+   * 基于 MOCK_TEAMS 生成完整队伍数组（含 30 名队员）
    * 每次调用返回全新对象（深拷贝），多次调用互不影响
-   * 队长 = p01，副队长 = p18
    */
   function createTeams() {
     return MOCK_TEAMS.map(function (t) {
@@ -73,8 +75,6 @@
         shortName: t.shortName,
         gmv: { day1: t.gmv.day1, day2: t.gmv.day2 },
         growth: { day1: t.growth.day1, day2: t.growth.day2 },
-        captainId: t.id + '-p01',
-        viceCaptainId: t.id + '-p18',
         players: buildPlayers(t)
       };
     });
@@ -85,58 +85,87 @@
     return Math.floor(rng() * 6) + 1;
   }
 
-  /** 掷 n 个骰子，返回长度 n 的数组（默认 5 个） */
-  function rollDiceSet(n = 5, rng = Math.random) {
-    const dice = [];
-    for (let i = 0; i < n; i++) dice.push(rollDie(rng));
-    return dice;
+  /** 开盲盒：按权重抽取一个点数档（+5/+4/+3/+2/+1/-1/-2，不含 0） */
+  function drawBlindBox(rng = Math.random, config = DEFAULT_CONFIG) {
+    const values = config.blindBoxValues;
+    const weights = config.blindBoxWeights;
+    const total = weights.reduce(function (a, b) { return a + b; }, 0);
+    let r = rng() * total;
+    for (let i = 0; i < values.length; i++) {
+      if (r < weights[i]) return values[i];
+      r -= weights[i];
+    }
+    return values[values.length - 1];
   }
 
-  /** 是否豹子（全部骰子点数相同） */
-  function isLeopard(dice) {
-    if (!Array.isArray(dice) || dice.length === 0) return false;
-    return dice.every(function (d) { return d === dice[0]; });
+  /** 四舍五入保留两位小数：与服务端 round2 一致 */
+  function round2(value) {
+    return Math.round(value * 100) / 100;
   }
 
-  /**
-   * 同步倍率：首尾时差 ≤ syncWindowMs → syncMultiplier，否则 1
-   * spreadMs 传入 null / undefined 表示无同步数据，按 1 计
-   */
-  function syncMultiplier(spreadMs, config = DEFAULT_CONFIG) {
-    if (spreadMs === null || spreadMs === undefined) return 1;
-    return spreadMs <= config.syncWindowMs ? config.syncMultiplier : 1;
+  /** 个人点数 = 最终骰子值 + 盲盒加减 */
+  function personalPoints(player) {
+    return (player && (player.diceFinal || 0) || 0) + (player && (player.blindBox || 0) || 0);
   }
 
-  /**
-   * 计算一次攻击
-   * total = (diceSum + growthCoef) × syncMult × leopardMult × fatigueMult + prophetBonus
-   */
-  function computeAttack({ dice, growthCoef, spreadMs = null, prophetHit = false, fatigued = false }, config = DEFAULT_CONFIG) {
-    const diceSum = dice.reduce(function (a, b) { return a + b; }, 0);
-    const syncMult = syncMultiplier(spreadMs, config);
-    const leopard = isLeopard(dice);
-    const leopardMult = leopard ? config.leopardMultiplier : 1;
-    const fatigueMult = fatigued ? config.fatigueMultiplier : 1;
-    const prophetBonus = prophetHit ? config.prophetBonus : 0;
-    const total = (diceSum + growthCoef) * syncMult * leopardMult * fatigueMult + prophetBonus;
-    return { diceSum, growthCoef, syncMult, leopardMult, fatigueMult, prophetBonus, total, isLeopard: leopard };
+  /** 猜阵加成 = min(命中人次 × 0.4, 10) */
+  function guessBonus(hits, config = DEFAULT_CONFIG) {
+    return round2(Math.min(hits * config.guessBonusPerHit, config.guessBonusCap));
   }
 
   /**
-   * 单局胜负判定：仅一方豹子 → 该方直接胜；
-   * 双方豹子或都无豹子 → total 高者胜；total 相等 → 'tie'
+   * 同步暴击判定：小队 5 人掷骰时刻首尾差 ≤ syncWindowMs；
+   * 含系统代掷队员的小队必无暴击（显式判定，不依赖时刻差）。
    */
-  function decideRound(attackA, attackB) {
-    if (attackA.isLeopard && !attackB.isLeopard) return 'A';
-    if (attackB.isLeopard && !attackA.isLeopard) return 'B';
-    if (attackA.total > attackB.total) return 'A';
-    if (attackB.total > attackA.total) return 'B';
-    return 'tie';
+  function syncCrit(timestamps, anyAutoRolled = false, config = DEFAULT_CONFIG) {
+    if (anyAutoRolled) return false;
+    if (!Array.isArray(timestamps) || timestamps.length < config.squadSize) return false;
+    const spread = computeSpread(timestamps).spreadMs;
+    return spread !== null && spread <= config.syncWindowMs;
   }
 
-  /** 掷骰配额：floor(gmv / gmvPerDice)，每天独立计算 */
-  function quotaFor(gmv, config = DEFAULT_CONFIG) {
-    return Math.floor(gmv / config.gmvPerDice);
+  /**
+   * 小队战力 = round2(base × (同步暴击 ? 1.5 : 1)) + guessBonus
+   * base 为该小队 5 人个人点数之和。
+   */
+  function squadPower(base, crit, hits, config = DEFAULT_CONFIG) {
+    return round2(base * (crit ? config.syncCritMultiplier : 1)) + guessBonus(hits, config);
+  }
+
+  /** 重掷配额 = floor(gmv / 100000) */
+  function rerollQuotaFor(gmv, config = DEFAULT_CONFIG) {
+    return Math.floor(gmv / config.gmvPerReroll);
+  }
+
+  /**
+   * 平局链比较：返回正数表示 A 方胜。
+   * 30 人总点数多者胜 → 增长系数高者胜 → 队伍 ID 字典序小者胜。
+   */
+  function compareMatchTieBreak(pointsA, pointsB, coefficientA, coefficientB, idA, idB) {
+    if (pointsA !== pointsB) return pointsA - pointsB;
+    if (coefficientA !== coefficientB) return coefficientA - coefficientB;
+    if (idA === idB) return 0;
+    return idA < idB ? 1 : -1;
+  }
+
+  /**
+   * 比赛胜负链：6 局胜场多者胜 → 30 人总点数 → 增长系数 → 队伍 ID。
+   * 返回 { winnerSide, tieBreak }。
+   */
+  function decideMatchWinner({ winsA, winsB, totalPointsA, totalPointsB, coefficientA, coefficientB, idA, idB }) {
+    if (winsA !== winsB) return { winnerSide: winsA > winsB ? 'A' : 'B', tieBreak: '胜场' };
+    const comparison = compareMatchTieBreak(totalPointsA, totalPointsB, coefficientA, coefficientB, idA, idB);
+    let tieBreak = '队伍ID';
+    if (totalPointsA !== totalPointsB) tieBreak = '总点数';
+    else if (coefficientA !== coefficientB) tieBreak = '增长系数';
+    return { winnerSide: comparison >= 0 ? 'A' : 'B', tieBreak };
+  }
+
+  /** 单局胜负：战力高者胜，相等记平局（winner 为 'A' / 'B' / null） */
+  function decideRoundWinner(powerA, powerB) {
+    if (powerA > powerB) return 'A';
+    if (powerB > powerA) return 'B';
+    return null;
   }
 
   /**
@@ -144,7 +173,7 @@
    * 返回 [[id,id],[id,id],[id,id],[id,id]]，不修改入参数组
    */
   function drawBracket(teamIds, rng = Math.random) {
-    const shuffled = teamIds.slice(); // 拷贝，避免修改入参
+    const shuffled = teamIds.slice();
     for (let i = shuffled.length - 1; i > 0; i--) {
       const j = Math.floor(rng() * (i + 1));
       const tmp = shuffled[i];
@@ -158,35 +187,147 @@
     return pairs;
   }
 
-  /** 军师猜阵容：两个 5 人 id 数组集合相等即中，忽略顺序 */
-  function checkProphetGuess(guessIds, lineupIds) {
-    if (!Array.isArray(guessIds) || !Array.isArray(lineupIds)) return false;
-    const guessSet = new Set(guessIds);
-    const lineSet = new Set(lineupIds);
-    if (guessSet.size !== lineSet.size) return false;
-    for (const id of guessSet) {
-      if (!lineSet.has(id)) return false;
+  /** 按名册顺序把 30 名队员均分为 6 支 5 人小队（有序即 1~6 号出场位） */
+  function buildSquads(players, config = DEFAULT_CONFIG) {
+    const squads = [];
+    for (let s = 0; s < config.squadsPerTeam; s++) {
+      const squad = [];
+      for (let i = s * config.squadSize; i < s * config.squadSize + config.squadSize; i++) {
+        squad.push(players[i]);
+      }
+      squads.push(squad);
     }
-    return true;
+    return squads;
   }
 
   /**
-   * 总冠军排名：先比两天合计胜场 totalWins，并列比两天增长率之和 growthSum，
-   * 再并列比两天 GMV 之和保证确定性；rank 从 1 开始，无并列名次
-   * 返回新数组，每项在原字段上追加 totalWins、growthSum、rank
+   * 单场完整模拟（确定性可复现，rng 可注入）：
+   * 掷骰 + 盲盒 → 分 6×5 小队 → 6 局逐局结算 → 平局链定胜负。
+   * opts: { rng, day, guessHits, rerolls, rollTs }
+   *  - guessHits: [{ A, B }] × 6，逐局注入猜阵命中人次（默认 0）
+   *  - rerolls: { [teamId]: count } 重掷次数（默认 0）
+   *  - rollTs: (teamId, squadIndex, memberIndex) => ms（默认队内 240ms 内 → 触发暴击）
+   * 返回与后端 rounds[] / match 结构对齐的结果对象。
+   */
+  function simulateMatch(teamA, teamB, opts = {}) {
+    const config = Object.assign({}, DEFAULT_CONFIG, opts.config || {});
+    const rng = opts.rng || Math.random;
+    const day = opts.day || 1;
+    const coefficientOf = function (team) {
+      if (opts.coefficients && opts.coefficients[team.id] != null) return opts.coefficients[team.id];
+      return 1 + (team.growth ? (team.growth['day' + day] || 0) : 0) / 100;
+    };
+    const prepare = function (team) {
+      const players = team.players.map(function (p) {
+        const dice = rollDie(rng);
+        return { id: p.id, name: p.name, dice: dice, diceFinal: dice, blindBox: drawBlindBox(rng, config), rollTs: null, autoRolled: false };
+      });
+      const squads = buildSquads(players, config);
+      squads.forEach(function (squad, sIdx) {
+        squad.forEach(function (p, mIdx) {
+          p.rollTs = opts.rollTs ? opts.rollTs(team.id, sIdx, mIdx) : 1000 + sIdx * 2000 + mIdx * 60;
+        });
+      });
+      const rerollCount = Math.min((opts.rerolls && opts.rerolls[team.id]) || 0, config.rerollLimitPerMatch);
+      for (let i = 0; i < rerollCount; i++) {
+        const target = squads[0][i % squads[0].length];
+        target.diceFinal = rollDie(rng);
+        target.rerolled = true;
+      }
+      return { id: team.id, name: team.name, players: players, squads: squads, coefficient: coefficientOf(team) };
+    };
+    const A = prepare(teamA), B = prepare(teamB);
+    const rounds = [];
+    let winsA = 0, winsB = 0;
+    for (let round = 1; round <= config.squadsPerTeam; round++) {
+      const squadA = A.squads[round - 1], squadB = B.squads[round - 1];
+      const baseA = squadA.reduce(function (sum, p) { return sum + personalPoints(p); }, 0);
+      const baseB = squadB.reduce(function (sum, p) { return sum + personalPoints(p); }, 0);
+      const critA = syncCrit(squadA.map(function (p) { return p.rollTs; }), squadA.some(function (p) { return p.autoRolled; }), config);
+      const critB = syncCrit(squadB.map(function (p) { return p.rollTs; }), squadB.some(function (p) { return p.autoRolled; }), config);
+      const hint = opts.guessHits && opts.guessHits[round - 1] || {};
+      const hitsA = hint.A || 0, hitsB = hint.B || 0;
+      const powerA = squadPower(baseA, critA, hitsA, config);
+      const powerB = squadPower(baseB, critB, hitsB, config);
+      const winner = decideRoundWinner(powerA, powerB);
+      if (winner === 'A') winsA++;
+      else if (winner === 'B') winsB++;
+      rounds.push({
+        round: round,
+        baseA: baseA, critA: critA, guessHitsA: hitsA, guessBonusA: guessBonus(hitsA, config), powerA: powerA,
+        baseB: baseB, critB: critB, guessHitsB: hitsB, guessBonusB: guessBonus(hitsB, config), powerB: powerB,
+        winner: winner
+      });
+    }
+    const totalPointsA = A.players.reduce(function (sum, p) { return sum + personalPoints(p); }, 0);
+    const totalPointsB = B.players.reduce(function (sum, p) { return sum + personalPoints(p); }, 0);
+    const decided = decideMatchWinner({
+      winsA: winsA, winsB: winsB,
+      totalPointsA: totalPointsA, totalPointsB: totalPointsB,
+      coefficientA: A.coefficient, coefficientB: B.coefficient,
+      idA: teamA.id, idB: teamB.id
+    });
+    return {
+      idA: teamA.id, idB: teamB.id,
+      rounds: rounds, winsA: winsA, winsB: winsB,
+      totalPointsA: totalPointsA, totalPointsB: totalPointsB,
+      coefficientA: A.coefficient, coefficientB: B.coefficient,
+      winnerSide: decided.winnerSide,
+      winner: decided.winnerSide === 'A' ? teamA.id : teamB.id,
+      tieBreak: decided.tieBreak
+    };
+  }
+
+  /**
+   * 8 队单败淘汰模拟：抽签 → 1/4 决赛 ×4 → 半决赛 ×2 → 决赛，
+   * 每场用 simulateMatch 结算，返回按轮次组织的对阵与冠军。
+   * teams 为含 .id 与 .players 的队伍对象数组（createTeams() 的产物）。
+   */
+  function simulateBracket(teams, opts = {}) {
+    const rng = opts.rng || Math.random;
+    const byId = {};
+    teams.forEach(function (team) { byId[team.id] = team; });
+    const pairs = drawBracket(teams.map(function (team) { return team.id; }), rng);
+    const play = function (aId, bId) {
+      return simulateMatch(byId[aId], byId[bId], Object.assign({}, opts, { rng: rng }));
+    };
+    const quarterfinals = pairs.map(function (pair) {
+      const result = play(pair[0], pair[1]);
+      return { a: pair[0], b: pair[1], winner: result.winner, result: result };
+    });
+    const semifinalIds = quarterfinals.map(function (q) { return q.winner; });
+    const semifinals = [
+      play(semifinalIds[0], semifinalIds[1]),
+      play(semifinalIds[2], semifinalIds[3])
+    ].map(function (result) {
+      return { a: result.idA, b: result.idB, winner: result.winner, result: result };
+    });
+    const final = play(semifinals[0].winner, semifinals[1].winner);
+    return {
+      quarterfinals: quarterfinals,
+      semifinals: semifinals,
+      final: final,
+      champion: final.winner
+    };
+  }
+
+  /**
+   * 总冠军排名：先比两天合计胜场 totalWins，并列比两天 GMV 之和 gmvSum，
+   * 再并列按队伍 ID 字典序保证确定性；rank 从 1 开始，无并列名次
    */
   function standings(rows, config = DEFAULT_CONFIG) {
     return rows
       .map(function (r) {
         return Object.assign({}, r, {
           totalWins: r.winsDay1 + r.winsDay2,
-          growthSum: r.growthDay1 + r.growthDay2
+          gmvSum: r.gmvDay1 + r.gmvDay2
         });
       })
       .sort(function (a, b) {
         if (b.totalWins !== a.totalWins) return b.totalWins - a.totalWins;
-        if (b.growthSum !== a.growthSum) return b.growthSum - a.growthSum;
-        return (b.gmvDay1 + b.gmvDay2) - (a.gmvDay1 + a.gmvDay2);
+        if (b.gmvSum !== a.gmvSum) return b.gmvSum - a.gmvSum;
+        if (a.id === b.id) return 0;
+        return a.id < b.id ? -1 : 1;
       })
       .map(function (r, i) {
         return Object.assign({}, r, { rank: i + 1 });
@@ -200,8 +341,7 @@
    * samples: [{c0, s, c1}, ...]（c0=客户端发送时刻本地时间，s=服务器收到时回复的服务器时间，
    * c1=客户端收到回复时刻本地时间，均为毫秒）
    * 每个样本：offset_i = s - (c0 + c1) / 2，rtt_i = c1 - c0
-   * 取 rtt 最小的样本（往返越短估算越准），返回 { offset, rtt }
-   * samples 为空返回 { offset: 0, rtt: null }
+   * 取 rtt 最小的样本，返回 { offset, rtt }
    */
   function estimateClockOffset(samples) {
     if (!Array.isArray(samples) || samples.length === 0) {
@@ -236,9 +376,8 @@
   }
 
   /**
-   * 同步判定：5 名出战队员校准后的点击时刻是否构成有效同步
-   * earlyCount = 早于 goTs 的时间戳个数（抢跑数）；goTs 为 null 时不判抢跑，恒 0
-   * syncOk 需同时满足：timestamps.length >= 5、spreadMs !== null 且 <= config.syncWindowMs、earlyCount === 0
+   * 联机掷骰同步判定（保留，兼容旧 server.js）：
+   * 5 名出战队员校准后的点击时刻是否构成有效同步。
    */
   function checkSync(timestamps, goTs = null, config = DEFAULT_CONFIG) {
     if (!Array.isArray(timestamps)) timestamps = [];
@@ -258,14 +397,20 @@
     MOCK_TEAMS,
     createTeams,
     rollDie,
-    rollDiceSet,
-    isLeopard,
-    syncMultiplier,
-    computeAttack,
-    decideRound,
-    quotaFor,
+    drawBlindBox,
+    round2,
+    personalPoints,
+    guessBonus,
+    syncCrit,
+    squadPower,
+    rerollQuotaFor,
+    compareMatchTieBreak,
+    decideMatchWinner,
+    decideRoundWinner,
     drawBracket,
-    checkProphetGuess,
+    buildSquads,
+    simulateMatch,
+    simulateBracket,
     standings,
     estimateClockOffset,
     normalizeTime,

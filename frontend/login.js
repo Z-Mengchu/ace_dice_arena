@@ -11,7 +11,7 @@
   function setMode(value) {
     registering = value;
     document.getElementById('login-title').textContent = value ? '创建入场账户' : '登录擂台';
-    document.getElementById('login-hint').textContent = value ? '普通账户进入队伍大厅，参与本队限时投票、预言和掷骰。' : '系统将按管理员或玩家身份进入对应工作区。';
+    document.getElementById('login-hint').textContent = value ? '普通账户进入队伍大厅，参与本队队长投票、掷骰、盲盒与六局对局。' : '系统将按管理员或玩家身份进入对应工作区。';
     document.getElementById('display-name-row').classList.toggle('hidden', !value);
     document.getElementById('department-row').classList.toggle('hidden', !value);
     document.getElementById('login-password').autocomplete = value ? 'new-password' : 'current-password';
