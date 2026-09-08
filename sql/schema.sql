@@ -1,4 +1,4 @@
--- 王牌攻守擂 · 骰子大亨
+-- 骰子擂台 · 田忌赛马
 -- MySQL 8.0+ 初始化脚本
 -- 执行示例：mysql -u root -p < sql/schema.sql
 

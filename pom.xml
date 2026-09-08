@@ -15,7 +15,7 @@
     <artifactId>ace-dice-arena</artifactId>
     <version>1.0.0</version>
     <name>Ace Dice Arena</name>
-    <description>王牌攻守擂在线游戏</description>
+    <description>骰子擂台 · 田忌赛马</description>
 
     <properties>
         <java.version>21</java.version>
