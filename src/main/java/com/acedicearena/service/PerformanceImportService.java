@@ -180,20 +180,22 @@ public class PerformanceImportService {
         List<UserAccount> all = players.stream().filter(user -> !testAccounts.excludes(user)).toList();
         List<UserAccount> frontEnds = all.stream().filter(UserAccount::isFrontEnd).collect(Collectors.toCollection(ArrayList::new));
         List<UserAccount> backEnds = all.stream().filter(u -> !u.isFrontEnd()).collect(Collectors.toCollection(ArrayList::new));
+        // 人数超过席位时按用户 id 升序优先参赛，id 靠后的多余人员留在观战席
         int maxFrontEnds = TEAM_COUNT * (TEAM_SIZE - MIN_BACK_END);
-        if (frontEnds.size() > maxFrontEnds)
-            throw new IllegalStateException("前端人员超过 " + maxFrontEnds + " 人，无法保证每队至少 "
-                    + MIN_BACK_END + " 名后端");
-        int requiredBackEnds = TEAM_COUNT * TEAM_SIZE - frontEnds.size();
+        frontEnds.sort(Comparator.comparing(UserAccount::getId));
+        List<UserAccount> selectedFrontEnds = new ArrayList<>(frontEnds.subList(0, Math.min(frontEnds.size(), maxFrontEnds)));
+        int requiredBackEnds = TEAM_COUNT * TEAM_SIZE - selectedFrontEnds.size();
         if (backEnds.size() < requiredBackEnds)
             throw new IllegalStateException("后端人员不足：当前 " + backEnds.size() + " 人，至少需要 " + requiredBackEnds + " 人");
+        backEnds.sort(Comparator.comparing(UserAccount::getId));
+        List<UserAccount> selectedBackEnds = new ArrayList<>(backEnds.subList(0, requiredBackEnds));
 
-        Collections.shuffle(frontEnds);
-        frontEnds.sort(Comparator.comparing(UserAccount::getGmv).reversed());
+        Collections.shuffle(selectedFrontEnds);
+        selectedFrontEnds.sort(Comparator.comparing(UserAccount::getGmv).reversed());
         List<TeamBucket> teams = new ArrayList<>();
         for (String teamId : LobbyService.TEAM_IDS) teams.add(new TeamBucket(teamId));
         Random random = new Random();
-        for (UserAccount user : frontEnds) {
+        for (UserAccount user : selectedFrontEnds) {
             List<TeamBucket> available = teams.stream().filter(t -> t.frontCount() < TEAM_SIZE - MIN_BACK_END)
                     .collect(Collectors.toCollection(ArrayList::new));
             Collections.shuffle(available, random);
@@ -202,17 +204,17 @@ public class PerformanceImportService {
             target.addFront(user);
         }
 
-        Collections.shuffle(backEnds, random);
+        Collections.shuffle(selectedBackEnds, random);
         int backendIndex = 0;
         for (TeamBucket team : teams) {
-            while (team.size() < TEAM_SIZE) team.addBack(backEnds.get(backendIndex++));
+            while (team.size() < TEAM_SIZE) team.addBack(selectedBackEnds.get(backendIndex++));
         }
         gameUsers.forEach(u -> u.assignTeam(null));
         teams.forEach(team -> team.members.forEach(u -> u.assignTeam(team.id)));
         users.saveAll(gameUsers);
         control().changePhase("GROUPED");
         events.stateChanged();
-        return new GroupingResult(teams.stream().map(TeamBucket::view).toList(), frontEnds.size(), requiredBackEnds);
+        return new GroupingResult(teams.stream().map(TeamBucket::view).toList(), selectedFrontEnds.size(), requiredBackEnds);
     }
 
     private ImportResult result(List<PerformanceRecord> imported, List<String> unmatched, List<String> ambiguous) {
@@ -224,13 +226,11 @@ public class PerformanceImportService {
         int playerCount = (int) users.findAll().stream()
                 .filter(this::isPlayer).filter(user -> !testAccounts.excludes(user)).count();
         int backendCount = playerCount - matchedUsers;
-        int requiredBackends = TEAM_COUNT * TEAM_SIZE - matchedUsers;
-        String issue = null;
         int maxFrontEnds = TEAM_COUNT * (TEAM_SIZE - MIN_BACK_END);
         int participantCount = TEAM_COUNT * TEAM_SIZE;
-        if (matchedUsers > maxFrontEnds)
-            issue = "前端超过 " + maxFrontEnds + " 人，无法保证每队至少 " + MIN_BACK_END + " 名后端";
-        else if (backendCount < requiredBackends)
+        int requiredBackends = participantCount - Math.min(matchedUsers, maxFrontEnds);
+        String issue = null;
+        if (backendCount < requiredBackends)
             issue = "用户总数不足 " + participantCount + " 人，还缺 " + (requiredBackends - backendCount) + " 名后端";
         boolean clean = !imported.isEmpty() && matchedRows == imported.size() && issue == null;
         return new ImportResult(imported.size(), matchedUsers, total, unmatched, ambiguous, issue, clean);

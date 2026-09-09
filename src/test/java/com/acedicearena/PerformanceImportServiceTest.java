@@ -117,4 +117,45 @@ class PerformanceImportServiceTest {
         assertThat(users.findByUsername("ignored_test_user").orElseThrow().getTeamId()).isNull();
         assertThat(users.findByUsername("missing_department_user").orElseThrow().getTeamId()).isNull();
     }
+
+    @Test
+    void overflowUsersWithLargerIdsBecomeSpectators() throws Exception {
+        records.deleteAll();
+        users.deleteAll(users.findAll().stream().filter(u -> "USER".equals(u.getRole())).toList());
+        List<UserAccount> accounts = new ArrayList<>();
+        for (int i = 1; i <= LobbyService.PARTICIPANT_COUNT + 10; i++) {
+            String name = i <= 80 ? "前端" + i : "后端" + i;
+            accounts.add(new UserAccount("overflow_user_" + i, name, "测试部门", "USER", "hash", "00"));
+        }
+        users.saveAll(accounts);
+
+        byte[] importFile;
+        try (var workbook = WorkbookFactory.create(new ByteArrayInputStream(performance.template()));
+             var output = new ByteArrayOutputStream()) {
+            var sheet = workbook.getSheetAt(0);
+            for (int i = 1; i <= 80; i++) {
+                var row = sheet.createRow(i);
+                row.createCell(0).setCellValue(i);
+                row.createCell(1).setCellValue("测试部门");
+                row.createCell(2).setCellValue("小组" + i);
+                row.createCell(3).setCellValue("前端" + i);
+                row.createCell(4).setCellValue(10 + i);
+                row.createCell(5).setCellValue(20 + i);
+                row.createCell(6).setCellValue(10_000 + i);
+                row.createCell(7).setCellValue(9_000 + i);
+            }
+            workbook.write(output);
+            importFile = output.toByteArray();
+        }
+        performance.importFile(new MockMultipartFile("file", "gmv.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", importFile));
+
+        var grouped = performance.randomGroup();
+        assertThat(grouped.teams()).hasSize(8)
+                .allSatisfy(team -> assertThat(team.totalCount()).isEqualTo(LobbyService.TEAM_SIZE));
+        for (int i = 1; i <= LobbyService.PARTICIPANT_COUNT; i++)
+            assertThat(users.findByUsername("overflow_user_" + i).orElseThrow().getTeamId()).isNotNull();
+        for (int i = LobbyService.PARTICIPANT_COUNT + 1; i <= LobbyService.PARTICIPANT_COUNT + 10; i++)
+            assertThat(users.findByUsername("overflow_user_" + i).orElseThrow().getTeamId()).isNull();
+    }
 }
