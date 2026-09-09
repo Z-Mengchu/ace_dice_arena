@@ -1,7 +1,7 @@
 -- 已有数据库升级：盲盒开盒热点修复（两张表一次执行）。
 -- 1) match_report：完赛对局逐局明细归档，game_state 行内只保留 {round, winner} 摘要，缩短全局行锁临界区。
--- 2) player_blind_box：开盲盒结果独立成行，开盒请求不再走 game_state 全局行锁；
---    (game_day, bracket_round, player_id) 唯一键保证幂等；推进 TACTICS 时合并回 game_state。
+-- 2) player_blind_box：开盲盒结果独立成行，开盒请求先锁定 game_state 再写入本表；
+--    状态行锁实现正常幂等，唯一键保留为完整性防线；推进 TACTICS 时合并回 game_state。
 USE ace_dice_arena;
 
 CREATE TABLE IF NOT EXISTS match_report (

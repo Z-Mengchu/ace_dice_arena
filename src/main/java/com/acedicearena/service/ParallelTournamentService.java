@@ -22,7 +22,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Comparator;
@@ -1045,17 +1044,15 @@ public class ParallelTournamentService {
         return true;
     }
 
-    /* ---------- 开盲盒独立成行（不走 game_state 全局行锁） ---------- */
+    /* ---------- 开盲盒（锁定 game_state 后独立成行） ---------- */
 
     /**
-     * 开盲盒独立路径：不带锁读状态做校验，结果写入 player_blind_box 独立行
-     * （唯一键保证同一玩家同轮只开一次，重复请求返回原结果）；
-     * 全员开齐时走锁内推进把结果批量合并回 JSON。REQUIRES_NEW 让唯一键冲突
-     * 只回滚本事务，外层可改走「读已有行」恢复，互不污染。
+     * 在调用方事务内先锁定 game_state，再校验、写入 player_blind_box 并推进阶段。
+     * 同一玩家的并发请求由状态行锁串行化，已有记录直接返回原结果。
      */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public BlindBoxResult openBlindBoxIndependent(UserAccount user, Integer boxIndex) {
-        GameStateRecord record = states.findById(1L)
+    @Transactional
+    public BlindBoxResult openBlindBoxLocked(UserAccount user, Integer boxIndex) {
+        GameStateRecord record = states.findLockedById(1L)
                 .orElseThrow(() -> new IllegalStateException("主持人尚未创建比赛"));
         ObjectNode root = readState(record);
         if (root == null) throw new IllegalStateException("比赛状态无法读取");
@@ -1083,20 +1080,15 @@ public class ParallelTournamentService {
         int[] boxes = drawBlindBoxes();
         int value = boxes[picked];
         blindBoxes.saveAndFlush(new PlayerBlindBox(day, round, playerId, team.path("id").asText(), value));
-        if (allBlindBoxesOpened(root, day, round)) advanceToTacticsLocked();
+        if (allBlindBoxesOpened(root, day, round)) {
+            applyBlindBoxRows(root);
+            startTactics(root);
+            record.update(root.toString(), "system");
+            states.save(record);
+            // 阶段推进：立即广播，玩家端不依赖到点兜底
+            events.gameChangedNow();
+        }
         return new BlindBoxResult(value, boxes, picked);
-    }
-
-    /**
-     * 幂等恢复：唯一键冲突（同一玩家并发重复开盒）时读已有行的结果。
-     */
-    public Integer openedBlindBoxValue(UserAccount user) {
-        GameStateRecord record = states.findById(1L).orElse(null);
-        ObjectNode root = readState(record);
-        if (root == null) return null;
-        int day = root.path("day").asInt(1);
-        return blindBoxes.findByGameDayAndBracketRoundAndPlayerId(day, bracketRoundOf(root), "u" + user.getId())
-                .map(PlayerBlindBox::getBoxValue).orElse(null);
     }
 
     /**
@@ -1129,22 +1121,6 @@ public class ParallelTournamentService {
         long opened = blindBoxes.findByGameDayAndBracketRound(day, round).stream()
                 .filter(row -> active.contains(row.getPlayerId())).count();
         return opened >= active.size();
-    }
-
-    /**
-     * 最后一人开盒触发推进：锁内复核阶段仍停留在 BLIND_BOX（并发下只推进一次），合并结果后进入 TACTICS。
-     */
-    private void advanceToTacticsLocked() {
-        GameStateRecord record = states.findLockedById(1L).orElse(null);
-        if (record == null) return;
-        ObjectNode root = readState(record);
-        if (root == null || !"BLIND_BOX".equals(root.path("stage").asText())) return;
-        applyBlindBoxRows(root);
-        startTactics(root);
-        record.update(root.toString(), "system");
-        states.save(record);
-        // 阶段推进：立即广播，玩家端不依赖到点兜底
-        events.gameChangedNow();
     }
 
     /**
@@ -2180,8 +2156,9 @@ public class ParallelTournamentService {
 
     @Transactional
     public void resetTwoDayTournament() {
-        if (states.existsById(1L)) states.deleteById(1L);
+        GameStateRecord record = states.findLockedById(1L).orElse(null);
         blindBoxes.deleteAll();
+        if (record != null) states.delete(record);
         users.deleteAll(users.findAll().stream().filter(LobbyService::isStandIn).toList());
         List<UserAccount> accounts = users.findAll().stream().filter(u -> "USER".equals(u.getRole())).toList();
         accounts.forEach(user -> {

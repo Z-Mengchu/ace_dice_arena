@@ -328,7 +328,7 @@ class ApplicationIntegrationTest {
         root.put("stageDeadlineAt", System.currentTimeMillis() + 15_000L);
         saveState(root);
 
-        // 开盒结果写入 player_blind_box 独立行并随响应返回，不改写 game_state 行；
+        // 开盒先锁定 game_state，再把结果写入 player_blind_box 独立行并随响应返回；
         // 三选一：selections 带盒子序号，响应返回 3 个盒子内容与选中序号
         JsonNode opened = objectMapper.readTree(mockMvc.perform(post("/api/lobby/player-action").session(session)
                         .contentType(MediaType.APPLICATION_JSON)
@@ -359,7 +359,7 @@ class ApplicationIntegrationTest {
         assertThat(me.path("blindBox").asInt()).isEqualTo(box);
         assertThat(me.path("blindBoxOpened").asBoolean()).isTrue();
 
-        // 重复开盒幂等：返回同一结果，「每人限开一次」由唯一键保证；重放不带陪跑值，前端按刷新重进处理
+        // 重复开盒幂等：锁内读取已有记录并返回同一结果；唯一键仅作完整性防线
         mockMvc.perform(post("/api/lobby/player-action").session(session)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"type\":\"blind-box-open\",\"selections\":[]}"))

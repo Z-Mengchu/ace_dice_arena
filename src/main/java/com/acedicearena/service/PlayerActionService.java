@@ -7,7 +7,6 @@ import com.acedicearena.repository.UserAccountRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -39,9 +38,9 @@ public class PlayerActionService {
             throw new IllegalStateException("只有本轮已分组玩家可以提交比赛操作");
         }
         if (user.isAfk()) throw new IllegalStateException("你当前处于挂机状态，请先取消挂机再操作");
-        // 开盲盒结果按玩家独立成行（player_blind_box 表），不取 game_state 全局行锁
+        // 开盲盒在当前事务内先锁定 game_state，再写入 player_blind_box
         if ("blind-box-open".equals(type)) {
-            var result = openBlindBoxIndependent(user, parseBoxIndex(selections));
+            var result = tournament.openBlindBoxLocked(user, parseBoxIndex(selections));
             events.gameChanged();
             Map<String, Object> body = new java.util.HashMap<>();
             body.put("ok", true);
@@ -70,19 +69,6 @@ public class PlayerActionService {
         gameStates.save(record);
         notifyPlayerAction(type, captainBefore, gameStageBefore, root, user.getTeamId());
         return Map.of("ok", true);
-    }
-
-    /**
-     * 独立开盒；唯一键冲突 = 同一玩家并发重复提交，读已有行返回同一结果（幂等）。
-     */
-    private ParallelTournamentService.BlindBoxResult openBlindBoxIndependent(UserAccount user, Integer boxIndex) {
-        try {
-            return tournament.openBlindBoxIndependent(user, boxIndex);
-        } catch (DataIntegrityViolationException duplicate) {
-            Integer box = tournament.openedBlindBoxValue(user);
-            if (box != null) return new ParallelTournamentService.BlindBoxResult(box, null, -1);
-            throw duplicate;
-        }
     }
 
     /** 解析可选的盒子序号（selections 首元素）；缺省为 null，由服务端随机选一个。 */

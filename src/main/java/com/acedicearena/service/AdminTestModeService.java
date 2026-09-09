@@ -189,7 +189,8 @@ public class AdminTestModeService {
     @Transactional
     public TestStatus cleanup() {
         requireEnabled();
-        states.findById(1L).ifPresent(record -> {
+        var record = states.findLockedById(1L).orElse(null);
+        if (record != null) {
             try {
                 var root = mapper.readTree(record.getContent());
                 root.path("sandboxPlayers").forEach(player -> users.findByUsername(player.path("username").asText())
@@ -199,11 +200,11 @@ public class AdminTestModeService {
                     users.findByUsername(legacyUsername).ifPresent(user -> user.assignTeam(null));
             } catch (Exception ignored) {
             }
-        });
+        }
         users.deleteAll(users.findAll().stream().filter(AdminTestModeService::isTestUser).toList());
         users.flush();
         blindBoxes.deleteAll();
-        if (states.existsById(1L)) states.deleteById(1L);
+        if (record != null) states.delete(record);
         control().changePhase("PREPARING");
         events.stateChanged();
         return status();

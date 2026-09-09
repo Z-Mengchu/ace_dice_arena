@@ -4,8 +4,8 @@ import jakarta.persistence.*;
 import java.time.Instant;
 
 /**
- * 开盲盒结果按玩家独立成行：开盒请求不再写 game_state 全局行，
- * (game_day, bracket_round, player_id) 唯一键保证同一玩家同轮只开一次（幂等）。
+ * 开盲盒结果按玩家独立成行：开盒请求先锁定 game_state，再写入本表，
+ * (game_day, bracket_round, player_id) 唯一键作为同一玩家同轮只开一次的数据完整性防线。
  * 推进 TACTICS 时批量合并回 game_state，结算与脱敏视图仍只读 JSON。
  */
 @Entity

@@ -16,15 +16,76 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ParallelTournamentServiceTest {
     private final ObjectMapper mapper = new ObjectMapper();
+
+    /* ---------- 盲盒事务 ---------- */
+
+    @Test
+    void lockedBlindBoxOpenUsesLockedStateAndReturnsExistingResult() {
+        var states = mock(com.acedicearena.repository.GameStateRepository.class);
+        var blindBoxes = mock(com.acedicearena.repository.PlayerBlindBoxRepository.class);
+        var user = new UserAccount("box_player", "开盒玩家", "技术部", "USER", "hash", "salt");
+        user.assignTeam("t1");
+        ReflectionTestUtils.setField(user, "id", 7L);
+        ObjectNode root = blindBoxRoot(7L);
+        when(states.findLockedById(1L)).thenReturn(Optional.of(
+                new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test")));
+        when(blindBoxes.findByGameDayAndBracketRoundAndPlayerId(1, 1, "u7"))
+                .thenReturn(Optional.of(new com.acedicearena.domain.PlayerBlindBox(1, 1, "u7", "t1", 4)));
+
+        var result = service(states, mock(com.acedicearena.repository.UserAccountRepository.class),
+                mock(LobbyEventService.class), blindBoxes).openBlindBoxLocked(user, 0);
+
+        assertThat(result.value()).isEqualTo(4);
+        assertThat(result.boxes()).isNull();
+        verify(states).findLockedById(1L);
+        verify(states, never()).findById(1L);
+        verify(blindBoxes, never()).saveAndFlush(any());
+    }
+
+    @Test
+    void lastBlindBoxOpenMergesRowsAndAdvancesCurrentLockedState() throws Exception {
+        var states = mock(com.acedicearena.repository.GameStateRepository.class);
+        var blindBoxes = mock(com.acedicearena.repository.PlayerBlindBoxRepository.class);
+        var events = mock(LobbyEventService.class);
+        var user = new UserAccount("last_box_player", "最后开盒玩家", "技术部", "USER", "hash", "salt");
+        user.assignTeam("t1");
+        ReflectionTestUtils.setField(user, "id", 8L);
+        ObjectNode root = blindBoxRoot(8L);
+        var record = new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test");
+        when(states.findLockedById(1L)).thenReturn(Optional.of(record));
+        when(blindBoxes.findByGameDayAndBracketRoundAndPlayerId(1, 1, "u8"))
+                .thenReturn(Optional.empty());
+        AtomicReference<com.acedicearena.domain.PlayerBlindBox> saved = new AtomicReference<>();
+        when(blindBoxes.saveAndFlush(any())).thenAnswer(invocation -> {
+            var row = invocation.<com.acedicearena.domain.PlayerBlindBox>getArgument(0);
+            saved.set(row);
+            return row;
+        });
+        when(blindBoxes.findByGameDayAndBracketRound(1, 1))
+                .thenAnswer(invocation -> saved.get() == null ? List.of() : List.of(saved.get()));
+
+        var result = service(states, mock(com.acedicearena.repository.UserAccountRepository.class),
+                events, blindBoxes).openBlindBoxLocked(user, 0);
+
+        ObjectNode updated = (ObjectNode) mapper.readTree(record.getContent());
+        assertThat(updated.path("stage").asText()).isEqualTo("TACTICS");
+        assertThat(updated.at("/teams/0/players/0/blindBox").asInt()).isEqualTo(result.value());
+        assertThat(updated.at("/teams/0/players/0/blindBoxOpened").asBoolean()).isTrue();
+        verify(states).save(record);
+        verify(events).gameChangedNow();
+    }
 
     /* ---------- 数值规则 ---------- */
 
@@ -1061,13 +1122,39 @@ class ParallelTournamentServiceTest {
     private ParallelTournamentService service(com.acedicearena.repository.GameStateRepository states,
                                               com.acedicearena.repository.UserAccountRepository users,
                                               LobbyEventService events) {
+        return service(states, users, events,
+                org.mockito.Mockito.mock(com.acedicearena.repository.PlayerBlindBoxRepository.class));
+    }
+
+    private ParallelTournamentService service(com.acedicearena.repository.GameStateRepository states,
+                                              com.acedicearena.repository.UserAccountRepository users,
+                                              LobbyEventService events,
+                                              com.acedicearena.repository.PlayerBlindBoxRepository blindBoxes) {
         return new ParallelTournamentService(states, users,
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
                 events, 6_000L,
                 org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.MatchReportRepository.class),
-                org.mockito.Mockito.mock(com.acedicearena.repository.PlayerBlindBoxRepository.class));
+                blindBoxes);
+    }
+
+    private ObjectNode blindBoxRoot(long userId) {
+        ObjectNode root = mapper.createObjectNode();
+        root.put("mode", "parallel");
+        root.put("stage", "BLIND_BOX");
+        root.put("stageDeadlineAt", System.currentTimeMillis() + 30_000L);
+        root.put("day", 1);
+        ArrayNode teams = root.putArray("teams");
+        teams.addObject().put("id", "t1").putArray("players")
+                .addObject().put("id", "u" + userId);
+        teams.addObject().put("id", "t2").putArray("players");
+        ObjectNode match = root.putObject("matches").putObject("g1");
+        match.put("id", "g1");
+        match.put("a", "t1");
+        match.put("b", "t2");
+        match.put("status", "active");
+        return root;
     }
 
     /** ROLL 阶段：t1/t2 各 30 人，g1 进行中，go 与截止时间由参数指定；小队错峰时刻表与真实状态一致。 */
