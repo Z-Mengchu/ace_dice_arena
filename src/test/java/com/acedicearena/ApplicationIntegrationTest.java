@@ -6,6 +6,7 @@ import com.acedicearena.domain.UserAccount;
 import com.acedicearena.repository.BattleReportRepository;
 import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.GameControlRepository;
+import com.acedicearena.repository.PlayerRollRepository;
 import com.acedicearena.repository.RequestAuditRepository;
 import com.acedicearena.repository.UserAccountRepository;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -39,6 +40,7 @@ class ApplicationIntegrationTest {
     @Autowired BattleReportRepository battleReportRepository;
     @Autowired RequestAuditRepository requestAuditRepository;
     @Autowired UserAccountRepository userAccountRepository;
+    @Autowired PlayerRollRepository playerRollRepository;
 
     @Test
     void groupedPlayerCanSeeCurrentOpponentRosterButNotUnrelatedTeams() throws Exception {
@@ -408,12 +410,16 @@ class ApplicationIntegrationTest {
         for (MockHttpSession rollerSession : sessions) {
             String token = join(rollerSession);
             pingAndCalibrate(rollerSession, token);
-            String rolled = roll(rollerSession, token);
-            assertThat(objectMapper.readTree(rolled).path("die").asInt()).isBetween(1, 6);
-            mockMvc.perform(post("/api/roll").session(rollerSession)
+            JsonNode first = objectMapper.readTree(roll(rollerSession, token));
+            assertThat(first.path("die").asInt()).isBetween(1, 6);
+            // 重复掷骰幂等：返回首次掷出的结果（唯一键保证同轮只记一次）
+            String repeated = mockMvc.perform(post("/api/roll").session(rollerSession)
                             .contentType(MediaType.APPLICATION_JSON)
                             .content("{\"token\":\"" + token + "\",\"clientTs\":" + System.currentTimeMillis() + "}"))
-                    .andExpect(status().isConflict());
+                    .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+            JsonNode second = objectMapper.readTree(repeated);
+            assertThat(second.path("die").asInt()).isEqualTo(first.path("die").asInt());
+            assertThat(second.path("rollTs").asLong()).isEqualTo(first.path("rollTs").asLong());
         }
 
         JsonNode state = objectMapper.readTree(gameStateRepository.findById(1L).orElseThrow().getContent());
@@ -425,10 +431,14 @@ class ApplicationIntegrationTest {
             JsonNode player = null;
             for (JsonNode candidate : team1.path("players"))
                 if (playerId.equals(candidate.path("id").asText())) player = candidate;
-            assertThat(player).as("队员 %s 的掷骰数据", playerId).isNotNull();
-            assertThat(player.path("dice").asInt()).isBetween(1, 6);
-            assertThat(player.path("rollTs").isNumber()).isTrue();
-            assertThat(player.has("autoRolled")).isFalse();
+            assertThat(player).as("队员 %s 的名册", playerId).isNotNull();
+            // 掷骰结果在 player_roll 表；ROLL 阶段 JSON 行内不带 dice，推进时才合并
+            assertThat(player.has("dice")).isFalse();
+            var row = playerRollRepository.findByGameDayAndBracketRoundAndPlayerId(1, 1, playerId).orElseThrow();
+            assertThat(row.getDice()).isBetween(1, 6);
+            assertThat(row.getDiceFinal()).isEqualTo(row.getDice());
+            assertThat(row.getRollTs()).isPositive();
+            assertThat(row.isAutoRolled()).isFalse();
         }
 
         // 旧的 OnlineGameService SSE 通道已退役

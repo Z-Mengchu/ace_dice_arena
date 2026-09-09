@@ -73,6 +73,30 @@ class OnlineGameServiceConcurrentTest {
     }
 
     @Test
+    void aUniqueKeyConflictOnRollFallsBackToTheRecordedRow() {
+        String token = service.join("alice", "u1").token();
+        when(tournament.recordLiveRoll(eq("alice"), anyLong()))
+                .thenThrow(new org.springframework.dao.DataIntegrityViolationException("duplicate"));
+        when(tournament.recordedLiveRoll("alice"))
+                .thenReturn(new ParallelTournamentService.LiveRoll(3, 42L));
+
+        ParallelTournamentService.LiveRoll roll = service.roll(token, (double) System.currentTimeMillis());
+
+        assertThat(roll.die()).isEqualTo(3);
+        assertThat(roll.rollTs()).isEqualTo(42L);
+    }
+
+    @Test
+    void aUniqueKeyConflictWithoutARecordedRowIsRethrown() {
+        String token = service.join("alice", "u1").token();
+        when(tournament.recordLiveRoll(eq("alice"), anyLong()))
+                .thenThrow(new org.springframework.dao.DataIntegrityViolationException("duplicate"));
+
+        assertThatThrownBy(() -> service.roll(token, (double) System.currentTimeMillis()))
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+    }
+
+    @Test
     void rollRejectsInvalidClientTimestamps() {
         String token = service.join("alice", "u1").token();
         assertThatThrownBy(() -> service.roll(token, null)).isInstanceOf(IllegalArgumentException.class);

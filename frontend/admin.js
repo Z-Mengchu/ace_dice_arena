@@ -5,6 +5,7 @@
   var testMode = null;
   var soloCandidates = [];
   var gameState = null;
+  var lastStateVersion = null;
   var eventRefreshTimer = null;
   var eventRefreshType = null;
 
@@ -387,7 +388,15 @@
     }).catch(showError);
   }
   function loadGameStateOnly() {
-    api('/api/game-state').then(function (result) {
+    var headers = { 'Content-Type': 'application/json' };
+    if (lastStateVersion != null) headers['If-State-Version'] = String(lastStateVersion);
+    fetch('/api/game-state', { headers: headers }).then(function (response) {
+      if (response.status === 304) return null;
+      var version = response.headers.get('X-State-Version');
+      if (version != null) lastStateVersion = version;
+      return readResponse(response);
+    }).then(function (result) {
+      if (result === null) return;
       gameState = result && result.state || null;
       render();
     }).catch(showError);

@@ -100,6 +100,9 @@
   var refreshTimer = null;
   var assignmentLoading = false, assignmentPending = false;
   var matchDetails = {}, matchDetailPending = {};
+  var lastStateVersion = null;  // /api/game-state 的 X-State-Version：条件请求（304）跳过未变化的 parse + 重绘
+  var forceFullState = false;   // SSE（重）连补拉时置位：下一次回源强制不带版本头，保证拿到全量
+  var STATE_UNCHANGED = {};     // 304 哨兵：Promise 结果按引用比较
   var rerollBaseline = -1;      // 首次见到本队重掷日志时只建基线，不弹历史记录；日志重置（下一 bracket）时重建
   var rerollQueue = [];
   var rerollShowing = false;
@@ -363,7 +366,7 @@
     if (es) return;
     try { es = new EventSource('/api/lobby/events'); } catch (e) { return; }
     // （重）连上后补拉一次：断线期间错过的阶段推进靠这次回源追平
-    es.onopen = function () { setNet('已连接服务器', false); scheduleRefresh(); };
+    es.onopen = function () { setNet('已连接服务器', false); forceFullState = true; scheduleRefresh(); };
     es.onerror = function () { setNet('连接中断，重连中…', true); };
     es.onmessage = function (ev) {
       var msg = null;
@@ -381,16 +384,38 @@
     }, 120 + Math.floor(Math.random() * 120));
   }
 
+  /** 比赛状态条件请求：带 If-State-Version，304 时返回 STATE_UNCHANGED 跳过 parse 与渲染；force 时不带版本头 */
+  function fetchGameState(force) {
+    var headers = {};
+    if (!force && lastStateVersion != null) headers['If-State-Version'] = String(lastStateVersion);
+    return fetchWithTimeout('/api/game-state', { headers: headers }, 8000).then(function (response) {
+      if (response.status === 304) return STATE_UNCHANGED;
+      var version = response.headers.get('X-State-Version');
+      if (version != null) lastStateVersion = version;
+      if (response.status === 204) return null;
+      return response.json().catch(function () { return {}; }).then(function (body) {
+        if (!response.ok) {
+          var error = new Error(body.error || ('访问 /api/game-state 失败（HTTP ' + response.status + '）'));
+          error.status = response.status;
+          error.endpoint = '/api/game-state';
+          throw error;
+        }
+        return body;
+      });
+    });
+  }
+
   /** 资格与整局状态回源：in-flight 去重，并发触发合并为一次，期间到达的请求在完成后补一轮 */
   function refreshAssignment() {
     if (assignmentLoading) { assignmentPending = true; return; }
     assignmentLoading = true;
+    var forceFull = forceFullState; forceFullState = false;
     Promise.all([
       bootJson('/api/roll-assignment'),
-      bootJson('/api/game-state', true)
+      fetchGameState(forceFull)
     ]).then(function (result) {
       assignment = result[0];
-      gameState = result[1] && result[1].state ? result[1].state : null;
+      if (result[1] !== STATE_UNCHANGED) gameState = result[1] && result[1].state ? result[1].state : null;
       checkRerollPopups();
       onAssignmentChange();
     }).catch(function () { /* 网络抖动：等下一条通知 */ })
@@ -1238,7 +1263,7 @@
     Promise.all([
       bootJson('/api/auth/me'),
       bootJson('/api/roll-assignment'),
-      bootJson('/api/game-state', true)
+      fetchGameState(true)
     ]).then(function (result) {
       loginUser = result[0];
       assignment = result[1];

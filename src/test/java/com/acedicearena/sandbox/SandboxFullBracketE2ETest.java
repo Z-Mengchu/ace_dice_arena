@@ -197,15 +197,19 @@ class SandboxFullBracketE2ETest {
         Thread.sleep(Math.max(0, rollGoAt - System.currentTimeMillis()) + 100);
 
         long firstRollTs = Long.MAX_VALUE, lastRollTs = Long.MIN_VALUE;
+        JsonNode firstRoll = null;
         for (int i = 0; i < 5; i++) {
             JsonNode rolled = roll(sessions[i], tokens[i], 200);
+            if (i == 0) firstRoll = rolled;
             assertThat(rolled.path("die").asInt()).isBetween(1, 6);
             firstRollTs = Math.min(firstRollTs, rolled.path("rollTs").asLong());
             lastRollTs = Math.max(lastRollTs, rolled.path("rollTs").asLong());
         }
         assertThat(lastRollTs - firstRollTs).as("串发连掷的归一化时刻应落在同步窗口内").isLessThanOrEqualTo(500);
-        // 重复掷骰被状态机拒绝
-        roll(sessions[0], tokens[0], 409);
+        // 重复掷骰幂等：返回首次掷出的结果（唯一键保证同轮只记一次）
+        JsonNode repeat = roll(sessions[0], tokens[0], 200);
+        assertThat(repeat.path("die").asInt()).isEqualTo(firstRoll.path("die").asInt());
+        assertThat(repeat.path("rollTs").asLong()).isEqualTo(firstRoll.path("rollTs").asLong());
 
         sandbox.advance(admin);   // ROLL → BLIND_BOX：缺席者由系统代掷
         state = sandbox.fetchState(admin);

@@ -303,7 +303,9 @@ class DeadlockTimeoutTest {
                 mock(LobbyEventService.class), 6_000L,
                 mock(com.acedicearena.repository.BattleReportRepository.class),
                 mock(com.acedicearena.repository.MatchReportRepository.class),
-                mock(com.acedicearena.repository.PlayerBlindBoxRepository.class));
+                mock(com.acedicearena.repository.PlayerBlindBoxRepository.class),
+                mock(com.acedicearena.repository.PlayerRollRepository.class),
+                mock(com.acedicearena.repository.MatchGuessRepository.class));
     }
 
     /** t1/t2 各 30 人，一场 g1 进行中。 */

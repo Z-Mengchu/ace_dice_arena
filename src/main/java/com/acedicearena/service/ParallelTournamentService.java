@@ -3,14 +3,18 @@ package com.acedicearena.service;
 import com.acedicearena.domain.GameStateRecord;
 import com.acedicearena.domain.UserAccount;
 import com.acedicearena.domain.BattleReport;
+import com.acedicearena.domain.MatchGuess;
 import com.acedicearena.domain.MatchReport;
 import com.acedicearena.domain.PlayerBlindBox;
+import com.acedicearena.domain.PlayerRoll;
 import com.acedicearena.repository.BattleReportRepository;
 import com.acedicearena.repository.GameControlRepository;
 import com.acedicearena.repository.GameStateRepository;
+import com.acedicearena.repository.MatchGuessRepository;
 import com.acedicearena.repository.MatchReportRepository;
 import com.acedicearena.repository.PerformanceRecordRepository;
 import com.acedicearena.repository.PlayerBlindBoxRepository;
+import com.acedicearena.repository.PlayerRollRepository;
 import com.acedicearena.repository.UserAccountRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -20,6 +24,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -114,6 +119,8 @@ public class ParallelTournamentService {
     private final BattleReportRepository reports;
     private final MatchReportRepository matchReports;
     private final PlayerBlindBoxRepository blindBoxes;
+    private final PlayerRollRepository playerRolls;
+    private final MatchGuessRepository matchGuesses;
 
     /**
      * ROLL 阶段总窗口 = 最后一个小队的开掷时刻（go+5s）+ 小队窗口（15s）= go+20s。
@@ -127,7 +134,8 @@ public class ParallelTournamentService {
                                      GameControlRepository controls, ObjectMapper mapper, LobbyEventService events,
                                      @Value("${app.game.result-display-ms:16000}") long resultDisplayMs,
                                      BattleReportRepository reports, MatchReportRepository matchReports,
-                                     PlayerBlindBoxRepository blindBoxes) {
+                                     PlayerBlindBoxRepository blindBoxes, PlayerRollRepository playerRolls,
+                                     MatchGuessRepository matchGuesses) {
         this.states = states;
         this.users = users;
         this.performances = performances;
@@ -138,6 +146,8 @@ public class ParallelTournamentService {
         this.reports = reports;
         this.matchReports = matchReports;
         this.blindBoxes = blindBoxes;
+        this.playerRolls = playerRolls;
+        this.matchGuesses = matchGuesses;
     }
 
     @Transactional
@@ -355,6 +365,18 @@ public class ParallelTournamentService {
                                 blindBoxes.delete(row);
                                 blindBoxes.save(new PlayerBlindBox(day, round, "u" + player.getId(),
                                         assignment.teamId(), row.getBoxValue()));
+                            });
+                }
+                // ROLL 阶段掷骰结果在 player_roll 表：同样随席位移交改挂到新队员名下
+                if ("ROLL".equals(root.path("stage").asText())) {
+                    int day = root.path("day").asInt(1);
+                    int round = bracketRoundOf(root);
+                    playerRolls.findByGameDayAndBracketRoundAndPlayerId(day, round, replacedId)
+                            .ifPresent(row -> {
+                                playerRolls.delete(row);
+                                playerRolls.save(new PlayerRoll(day, round, "u" + player.getId(),
+                                        assignment.teamId(), row.getDice(), row.getDiceFinal(),
+                                        row.getRollTs(), row.isAutoRolled()));
                             });
                 }
             }
@@ -735,15 +757,20 @@ public class ParallelTournamentService {
     }
 
     /**
-     * 在赛队伍全员是否都已有点数（真人掷或系统代掷）。
+     * 在赛队伍全员是否都已有点数：真人掷骰结果在 player_roll 表（本轮），
+     * 判定口径为 表行 ∩ 在赛名单 ∪ JSON 中已有点数的在赛玩家（双读兼容）。
      */
     private boolean allActiveRolled(ObjectNode root) {
-        Set<String> activeTeams = activeTeamIds(root);
-        for (JsonNode teamNode : root.path("teams")) {
-            if (!activeTeams.contains(teamNode.path("id").asText())) continue;
-            for (JsonNode player : teamNode.path("players")) if (!player.has("dice")) return false;
-        }
-        return true;
+        Set<String> active = activePlayerIds(root);
+        Set<String> rolled = new HashSet<>();
+        for (JsonNode teamNode : root.path("teams"))
+            for (JsonNode player : teamNode.path("players"))
+                if (player.has("dice")) rolled.add(player.path("id").asText());
+        int day = root.path("day").asInt(1);
+        int round = bracketRoundOf(root);
+        for (PlayerRoll row : playerRolls.findByGameDayAndBracketRound(day, round))
+            rolled.add(row.getPlayerId());
+        return rolled.containsAll(active);
     }
 
     /**
@@ -752,6 +779,7 @@ public class ParallelTournamentService {
     boolean expireRoll(ObjectNode root, long now) {
         if (!"ROLL".equals(root.path("stage").asText())) return false;
         if ((root.hasNonNull("rollGoAt") || root.has("rollOpenAts")) && allActiveRolled(root)) {
+            applyRollRows(root);
             enterBlindBox(root);
             return true;
         }
@@ -761,6 +789,8 @@ public class ParallelTournamentService {
     }
 
     private void doRoll(ObjectNode root) {
+        // 真人掷骰结果在 player_roll 表：先合并回 JSON，再为仍缺骰者代掷，避免覆盖真人结果
+        applyRollRows(root);
         Set<String> activeTeams = activeTeamIds(root);
         for (JsonNode teamNode : root.path("teams")) {
             if (!activeTeams.contains(teamNode.path("id").asText())) continue;
@@ -787,15 +817,18 @@ public class ParallelTournamentService {
     /* ---------- 真人联机掷骰 ---------- */
 
     /**
-     * 真人掷骰落库：客户端只提交点击时刻（已由校准偏移归一化），点数在事务内随机产生。
+     * 真人掷骰独立路径：不带锁读状态做校验，结果写入 player_roll 独立行
+     * （唯一键保证同一玩家同轮只掷一次，重复请求返回原结果）；
+     * 全员掷齐时走锁内推进把结果批量合并回 JSON 并进入 BLIND_BOX。
      * 时刻夹取到 [now-250ms, now]，且不早于 go（抢跑按 go 时刻计）。
+     * REQUIRES_NEW 让唯一键冲突只回滚本事务，外层可改走「读已有行」恢复，互不污染。
      */
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public LiveRoll recordLiveRoll(String username, long clientTs) {
         // 用户解析不持行锁，与 PlayerActionService.submit 的锁外查用户对齐
         UserAccount user = users.findByUsername(username)
                 .orElseThrow(() -> new IllegalStateException("账号不存在"));
-        GameStateRecord record = states.findLockedById(1L)
+        GameStateRecord record = states.findById(1L)
                 .orElseThrow(() -> new IllegalStateException("比赛尚未开始"));
         try {
             ObjectNode root = (ObjectNode) mapper.readTree(record.getContent());
@@ -814,27 +847,91 @@ public class ParallelTournamentService {
                 throw new IllegalStateException("本轮掷骰已截止");
             long openAt = rollOpenAt(root, squadIndexOf(team, player.path("id").asText()));
             if (now < openAt) throw new IllegalStateException("还没轮到你们小队掷骰");
+            // 双读幂等：JSON 已有点数（部署瞬间进行中的局、锁内代掷）直接返回原结果
+            if (player.has("dice"))
+                return new LiveRoll(player.path("dice").asInt(), player.path("rollTs").asLong());
+            int day = root.path("day").asInt(1);
+            int round = bracketRoundOf(root);
+            String playerId = player.path("id").asText();
+            var existing = playerRolls.findByGameDayAndBracketRoundAndPlayerId(day, round, playerId);
+            if (existing.isPresent()) {
+                PlayerRoll row = existing.get();
+                return new LiveRoll(row.getDice(), row.getRollTs());
+            }
             // 开掷时刻按小队错开，但截止时刻全员统一为 stageDeadlineAt
-            if (player.has("dice")) throw new IllegalStateException("你本轮已经掷过骰子");
             long rollTs = Math.max(Math.min(Math.max(clientTs, now - ROLL_TOLERANCE_MS), now), goAt);
             int die = ThreadLocalRandom.current().nextInt(1, 7);
-            player.put("dice", die);
-            player.put("diceFinal", die);
-            player.put("rollTs", rollTs);
-            // 全员掷齐立即进盲盒，不等阶段截止
-            boolean advanced = allActiveRolled(root);
-            if (advanced) enterBlindBox(root);
-            record.update(root.toString(), username);
-            states.save(record);
-            // 阶段推进走立即广播，普通掷骰走合并广播
-            if (advanced) events.gameChangedNow();
+            playerRolls.saveAndFlush(new PlayerRoll(day, round, playerId, teamId, die, die, rollTs, false));
+            // 全员掷齐立即进盲盒（锁内复核 + 合并回 JSON），不等阶段截止；普通掷骰走合并广播
+            if (allActiveRolled(root)) advanceToBlindBoxLocked();
             else events.gameChanged();
             return new LiveRoll(die, rollTs);
         } catch (IllegalStateException e) {
             throw e;
+        } catch (DataIntegrityViolationException e) {
+            // 唯一键冲突 = 同一玩家并发重复掷骰，原样抛出由调用方读已有行恢复
+            throw e;
         } catch (Exception e) {
             throw new IllegalStateException("掷骰失败", e);
         }
+    }
+
+    /**
+     * 幂等恢复：唯一键冲突（同一玩家并发重复掷骰）时读已有行的结果。
+     */
+    @Transactional(readOnly = true)
+    public LiveRoll recordedLiveRoll(String username) {
+        UserAccount user = users.findByUsername(username).orElse(null);
+        if (user == null) return null;
+        GameStateRecord record = states.findById(1L).orElse(null);
+        ObjectNode root = readState(record);
+        if (root == null) return null;
+        int day = root.path("day").asInt(1);
+        return playerRolls.findByGameDayAndBracketRoundAndPlayerId(day, bracketRoundOf(root), "u" + user.getId())
+                .map(row -> new LiveRoll(row.getDice(), row.getRollTs())).orElse(null);
+    }
+
+    /**
+     * 最后一人掷骰触发推进：锁内复核阶段仍停留在 ROLL（并发下只推进一次），合并结果后进入 BLIND_BOX。
+     */
+    private void advanceToBlindBoxLocked() {
+        GameStateRecord record = states.findLockedById(1L).orElse(null);
+        if (record == null) return;
+        ObjectNode root = readState(record);
+        if (root == null || !"ROLL".equals(root.path("stage").asText())) return;
+        applyRollRows(root);
+        enterBlindBox(root);
+        record.update(root.toString(), "system");
+        states.save(record);
+        // 阶段推进：立即广播，玩家端不依赖到点兜底
+        events.gameChangedNow();
+    }
+
+    /**
+     * 把本轮 player_roll 行写入 JSON 的 player 节点；已有点数者不覆盖（JSON 旧值优先）。
+     */
+    private void applyRollRows(ObjectNode root) {
+        int day = root.path("day").asInt(1);
+        int round = bracketRoundOf(root);
+        for (PlayerRoll row : playerRolls.findByGameDayAndBracketRound(day, round)) {
+            ObjectNode team = findTeamOrNull(root, row.getTeamId());
+            ObjectNode player = team == null ? null : findPlayer(team, row.getPlayerId());
+            if (player == null || player.has("dice")) continue;
+            player.put("dice", row.getDice());
+            player.put("diceFinal", row.getDiceFinal());
+            player.put("rollTs", row.getRollTs());
+            if (row.isAutoRolled()) player.put("autoRolled", true);
+        }
+    }
+
+    /**
+     * 读取层注入：ROLL 阶段 game_state 行内还没有掷骰字段（结果在 player_roll 表），
+     * 快照组装时把本轮已掷结果注入 player 节点，玩家/大厅/大屏视图与脱敏逻辑保持不变。
+     */
+    public void injectRollResults(JsonNode state) {
+        if (!(state instanceof ObjectNode root)) return;
+        if (!"ROLL".equals(root.path("stage").asText())) return;
+        applyRollRows(root);
     }
 
     /**
@@ -860,7 +957,10 @@ public class ParallelTournamentService {
                 eligible = true;
                 ObjectNode team = findTeam(root, teamId);
                 ObjectNode player = user == null ? null : findPlayer(team, "u" + user.getId());
-                alreadyRolled = player != null && player.has("dice");
+                // 双读：真人掷骰结果在 player_roll 表，JSON 已有点数兼容旧局/锁内代掷
+                alreadyRolled = player != null && (player.has("dice")
+                        || playerRolls.findByGameDayAndBracketRoundAndPlayerId(root.path("day").asInt(1),
+                                bracketRoundOf(root), player.path("id").asText()).isPresent());
                 if (player != null) {
                     squadIndex = squadIndexOf(team, player.path("id").asText());
                     long openAt = rollOpenAt(root, squadIndex);
@@ -939,25 +1039,31 @@ public class ParallelTournamentService {
 
     /**
      * 猜阵密封：内容不可见，只能看到提交状态；提前猜阵同样密封为 preGuessStatus。
+     * 真人提交在 match_guess 表时由 injectGuessStatus 预挂布尔状态（内容不进快照），此处与 JSON 残留合并。
      */
     private void sealGuesses(ObjectNode match) {
         JsonNode guesses = match.path("guesses");
-        ObjectNode status = mapper.createObjectNode();
+        ObjectNode status = match.path("guessStatus").isObject()
+                ? (ObjectNode) match.path("guessStatus") : mapper.createObjectNode();
         for (String side : List.of("A", "B")) {
-            ObjectNode sideStatus = status.putObject(side);
+            ObjectNode sideStatus = status.withObject("/" + side);
             guesses.path(side).fieldNames().forEachRemaining(id -> sideStatus.put(id, true));
         }
         match.set("guessStatus", status);
         match.remove("guesses");
         JsonNode preGuesses = match.path("preGuesses");
-        ObjectNode preStatus = mapper.createObjectNode();
+        ObjectNode preStatus = match.path("preGuessStatus").isObject()
+                ? (ObjectNode) match.path("preGuessStatus") : mapper.createObjectNode();
         preGuesses.fields().forEachRemaining(roundEntry -> {
-            ObjectNode roundStatus = preStatus.putObject(roundEntry.getKey());
+            ObjectNode roundStatus = preStatus.withObject("/" + roundEntry.getKey());
             for (String side : List.of("A", "B")) {
-                ObjectNode sideStatus = roundStatus.putObject(side);
+                ObjectNode sideStatus = roundStatus.withObject("/" + side);
                 roundEntry.getValue().path(side).fieldNames().forEachRemaining(id -> sideStatus.put(id, true));
             }
         });
+        // 注入来源的轮次可能只挂了一边，补齐 A/B 双侧保持视图形状一致
+        for (JsonNode roundStatus : preStatus)
+            for (String side : List.of("A", "B")) ((ObjectNode) roundStatus).withObject("/" + side);
         match.set("preGuessStatus", preStatus);
         match.remove("preGuesses");
     }
@@ -1424,6 +1530,336 @@ public class ParallelTournamentService {
         if (!removed) throw new IllegalStateException("你没有可撤回的猜阵");
     }
 
+    /* ---------- 猜阵独立成行（不走 game_state 全局行锁） ---------- */
+
+    /**
+     * 猜阵独立入口：非锁读状态做校验，提交写 match_guess 独立行
+     * （唯一键 (game_day, match_id, guess_type, round_no, side, player_id) 幂等；pre 改投 = 同键覆盖）。
+     * 沙盘/测试账号返回 false，由调用方回落行锁 JSON 路径（沙盘状态保留 guesses 在 JSON）。
+     * REQUIRES_NEW 让唯一键冲突只回滚本事务，外层可改走「读已有行/覆盖」恢复，互不污染。
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public boolean submitGuessIndependent(UserAccount user, String type, List<String> values) {
+        GameStateRecord record = states.findById(1L)
+                .orElseThrow(() -> new IllegalStateException("主持人尚未创建比赛"));
+        ObjectNode root = readState(record);
+        if (root == null) throw new IllegalStateException("比赛状态无法读取");
+        if (!"parallel".equals(root.path("mode").asText()))
+            throw new IllegalStateException("当前比赛不是并行赛制");
+        if (AdminTestModeService.isTestUser(user) || sandboxPlayer(root, user.getUsername()) != null)
+            return false;
+        List<String> guess = values == null ? List.of() : values;
+        switch (type == null ? "" : type) {
+            case "round-guess" -> submitRoundGuessIndependent(root, user, guess);
+            case "pre-guess" -> submitPreGuessIndependent(root, user, guess);
+            case "retract-guess" -> retractGuessIndependent(root, user);
+            default -> throw new IllegalArgumentException("未知的玩家操作");
+        }
+        return true;
+    }
+
+    /**
+     * 本轮猜阵：校验与 JSON 路径一致；双读幂等（JSON 残留 + 表行均视为已提交）；
+     * 双方交齐（表 ∪ JSON）且满每局最短时长即走锁内揭晓。
+     */
+    private void submitRoundGuessIndependent(ObjectNode root, UserAccount user, List<String> values) {
+        if (!"BATTLE".equals(root.path("stage").asText()))
+            throw new IllegalStateException("当前不在对局阶段");
+        ObjectNode match = activeMatchFor(root, user.getTeamId());
+        if (!"BATTLE".equals(match.path("phase").asText())
+                || !"GUESS".equals(match.path("roundPhase").asText()))
+            throw new IllegalStateException("当前不接受猜阵");
+        if (match.path("guessDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
+            throw new IllegalStateException("本轮猜阵已截止");
+        String side = sideOf(match, user.getTeamId());
+        ObjectNode team = findTeam(root, user.getTeamId());
+        String playerId = "u" + user.getId();
+        int round = match.path("round").asInt(1);
+        if (!contains(team.path("squads").path(round - 1), playerId))
+            throw new IllegalStateException("只有本轮出战小队成员可以提交猜阵");
+        validateGuessTargets(root, match, side, values);
+        if (match.path("guesses").path(side).has(playerId))
+            throw new IllegalStateException("你已经提交过本轮猜阵");
+        int day = root.path("day").asInt(1);
+        String matchId = match.path("id").asText();
+        if (matchGuesses.findByGameDayAndMatchIdAndGuessTypeAndRoundNoAndSideAndPlayerId(
+                day, matchId, MatchGuess.TYPE_ROUND, round, side, playerId).isPresent())
+            throw new IllegalStateException("你已经提交过本轮猜阵");
+        matchGuesses.saveAndFlush(new MatchGuess(day, matchId, MatchGuess.TYPE_ROUND, round, side, playerId,
+                targetsJson(values)));
+        if (guessSideCount(root, match, "A") >= SQUAD_SIZE
+                && guessSideCount(root, match, "B") >= SQUAD_SIZE
+                && System.currentTimeMillis() >= match.path("guessOpenedAt").asLong(0L) + GUESS_MIN_DURATION_MS)
+            revealRoundLocked(matchId, round);
+    }
+
+    /**
+     * 提前猜阵：覆盖语义（改投）——有行更新 targets，无行插入；
+     * JSON 残留同 key 会在合并时压过表行（JSON 优先），先拿锁清掉再写表。
+     */
+    private void submitPreGuessIndependent(ObjectNode root, UserAccount user, List<String> values) {
+        if (!"BATTLE".equals(root.path("stage").asText()))
+            throw new IllegalStateException("当前不在对局阶段");
+        ObjectNode match = activeMatchFor(root, user.getTeamId());
+        if (!"BATTLE".equals(match.path("phase").asText()))
+            throw new IllegalStateException("当前不接受猜阵");
+        String side = sideOf(match, user.getTeamId());
+        ObjectNode team = findTeam(root, user.getTeamId());
+        String playerId = "u" + user.getId();
+        int round = squadIndexOf(team, playerId) + 1;
+        int currentRound = match.path("round").asInt(1);
+        if (round == currentRound) throw new IllegalStateException("当前轮次请直接提交猜阵");
+        if (round < currentRound) throw new IllegalStateException("你们小队的轮次已经结束");
+        validateGuessTargets(root, match, side, values);
+        int day = root.path("day").asInt(1);
+        String matchId = match.path("id").asText();
+        if (match.path("preGuesses").path(String.valueOf(round)).path(side).has(playerId))
+            removeJsonPreGuessLocked(matchId, round, side, playerId);
+        String targets = targetsJson(values);
+        var existing = matchGuesses.findByGameDayAndMatchIdAndGuessTypeAndRoundNoAndSideAndPlayerId(
+                day, matchId, MatchGuess.TYPE_PRE, round, side, playerId);
+        if (existing.isPresent()) {
+            existing.get().updateTargets(targets);
+            matchGuesses.saveAndFlush(existing.get());
+        } else {
+            matchGuesses.saveAndFlush(
+                    new MatchGuess(day, matchId, MatchGuess.TYPE_PRE, round, side, playerId, targets));
+        }
+    }
+
+    /**
+     * 撤回：先删表行（当前轮 round 行 + 本人该场全部 pre 行），
+     * JSON 有残留（部署瞬间进行中的局）再短事务拿锁清理；两边都没有则幂等报错。
+     */
+    private void retractGuessIndependent(ObjectNode root, UserAccount user) {
+        if (!"BATTLE".equals(root.path("stage").asText()))
+            throw new IllegalStateException("当前不在对局阶段");
+        ObjectNode match = activeMatchFor(root, user.getTeamId());
+        if (!"BATTLE".equals(match.path("phase").asText()))
+            throw new IllegalStateException("当前不接受猜阵");
+        String side = sideOf(match, user.getTeamId());
+        String playerId = "u" + user.getId();
+        int day = root.path("day").asInt(1);
+        String matchId = match.path("id").asText();
+        boolean removed = false;
+        if ("GUESS".equals(match.path("roundPhase").asText())) {
+            var row = matchGuesses.findByGameDayAndMatchIdAndGuessTypeAndRoundNoAndSideAndPlayerId(
+                    day, matchId, MatchGuess.TYPE_ROUND, match.path("round").asInt(1), side, playerId);
+            if (row.isPresent()) {
+                matchGuesses.delete(row.get());
+                removed = true;
+            }
+        }
+        List<MatchGuess> preRows = matchGuesses
+                .findByGameDayAndMatchIdAndGuessType(day, matchId, MatchGuess.TYPE_PRE).stream()
+                .filter(row -> playerId.equals(row.getPlayerId())).toList();
+        if (!preRows.isEmpty()) {
+            matchGuesses.deleteAll(preRows);
+            removed = true;
+        }
+        if (jsonGuessPresent(match, side, playerId)) {
+            retractGuessFromJsonLocked(matchId, side, playerId);
+            removed = true;
+        }
+        if (!removed) throw new IllegalStateException("你没有可撤回的猜阵");
+    }
+
+    private boolean jsonGuessPresent(ObjectNode match, String side, String playerId) {
+        if ("GUESS".equals(match.path("roundPhase").asText())
+                && match.path("guesses").path(side).has(playerId)) return true;
+        for (JsonNode roundNode : match.path("preGuesses"))
+            if (roundNode.path(side).has(playerId)) return true;
+        return false;
+    }
+
+    /** 锁内清 JSON 残留的猜阵（与 retractGuess 口径一致：live 只在 GUESS 窗口可撤，pre 全撤）。 */
+    private void retractGuessFromJsonLocked(String matchId, String side, String playerId) {
+        GameStateRecord record = states.findLockedById(1L).orElse(null);
+        if (record == null) return;
+        ObjectNode root = readState(record);
+        if (root == null) return;
+        if (!(root.path("matches").path(matchId) instanceof ObjectNode match)) return;
+        boolean removed = false;
+        if ("GUESS".equals(match.path("roundPhase").asText())) {
+            ObjectNode sideGuesses = (ObjectNode) match.path("guesses").path(side);
+            if (sideGuesses.has(playerId)) {
+                sideGuesses.remove(playerId);
+                removed = true;
+            }
+        }
+        for (JsonNode roundNode : match.path("preGuesses")) {
+            ObjectNode sideNode = (ObjectNode) roundNode.path(side);
+            if (sideNode.has(playerId)) {
+                sideNode.remove(playerId);
+                removed = true;
+            }
+        }
+        if (!removed) return;
+        record.update(root.toString(), "system");
+        states.save(record);
+    }
+
+    /** 锁内清 JSON 残留的同 key 提前猜阵（改投走表后，避免合并时 JSON 旧值压过新表行）。 */
+    private void removeJsonPreGuessLocked(String matchId, int round, String side, String playerId) {
+        GameStateRecord record = states.findLockedById(1L).orElse(null);
+        if (record == null) return;
+        ObjectNode root = readState(record);
+        if (root == null) return;
+        if (!(root.path("matches").path(matchId) instanceof ObjectNode match)) return;
+        ObjectNode sideNode = (ObjectNode) match.path("preGuesses").path(String.valueOf(round)).path(side);
+        if (!sideNode.has(playerId)) return;
+        sideNode.remove(playerId);
+        record.update(root.toString(), "system");
+        states.save(record);
+    }
+
+    /**
+     * 齐 5 提前揭晓：锁内复核该局仍停留在 GUESS 窗口（并发提交/超时扫描只揭晓一次），
+     * 合并表行后走原 reveal 流程。
+     */
+    private void revealRoundLocked(String matchId, int round) {
+        GameStateRecord record = states.findLockedById(1L).orElse(null);
+        if (record == null) return;
+        ObjectNode root = readState(record);
+        if (root == null) return;
+        if (!(root.path("matches").path(matchId) instanceof ObjectNode match)) return;
+        if (!"BATTLE".equals(root.path("stage").asText())
+                || !"active".equals(match.path("status").asText())
+                || !"BATTLE".equals(match.path("phase").asText())
+                || !"GUESS".equals(match.path("roundPhase").asText())
+                || match.path("round").asInt(1) != round) return;
+        applyGuessRows(root, match);
+        revealRound(root, match);
+        record.update(root.toString(), "system");
+        states.save(record);
+        // 阶段推进：立即广播，玩家端不依赖到点兜底
+        events.gameChangedNow();
+    }
+
+    /**
+     * 把本轮 match_guess 表行写回 match.guesses.{side}.{playerId}；已有 key skip（JSON 旧值优先）。
+     */
+    private void applyGuessRows(ObjectNode root, ObjectNode match) {
+        int day = root.path("day").asInt(1);
+        List<MatchGuess> rows = matchGuesses.findByGameDayAndMatchIdAndGuessTypeAndRoundNo(
+                day, match.path("id").asText(), MatchGuess.TYPE_ROUND, match.path("round").asInt(1));
+        if (rows.isEmpty()) return;
+        ObjectNode guesses = match.withObject("/guesses");
+        for (MatchGuess row : rows) {
+            ObjectNode sideGuesses = guesses.withObject("/" + row.getSide());
+            if (sideGuesses.has(row.getPlayerId())) continue;
+            sideGuesses.set(row.getPlayerId(), parseTargets(row.getTargets()));
+        }
+    }
+
+    /** 一方已交猜阵人数：本轮表行 ∪ JSON 残留（双读口径，与齐 5 判定/提前揭晓共用）。 */
+    private int guessSideCount(ObjectNode root, ObjectNode match, String side) {
+        Set<String> ids = new HashSet<>();
+        match.path("guesses").path(side).fieldNames().forEachRemaining(ids::add);
+        int day = root.path("day").asInt(1);
+        for (MatchGuess row : matchGuesses.findByGameDayAndMatchIdAndGuessTypeAndRoundNo(
+                day, match.path("id").asText(), MatchGuess.TYPE_ROUND, match.path("round").asInt(1)))
+            if (side.equals(row.getSide())) ids.add(row.getPlayerId());
+        return ids.size();
+    }
+
+    /**
+     * 幂等恢复：round-guess 唯一键冲突 = 同一玩家并发重复提交，行已存在即恢复为「已提交」语义。
+     */
+    public boolean roundGuessSubmitted(UserAccount user) {
+        if (user.getTeamId() == null) return false;
+        GameStateRecord record = states.findById(1L).orElse(null);
+        ObjectNode root = readState(record);
+        if (root == null) return false;
+        ObjectNode match = null;
+        for (JsonNode node : root.path("matches")) {
+            if ("active".equals(node.path("status").asText())
+                    && (user.getTeamId().equals(node.path("a").asText())
+                    || user.getTeamId().equals(node.path("b").asText())))
+                match = (ObjectNode) node;
+        }
+        if (match == null) return false;
+        return matchGuesses.findByGameDayAndMatchIdAndGuessTypeAndRoundNoAndSideAndPlayerId(
+                root.path("day").asInt(1), match.path("id").asText(), MatchGuess.TYPE_ROUND,
+                match.path("round").asInt(1), sideOf(match, user.getTeamId()), "u" + user.getId()).isPresent();
+    }
+
+    /**
+     * 幂等恢复：pre-guess 唯一键冲突 = 并发改投，新事务把已有行覆盖为最新 targets。
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void overwritePreGuessAfterConflict(UserAccount user, List<String> values) {
+        GameStateRecord record = states.findById(1L).orElse(null);
+        ObjectNode root = readState(record);
+        if (root == null) throw new IllegalStateException("比赛状态无法读取");
+        ObjectNode match = activeMatchFor(root, user.getTeamId());
+        ObjectNode team = findTeam(root, user.getTeamId());
+        String playerId = "u" + user.getId();
+        int round = squadIndexOf(team, playerId) + 1;
+        var row = matchGuesses.findByGameDayAndMatchIdAndGuessTypeAndRoundNoAndSideAndPlayerId(
+                root.path("day").asInt(1), match.path("id").asText(), MatchGuess.TYPE_PRE,
+                round, sideOf(match, user.getTeamId()), playerId);
+        if (row.isEmpty()) throw new IllegalStateException("猜阵提交冲突，请重试");
+        row.get().updateTargets(targetsJson(values));
+        matchGuesses.saveAndFlush(row.get());
+    }
+
+    /**
+     * 读取层注入：BATTLE 阶段真人猜阵在 match_guess 表，内容保持密封不进快照，
+     * 只把提交状态布尔挂到 guessStatus/preGuessStatus，由 sealGuesses 与 JSON 残留合并后下发。
+     */
+    public void injectGuessStatus(JsonNode state) {
+        if (!(state instanceof ObjectNode root)) return;
+        if (!"BATTLE".equals(root.path("stage").asText())) return;
+        int day = root.path("day").asInt(1);
+        for (JsonNode matchNode : root.path("matches")) {
+            if (!(matchNode instanceof ObjectNode match)) continue;
+            if (!"active".equals(match.path("status").asText())
+                    || !"BATTLE".equals(match.path("phase").asText())) continue;
+            List<MatchGuess> rows = matchGuesses.findByGameDayAndMatchId(day, match.path("id").asText());
+            if (rows.isEmpty()) continue;
+            int round = match.path("round").asInt(1);
+            boolean guessWindow = "GUESS".equals(match.path("roundPhase").asText());
+            for (MatchGuess row : rows) {
+                if (MatchGuess.TYPE_ROUND.equals(row.getGuessType())) {
+                    if (!guessWindow || row.getRoundNo() != round) continue;
+                    match.withObject("/guessStatus").withObject("/" + row.getSide())
+                            .put(row.getPlayerId(), true);
+                } else if (row.getRoundNo() > round) {
+                    match.withObject("/preGuessStatus").withObject("/" + row.getRoundNo())
+                            .withObject("/" + row.getSide()).put(row.getPlayerId(), true);
+                }
+            }
+        }
+    }
+
+    private String sideOf(ObjectNode match, String teamId) {
+        return teamId.equals(match.path("a").asText()) ? "A" : "B";
+    }
+
+    private void validateGuessTargets(ObjectNode root, ObjectNode match, String side, List<String> values) {
+        if (values.size() != SQUAD_SIZE || new HashSet<>(values).size() != values.size())
+            throw new IllegalArgumentException("猜阵必须选择 5 名敌方队员");
+        ObjectNode enemy = findTeam(root, teamForSide(match, "A".equals(side) ? "B" : "A"));
+        Set<String> enemyRoster = new HashSet<>();
+        enemy.path("players").forEach(player -> enemyRoster.add(player.path("id").asText()));
+        if (!enemyRoster.containsAll(values)) throw new IllegalArgumentException("猜阵目标必须是敌方队员");
+    }
+
+    private String targetsJson(List<String> values) {
+        ArrayNode array = mapper.createArrayNode();
+        values.forEach(array::add);
+        return array.toString();
+    }
+
+    private ArrayNode parseTargets(String json) {
+        try {
+            return (ArrayNode) mapper.readTree(json);
+        } catch (Exception e) {
+            throw new IllegalStateException("猜阵数据无法读取", e);
+        }
+    }
+
     boolean expireGuesses(ObjectNode root, long now) {
         if (!"BATTLE".equals(root.path("stage").asText())) return false;
         boolean changed = false;
@@ -1432,16 +1868,19 @@ public class ParallelTournamentService {
             if (!"active".equals(match.path("status").asText())
                     || !"BATTLE".equals(match.path("phase").asText())
                     || !"GUESS".equals(match.path("roundPhase").asText())) continue;
-            // 双方交齐（含整轮靠提前猜阵交齐）且满最短时长即揭晓
-            boolean bothComplete = match.at("/guesses/A").size() >= SQUAD_SIZE
-                    && match.at("/guesses/B").size() >= SQUAD_SIZE;
+            // 双方交齐（表 ∪ JSON，含整轮靠提前猜阵交齐）且满最短时长即揭晓
+            boolean bothComplete = guessSideCount(root, match, "A") >= SQUAD_SIZE
+                    && guessSideCount(root, match, "B") >= SQUAD_SIZE;
             boolean minElapsed = now >= match.path("guessOpenedAt").asLong(0L) + GUESS_MIN_DURATION_MS;
             if (bothComplete && minElapsed) {
+                applyGuessRows(root, match);
                 revealRound(root, match);
                 changed = true;
                 continue;
             }
             if (match.path("guessDeadlineAt").asLong(Long.MAX_VALUE) > now) continue;
+            // 到点强制揭晓：先把表内猜阵合并回 JSON 再结算
+            applyGuessRows(root, match);
             revealRound(root, match);
             changed = true;
         }
@@ -1568,26 +2007,40 @@ public class ParallelTournamentService {
 
     /**
      * 开窗合并：把该轮的提前猜阵并入正式猜阵，按当前敌方花名册过滤失效目标，合并后删除该轮条目。
+     * 真人提交在 match_guess 表（pre 行），与 JSON 残留一起并入（同 key JSON 优先），并入后删除表行。
      */
     private void mergePreGuesses(ObjectNode root, ObjectNode match, int round) {
+        int day = root.path("day").asInt(1);
+        String matchId = match.path("id").asText();
         JsonNode roundNode = match.path("preGuesses").path(String.valueOf(round));
-        if (!roundNode.isObject()) return;
+        List<MatchGuess> preRows = matchGuesses.findByGameDayAndMatchIdAndGuessTypeAndRoundNo(
+                day, matchId, MatchGuess.TYPE_PRE, round);
+        if (!roundNode.isObject() && preRows.isEmpty()) return;
         ObjectNode guesses = match.withObject("/guesses");
         for (String side : List.of("A", "B")) {
-            JsonNode sideNode = roundNode.path(side);
-            if (!sideNode.isObject()) continue;
             ObjectNode enemy = findTeam(root, teamForSide(match, "A".equals(side) ? "B" : "A"));
             Set<String> enemyRoster = new HashSet<>();
             enemy.path("players").forEach(player -> enemyRoster.add(player.path("id").asText()));
             ObjectNode target = guesses.withObject("/" + side);
-            sideNode.fields().forEachRemaining(entry -> {
+            JsonNode sideNode = roundNode.path(side);
+            if (sideNode.isObject()) {
+                sideNode.fields().forEachRemaining(entry -> {
+                    ArrayNode filtered = mapper.createArrayNode();
+                    for (JsonNode id : entry.getValue())
+                        if (enemyRoster.contains(id.asText())) filtered.add(id.asText());
+                    target.set(entry.getKey(), filtered);
+                });
+            }
+            for (MatchGuess row : preRows) {
+                if (!side.equals(row.getSide()) || target.has(row.getPlayerId())) continue;
                 ArrayNode filtered = mapper.createArrayNode();
-                for (JsonNode id : entry.getValue())
+                for (JsonNode id : parseTargets(row.getTargets()))
                     if (enemyRoster.contains(id.asText())) filtered.add(id.asText());
-                target.set(entry.getKey(), filtered);
-            });
+                target.set(row.getPlayerId(), filtered);
+            }
         }
-        ((ObjectNode) match.path("preGuesses")).remove(String.valueOf(round));
+        if (roundNode.isObject()) ((ObjectNode) match.path("preGuesses")).remove(String.valueOf(round));
+        matchGuesses.deleteAll(preRows);
     }
 
     /* ---------- 比赛结算与平局链 ---------- */
@@ -2036,8 +2489,10 @@ public class ParallelTournamentService {
                         if (!"active".equals(match.path("status").asText())) continue;
                         switch (match.path("phase").asText()) {
                             case "BATTLE" -> {
-                                if ("GUESS".equals(match.path("roundPhase").asText())) revealRound(root, match);
-                                else advanceMatchRound(root, match);
+                                if ("GUESS".equals(match.path("roundPhase").asText())) {
+                                    applyGuessRows(root, match);
+                                    revealRound(root, match);
+                                } else advanceMatchRound(root, match);
                                 progressed++;
                             }
                             case "RESULT" -> {
@@ -2168,6 +2623,18 @@ public class ParallelTournamentService {
     }
 
     private void prepareRematch(ObjectNode root, ObjectNode match) {
+        int day = root.path("day").asInt(1);
+        int bracketRound = bracketRoundOf(root);
+        Set<String> rematchTeams = Set.of(match.path("a").asText(), match.path("b").asText());
+        // 加赛复用轮次键：仅清本场两队，保留同轮其他队伍和其他天的记录。
+        playerRolls.deleteAll(playerRolls.findByGameDayAndBracketRound(day, bracketRound).stream()
+                .filter(row -> rematchTeams.contains(row.getTeamId())).toList());
+        blindBoxes.deleteAll(blindBoxes.findByGameDayAndBracketRound(day, bracketRound).stream()
+                .filter(row -> rematchTeams.contains(row.getTeamId())).toList());
+        // 重赛复用同一 (game_day, match_id, round_no)：清理上一局的猜阵表行，
+        // 避免唯一键冲突与旧猜阵并入新一局
+        matchGuesses.deleteAll(matchGuesses.findByGameDayAndMatchId(
+                root.path("day").asInt(1), match.path("id").asText()));
         match.remove(List.of("winner", "tieBreak", "totalPointsA", "totalPointsB", "gmvA", "gmvB",
                 "resultReadyAt", "guesses", "preGuesses", "guessDeadlineAt", "guessOpenedAt", "revealUntil"));
         match.put("winsA", 0);
@@ -2182,6 +2649,8 @@ public class ParallelTournamentService {
     public void resetTwoDayTournament() {
         if (states.existsById(1L)) states.deleteById(1L);
         blindBoxes.deleteAll();
+        playerRolls.deleteAll();
+        matchGuesses.deleteAll();
         users.deleteAll(users.findAll().stream().filter(LobbyService::isStandIn).toList());
         List<UserAccount> accounts = users.findAll().stream().filter(u -> "USER".equals(u.getRole())).toList();
         accounts.forEach(user -> {

@@ -126,7 +126,9 @@ class SandboxAssistTest {
                 mock(LobbyEventService.class), 6_000L,
                 mock(com.acedicearena.repository.BattleReportRepository.class),
                 mock(com.acedicearena.repository.MatchReportRepository.class),
-                mock(com.acedicearena.repository.PlayerBlindBoxRepository.class));
+                mock(com.acedicearena.repository.PlayerBlindBoxRepository.class),
+                mock(com.acedicearena.repository.PlayerRollRepository.class),
+                mock(com.acedicearena.repository.MatchGuessRepository.class));
     }
 
     private UserAccount user(long id, String username, String teamId) {

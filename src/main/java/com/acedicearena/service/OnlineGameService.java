@@ -1,5 +1,6 @@
 package com.acedicearena.service;
 
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
@@ -85,7 +86,8 @@ public class OnlineGameService {
 
     /**
      * 掷骰：令牌校验与偏移归一化在监视器内完成，落库调用在监视器外执行——
-     * recordLiveRoll 是 @Transactional 会取行锁，持监视器等行锁会形成 AB-BA 死锁。
+     * recordLiveRoll 是 @Transactional，持监视器做落库会形成 AB-BA 死锁。
+     * 唯一键冲突 = 同一玩家并发重复掷骰，读已有行返回同一结果（幂等）。
      */
     public ParallelTournamentService.LiveRoll roll(String token, Double clientTs) {
         Device device;
@@ -95,7 +97,13 @@ public class OnlineGameService {
             if (clientTs == null || !Double.isFinite(clientTs)) throw new IllegalArgumentException("invalid clientTs");
             normalized = Math.round(clientTs + device.offset());
         }
-        return tournament.recordLiveRoll(device.username(), normalized);
+        try {
+            return tournament.recordLiveRoll(device.username(), normalized);
+        } catch (DataIntegrityViolationException duplicate) {
+            ParallelTournamentService.LiveRoll existing = tournament.recordedLiveRoll(device.username());
+            if (existing != null) return existing;
+            throw duplicate;
+        }
     }
 
     /**

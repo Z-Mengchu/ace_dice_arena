@@ -192,11 +192,20 @@
     renderStage(state, null);
   }
 
+  var lastStateVersion = null;  // /api/game-state 的 X-State-Version：条件请求（304）跳过未变化的 parse + 重绘
+  var forceFullLoad = false;    // SSE（重）连补拉时置位：下一次回源强制不带版本头，保证拿到全量
+  var STATE_UNCHANGED = {};     // 304 哨兵：Promise 结果按引用比较
+
   function load() {
-    fetch('/api/game-state').then(function (r) {
+    var force = forceFullLoad; forceFullLoad = false;
+    var headers = {};
+    if (!force && lastStateVersion != null) headers['If-State-Version'] = String(lastStateVersion);
+    fetch('/api/game-state', { headers: headers }).then(function (r) {
       if (r.status === 401) { location.replace('/login'); throw new Error(); }
+      if (r.status === 304) return STATE_UNCHANGED;
+      var v = r.headers.get('X-State-Version'); if (v != null) lastStateVersion = v;
       return r.status === 204 ? null : r.json();
-    }).then(function (d) { lastState = d && d.state; render(lastState); refreshExpanded(lastState); }).catch(function () {});
+    }).then(function (d) { if (d === STATE_UNCHANGED) return; lastState = d && d.state; render(lastState); refreshExpanded(lastState); }).catch(function () {});
   }
 
   /* 逐局战况按需展开：事件委托，展开状态跨刷新保留 */
@@ -247,8 +256,8 @@
   }
   function connectEvents() {
     var source = new EventSource('/api/lobby/events');
-    // （重）连上后补拉一次：断线期间错过的推进靠这次回源追平
-    source.onopen = function () { queueLoad(); };
+    // （重）连上后补拉一次：断线期间错过的推进靠这次回源追平（强制全量，不带版本头）
+    source.onopen = function () { forceFullLoad = true; queueLoad(); };
     source.onmessage = function (e) {
       var m;
       try { m = JSON.parse(e.data); } catch (err) { return; }

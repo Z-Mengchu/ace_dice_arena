@@ -2,6 +2,8 @@ package com.acedicearena.service;
 
 import jakarta.annotation.PreDestroy;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
@@ -18,6 +20,7 @@ public class LobbyEventService {
     private static final long CHANGE_COALESCE_MS = 600L;
     private static final long RECONNECT_TIME_MS = 3_000L;
     private static final long HEARTBEAT_INTERVAL_SECONDS = 25L;
+    private final StateVersionClock stateVersions;
     private final Set<Client> clients = ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService broadcaster = Executors.newSingleThreadScheduledExecutor(runnable -> {
         Thread thread = new Thread(runnable, "lobby-event-broadcaster");
@@ -29,7 +32,8 @@ public class LobbyEventService {
     private final AtomicBoolean adminGameChangePending = new AtomicBoolean();
     private final ConcurrentHashMap<String, AtomicBoolean> teamGameChangePending = new ConcurrentHashMap<>();
 
-    public LobbyEventService() {
+    public LobbyEventService(StateVersionClock stateVersions) {
+        this.stateVersions = stateVersions;
         broadcaster.scheduleWithFixedDelay(this::heartbeat, HEARTBEAT_INTERVAL_SECONDS,
                 HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
     }
@@ -49,28 +53,43 @@ public class LobbyEventService {
      * 大厅资料变化：分组、准备状态等，需要客户端重新读取大厅和比赛状态。
      */
     public void stateChanged() {
-        scheduleChange("lobby", lobbyChangePending);
+        afterCommit(() -> {
+            stateVersions.tick();
+            scheduleChange("lobby", lobbyChangePending);
+            scheduleChange("game", gameChangePending);
+        });
     }
 
     /**
      * 比赛状态变化：投票、骰子、比分等，只需要客户端重新读取比赛状态。
      */
     public void gameChanged() {
-        scheduleChange("game", gameChangePending);
+        afterCommit(() -> {
+            stateVersions.tick();
+            scheduleChange("game", gameChangePending);
+        });
     }
 
     /**
      * 阶段/截止时间推进：时效敏感，跳过合并立即广播。
      */
     public void gameChangedNow() {
-        Event event = new Event("game", null, null, null);
-        clients.forEach(client -> send(client, event));
+        afterCommit(() -> {
+            stateVersions.tick();
+            Event event = new Event("game", null, null, null);
+            clients.forEach(client -> send(client, event));
+        });
     }
 
     /**
      * 单张角色选票变化只刷新管理员监控，避免普通玩家的投票表单被反复重绘。
      */
     public void adminGameChanged() {
+        afterCommit(this::publishAdminGameChanged);
+    }
+
+    private void publishAdminGameChanged() {
+        stateVersions.tick();
         if (!adminGameChangePending.compareAndSet(false, true)) return;
         broadcaster.schedule(() -> {
             adminGameChangePending.set(false);
@@ -83,6 +102,11 @@ public class LobbyEventService {
      * 角色投票切换到下一角色时，只刷新本队和管理员。
      */
     public void teamGameChanged(String teamId) {
+        afterCommit(() -> publishTeamGameChanged(teamId));
+    }
+
+    private void publishTeamGameChanged(String teamId) {
+        stateVersions.tick();
         AtomicBoolean pending = teamGameChangePending.computeIfAbsent(teamId, ignored -> new AtomicBoolean());
         if (!pending.compareAndSet(false, true)) return;
         broadcaster.schedule(() -> {
@@ -91,6 +115,21 @@ public class LobbyEventService {
             clients.stream().filter(client -> client.admin() || teamId.equals(client.teamId()))
                     .forEach(client -> send(client, event));
         }, CHANGE_COALESCE_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /** 版本与通知都在提交后发布，回滚事务不得使客户端缓存失效。 */
+    private void afterCommit(Runnable notification) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()
+                && TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    notification.run();
+                }
+            });
+        } else {
+            notification.run();
+        }
     }
 
     public void chat(String teamId, String sender, String content) {

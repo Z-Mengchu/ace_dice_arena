@@ -52,6 +52,14 @@ public class PlayerActionService {
             }
             return body;
         }
+        // 猜阵按 (场次, 轮次, 玩家) 独立成行（match_guess 表），不取 game_state 全局行锁；
+        // 沙盘/测试账号返回 false，回落下方行锁 JSON 路径
+        if ("round-guess".equals(type) || "pre-guess".equals(type) || "retract-guess".equals(type)) {
+            if (submitGuessIndependent(user, type, selections)) {
+                events.gameChanged();
+                return Map.of("ok", true);
+            }
+        }
         GameStateRecord record = gameStates.findLockedById(1L)
                 .orElseThrow(() -> new IllegalStateException("主持人尚未创建比赛"));
         ObjectNode root = parse(record.getContent());
@@ -81,6 +89,26 @@ public class PlayerActionService {
         } catch (DataIntegrityViolationException duplicate) {
             Integer box = tournament.openedBlindBoxValue(user);
             if (box != null) return new ParallelTournamentService.BlindBoxResult(box, null, -1);
+            throw duplicate;
+        }
+    }
+
+    /**
+     * 独立猜阵；唯一键冲突 = 并发重复提交/改投（照盲盒唯一键兜底）：
+     * round-guess 恢复为「已提交」语义，pre-guess 恢复为覆盖最新目标。
+     * 返回 false 表示沙盘/测试账号，调用方回落行锁 JSON 路径。
+     */
+    private boolean submitGuessIndependent(UserAccount user, String type, List<String> selections) {
+        List<String> values = selections == null ? List.of() : selections;
+        try {
+            return tournament.submitGuessIndependent(user, type, values);
+        } catch (DataIntegrityViolationException duplicate) {
+            if ("pre-guess".equals(type)) {
+                tournament.overwritePreGuessAfterConflict(user, values);
+                return true;
+            }
+            if ("round-guess".equals(type) && tournament.roundGuessSubmitted(user))
+                throw new IllegalStateException("你已经提交过本轮猜阵");
             throw duplicate;
         }
     }

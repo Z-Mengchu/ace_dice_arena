@@ -58,17 +58,20 @@ class PlayerActionServiceTest {
         service.submit("player", "blind-box-open", List.of());
         service.submit("player", "reroll", List.of("u5"));
         service.submit("player", "squad-order", List.of("3", "1", "2", "4", "5", "6"));
+        when(tournament.submitGuessIndependent(eq(player), eq("round-guess"), anyList())).thenReturn(true);
         service.submit("player", "round-guess", List.of("u101"));
 
         verify(tournament).dispatchPlayerAction(any(), eq(player), eq("squad-form"), eq(List.of("u1")));
         verify(tournament).dispatchPlayerAction(any(), eq(player), eq("reroll"), eq(List.of("u5")));
         verify(tournament).dispatchPlayerAction(any(), eq(player), eq("squad-order"), eq(List.of("3", "1", "2", "4", "5", "6")));
-        verify(tournament).dispatchPlayerAction(any(), eq(player), eq("round-guess"), eq(List.of("u101")));
+        // 猜阵走 match_guess 独立行存储路径，不进 game_state 全局锁也不走动作分发表
+        verify(tournament).submitGuessIndependent(eq(player), eq("round-guess"), eq(List.of("u101")));
+        verify(tournament, never()).dispatchPlayerAction(any(), any(), eq("round-guess"), any());
         // 开盲盒走独立行存储路径，不进 game_state 全局锁也不走动作分发表；未带序号时为 null
         verify(tournament).openBlindBoxIndependent(eq(player), isNull());
         verify(tournament, never()).dispatchPlayerAction(any(), any(), eq("blind-box-open"), any());
         verify(tournament, never()).submitSandboxAction(any(), any(), any(), any());
-        verify(states, times(4)).save(record);
+        verify(states, times(3)).save(record);
         verify(events, times(5)).gameChanged();
     }
 
@@ -83,7 +86,9 @@ class PlayerActionServiceTest {
                 mock(LobbyEventService.class), 0,
                 mock(com.acedicearena.repository.BattleReportRepository.class),
                 mock(com.acedicearena.repository.MatchReportRepository.class),
-                mock(com.acedicearena.repository.PlayerBlindBoxRepository.class));
+                mock(com.acedicearena.repository.PlayerBlindBoxRepository.class),
+                mock(com.acedicearena.repository.PlayerRollRepository.class),
+                mock(com.acedicearena.repository.MatchGuessRepository.class));
         UserAccount player = new UserAccount("player", "队员", "技术部", "USER", "hash", "salt");
         player.assignTeam("t1");
         when(users.findByUsername("player")).thenReturn(Optional.of(player));
@@ -121,10 +126,13 @@ class PlayerActionServiceTest {
                 mock(LobbyEventService.class), tournament);
 
         service.submit("sandbox_player", "role-vote", List.of("u1"));
+        // 沙盘玩家的猜阵在独立路径返回 false 后回落行锁 JSON 分发（mock 默认 false）
+        service.submit("sandbox_player", "round-guess", List.of("u101"));
 
         verify(tournament).submitSandboxAction(any(), eq(player), eq("role-vote"), eq(List.of("u1")));
+        verify(tournament).submitSandboxAction(any(), eq(player), eq("round-guess"), eq(List.of("u101")));
         verify(tournament, never()).submitRoleVote(any(), any(), any());
-        verify(states).save(record);
+        verify(states, times(2)).save(record);
     }
 
     @Test

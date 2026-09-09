@@ -550,7 +550,7 @@ class ParallelTournamentServiceTest {
     }
 
     @Test
-    void liveRollWritesDiceAndClampedTimestampAndRejectsRepeats() throws Exception {
+    void liveRollWritesDiceRowAndClampedTimestampAndRepeatsReturnTheSameResult() throws Exception {
         long before = System.currentTimeMillis();
         ObjectNode root = rollRoot(before - 1_000L, before + 30_000L);
         UserAccount player = user(1L, "t1");
@@ -558,25 +558,34 @@ class ParallelTournamentServiceTest {
         when(users.findByUsername("user1")).thenReturn(Optional.of(player));
         var states = mock(com.acedicearena.repository.GameStateRepository.class);
         var record = new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test");
-        when(states.findLockedById(1L)).thenReturn(Optional.of(record));
+        when(states.findById(1L)).thenReturn(Optional.of(record));
         LobbyEventService events = mock(LobbyEventService.class);
-        ParallelTournamentService service = service(states, users, events);
+        List<com.acedicearena.domain.PlayerRoll> rows = new ArrayList<>();
+        ParallelTournamentService service = service(states, users, events, rollRows(rows));
 
         ParallelTournamentService.LiveRoll roll = service.recordLiveRoll("user1", before);
         long after = System.currentTimeMillis();
 
         assertThat(roll.die()).isBetween(1, 6);
         assertThat(roll.rollTs()).isBetween(before - ParallelTournamentService.ROLL_TOLERANCE_MS, after);
+        // 结果写 player_roll 独立行，不动 game_state JSON
+        assertThat(rows).hasSize(1);
+        com.acedicearena.domain.PlayerRoll row = rows.get(0);
+        assertThat(row.getPlayerId()).isEqualTo("u1");
+        assertThat(row.getDice()).isEqualTo(roll.die());
+        assertThat(row.getDiceFinal()).isEqualTo(roll.die());
+        assertThat(row.getRollTs()).isEqualTo(roll.rollTs());
+        assertThat(row.isAutoRolled()).isFalse();
         ObjectNode savedRoot = (ObjectNode) mapper.readTree(record.getContent());
-        ObjectNode saved = player(team(savedRoot, "t1"), "u1");
-        assertThat(saved.path("dice").asInt()).isEqualTo(roll.die());
-        assertThat(saved.path("diceFinal").asInt()).isEqualTo(roll.die());
-        assertThat(saved.path("rollTs").asLong()).isEqualTo(roll.rollTs());
-        assertThat(saved.has("autoRolled")).isFalse();
+        assertThat(player(team(savedRoot, "t1"), "u1").has("dice")).isFalse();
         verify(events).gameChanged();
 
-        assertThatThrownBy(() -> service.recordLiveRoll("user1", System.currentTimeMillis()))
-                .hasMessage("你本轮已经掷过骰子");
+        // 重复掷骰幂等：返回原结果，不产生新行、不再广播
+        ParallelTournamentService.LiveRoll repeat = service.recordLiveRoll("user1", System.currentTimeMillis());
+        assertThat(repeat.die()).isEqualTo(roll.die());
+        assertThat(repeat.rollTs()).isEqualTo(roll.rollTs());
+        assertThat(rows).hasSize(1);
+        verify(events, org.mockito.Mockito.times(1)).gameChanged();
     }
 
     @Test
@@ -590,7 +599,7 @@ class ParallelTournamentServiceTest {
         when(users.findByUsername("user1")).thenReturn(Optional.of(early));
         when(users.findByUsername("user2")).thenReturn(Optional.of(future));
         var states = mock(com.acedicearena.repository.GameStateRepository.class);
-        when(states.findLockedById(1L)).thenReturn(
+        when(states.findById(1L)).thenReturn(
                 Optional.of(new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test")));
         ParallelTournamentService service = service(states, users, mock(LobbyEventService.class));
 
@@ -606,7 +615,7 @@ class ParallelTournamentServiceTest {
         var oldUsers = mock(com.acedicearena.repository.UserAccountRepository.class);
         when(oldUsers.findByUsername("user3")).thenReturn(Optional.of(past));
         var oldStates = mock(com.acedicearena.repository.GameStateRepository.class);
-        when(oldStates.findLockedById(1L)).thenReturn(
+        when(oldStates.findById(1L)).thenReturn(
                 Optional.of(new com.acedicearena.domain.GameStateRecord(1L, oldRoot.toString(), "test")));
         ParallelTournamentService oldService = service(oldStates, oldUsers, mock(LobbyEventService.class));
 
@@ -686,14 +695,22 @@ class ParallelTournamentServiceTest {
         when(users.findByUsername("user1")).thenReturn(Optional.of(account));
         var states = mock(com.acedicearena.repository.GameStateRepository.class);
         var record = new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test");
+        when(states.findById(1L)).thenReturn(Optional.of(record));
         when(states.findLockedById(1L)).thenReturn(Optional.of(record));
-        ParallelTournamentService service = service(states, users, mock(LobbyEventService.class));
+        List<com.acedicearena.domain.PlayerRoll> rows = new ArrayList<>();
+        ParallelTournamentService service = service(states, users, mock(LobbyEventService.class), rollRows(rows));
 
         service.recordLiveRoll("user1", now);
 
         ObjectNode saved = (ObjectNode) mapper.readTree(record.getContent());
         assertThat(saved.path("stage").asText()).isEqualTo("BLIND_BOX");
         assertThat(saved.path("stageDeadlineAt").asLong()).isGreaterThan(now);
+        // 锁内推进时把 player_roll 行合并回 JSON（skip-if-present 不覆盖已有掷骰）
+        ObjectNode rolled = player(team(saved, "t1"), "u1");
+        assertThat(rolled.path("dice").asInt()).isEqualTo(rows.get(0).getDice());
+        assertThat(rolled.path("diceFinal").asInt()).isEqualTo(rows.get(0).getDice());
+        assertThat(rolled.path("rollTs").asLong()).isEqualTo(rows.get(0).getRollTs());
+        assertThat(player(team(saved, "t1"), "u2").path("dice").asInt()).isEqualTo(3);
     }
 
     /* ---------- 战术确认 ---------- */
@@ -1061,13 +1078,44 @@ class ParallelTournamentServiceTest {
     private ParallelTournamentService service(com.acedicearena.repository.GameStateRepository states,
                                               com.acedicearena.repository.UserAccountRepository users,
                                               LobbyEventService events) {
+        return service(states, users, events,
+                org.mockito.Mockito.mock(com.acedicearena.repository.PlayerRollRepository.class));
+    }
+
+    private ParallelTournamentService service(com.acedicearena.repository.GameStateRepository states,
+                                              com.acedicearena.repository.UserAccountRepository users,
+                                              LobbyEventService events,
+                                              com.acedicearena.repository.PlayerRollRepository playerRolls) {
         return new ParallelTournamentService(states, users,
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
                 events, 6_000L,
                 org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.MatchReportRepository.class),
-                org.mockito.Mockito.mock(com.acedicearena.repository.PlayerBlindBoxRepository.class));
+                org.mockito.Mockito.mock(com.acedicearena.repository.PlayerBlindBoxRepository.class),
+                playerRolls,
+                org.mockito.Mockito.mock(com.acedicearena.repository.MatchGuessRepository.class));
+    }
+
+    /** 有状态的 player_roll 仓库替身：saveAndFlush 入行，两个查询按行应答（行幂等/合并/计数共用）。 */
+    private com.acedicearena.repository.PlayerRollRepository rollRows(List<com.acedicearena.domain.PlayerRoll> rows) {
+        var rolls = org.mockito.Mockito.mock(com.acedicearena.repository.PlayerRollRepository.class);
+        org.mockito.Mockito.when(rolls.saveAndFlush(org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(inv -> {
+                    com.acedicearena.domain.PlayerRoll row = inv.getArgument(0);
+                    rows.add(row);
+                    return row;
+                });
+        org.mockito.Mockito.when(rolls.findByGameDayAndBracketRound(
+                        org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.anyInt()))
+                .thenAnswer(inv -> List.copyOf(rows));
+        org.mockito.Mockito.when(rolls.findByGameDayAndBracketRoundAndPlayerId(
+                        org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.anyInt(),
+                        org.mockito.ArgumentMatchers.anyString()))
+                .thenAnswer(inv -> rows.stream()
+                        .filter(row -> row.getPlayerId().equals(inv.getArgument(2)))
+                        .findFirst());
+        return rolls;
     }
 
     /** ROLL 阶段：t1/t2 各 30 人，g1 进行中，go 与截止时间由参数指定；小队错峰时刻表与真实状态一致。 */
@@ -1082,11 +1130,12 @@ class ParallelTournamentServiceTest {
         return root;
     }
 
-    /** 带持久化仓库的 service：findLockedById 返回装有 root 的记录，账号按用户名可查。 */
+    /** 带持久化仓库的 service：findById/findLockedById 返回装有 root 的记录，账号按用户名可查。 */
     private ParallelTournamentService rollingService(ObjectNode root, UserAccount... accounts) {
         var states = mock(com.acedicearena.repository.GameStateRepository.class);
-        when(states.findLockedById(1L)).thenReturn(
-                Optional.of(new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test")));
+        var record = new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test");
+        when(states.findById(1L)).thenReturn(Optional.of(record));
+        when(states.findLockedById(1L)).thenReturn(Optional.of(record));
         var users = mock(com.acedicearena.repository.UserAccountRepository.class);
         for (UserAccount account : accounts)
             when(users.findByUsername(account.getUsername())).thenReturn(Optional.of(account));
