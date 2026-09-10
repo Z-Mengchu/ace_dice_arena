@@ -15,6 +15,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.servlet.http.HttpSession;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
@@ -28,6 +30,7 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequestMapping("/api")
 public class GameDataController {
     private static final long STATE_ID = 1L;
+    private static final String STATE_CACHE_CONTROL = "private, no-cache";
     private final GameStateRepository gameStateRepository;
     private final BattleReportRepository battleReportRepository;
     private final ObjectMapper objectMapper;
@@ -59,25 +62,44 @@ public class GameDataController {
     }
 
     @GetMapping("/game-state")
-    public ResponseEntity<?> getGameState(HttpSession session) {
+    public ResponseEntity<?> getGameState(
+            @RequestParam(required = false) String scope,
+            @RequestHeader(value = HttpHeaders.IF_NONE_MATCH, required = false) String ifNoneMatch,
+            HttpSession session) {
         StateSnapshot snapshot = gameState();
         boolean ordinaryUser = "USER".equals(session.getAttribute("role"));
         String username = (String) session.getAttribute(AuthController.SESSION_USER);
         if (ordinaryUser && sandboxHidden(username, snapshot)) return ResponseEntity.noContent().build();
         if (!snapshot.present()) return ResponseEntity.noContent().build();
+        UserAccount account = ordinaryUser ? users.findByUsername(username).orElse(null) : null;
+        String teamId = account == null ? null : account.getTeamId();
+        String playerId = account == null ? null : "u" + account.getId();
+        boolean playerScope = ordinaryUser && "player".equals(scope);
+        String viewKey = ordinaryUser
+                ? (playerScope ? "player:" : "public:") + (teamId != null ? "t:" + teamId
+                        : playerId != null ? "p:" + playerId : "outsider")
+                : "admin";
+        String etag = stateEtag(snapshot.version(), viewKey);
+        if (etagMatches(ifNoneMatch, etag)) {
+            return ResponseEntity.status(HttpStatus.NOT_MODIFIED).eTag(etag)
+                    .header(HttpHeaders.CACHE_CONTROL, STATE_CACHE_CONTROL).build();
+        }
         JsonNode state = snapshot.state();
         if (ordinaryUser) {
-            UserAccount account = users.findByUsername(username).orElse(null);
-            String teamId = account == null ? null : account.getTeamId();
-            String playerId = account == null ? null : "u" + account.getId();
             // 脱敏视图只取决于 (state, teamId, playerId)：按队缓存在快照上，随快照替换整体失效，
             // 避免每个回源请求都对全树深拷贝；teamId 为空时视图按 playerId 兜底定位本队。
-            String viewKey = teamId != null ? "t:" + teamId
-                    : playerId != null ? "p:" + playerId : "outsider";
             state = snapshot.teamViews().computeIfAbsent(viewKey,
-                    key -> tournament.publicStateView(snapshot.state(), teamId, playerId));
+                    key -> playerScope
+                            ? tournament.playerStateView(snapshot.state(), teamId, playerId)
+                            : tournament.publicStateView(snapshot.state(), teamId, playerId));
         }
-        return ResponseEntity.ok(Map.of("state", state, "version", snapshot.version()));
+        return ResponseEntity.ok().eTag(etag).header(HttpHeaders.CACHE_CONTROL, STATE_CACHE_CONTROL)
+                .body(Map.of("state", state, "version", snapshot.version()));
+    }
+
+    /** 供轻量单元测试与内部调用保留的无条件读取入口。 */
+    public ResponseEntity<?> getGameState(HttpSession session) {
+        return getGameState(null, null, session);
     }
 
     /**
@@ -165,11 +187,15 @@ public class GameDataController {
     private StateSnapshot gameState() {
         long now = System.currentTimeMillis();
         StateSnapshot cached = stateCache;
-        if (stateCacheTtlMs > 0 && cached != null && now - cached.loadedAt() < stateCacheTtlMs) return cached;
+        long currentVersion = gameStateRepository.findVersionById(STATE_ID).orElse(0L);
+        if (stateCacheTtlMs > 0 && cached != null && cached.version() == currentVersion
+                && now - cached.loadedAt() < stateCacheTtlMs) return cached;
         synchronized (stateCacheLock) {
             cached = stateCache;
             now = System.currentTimeMillis();
-            if (stateCacheTtlMs > 0 && cached != null && now - cached.loadedAt() < stateCacheTtlMs) return cached;
+            currentVersion = gameStateRepository.findVersionById(STATE_ID).orElse(0L);
+            if (stateCacheTtlMs > 0 && cached != null && cached.version() == currentVersion
+                    && now - cached.loadedAt() < stateCacheTtlMs) return cached;
             long loadedAt = now;
             StateSnapshot loaded = gameStateRepository.findById(STATE_ID)
                     .map(record -> {
@@ -185,6 +211,19 @@ public class GameDataController {
             stateCache = loaded;
             return loaded;
         }
+    }
+
+    private static String stateEtag(long version, String viewKey) {
+        return "\"game-state-" + version + "-" + viewKey + "\"";
+    }
+
+    private static boolean etagMatches(String ifNoneMatch, String etag) {
+        if (ifNoneMatch == null || ifNoneMatch.isBlank()) return false;
+        for (String candidate : ifNoneMatch.split(",")) {
+            String value = candidate.trim();
+            if ("*".equals(value) || etag.equals(value) || ("W/" + etag).equals(value)) return true;
+        }
+        return false;
     }
 
     private boolean hasTestUsers() {

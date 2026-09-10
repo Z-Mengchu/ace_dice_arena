@@ -896,18 +896,7 @@ public class ParallelTournamentService {
      */
     public JsonNode publicStateView(JsonNode state, String teamId, String playerId) {
         ObjectNode view = state.deepCopy();
-        String ownTeamId = teamId;
-        if (ownTeamId == null && playerId != null) {
-            for (JsonNode team : view.path("teams")) {
-                for (JsonNode player : team.path("players")) {
-                    if (playerId.equals(player.path("id").asText())) {
-                        ownTeamId = team.path("id").asText();
-                        break;
-                    }
-                }
-                if (ownTeamId != null) break;
-            }
-        }
+        String ownTeamId = resolveTeamId(view, teamId, playerId);
         for (JsonNode teamNode : view.path("teams")) {
             ObjectNode team = (ObjectNode) teamNode;
             team.remove(TEAM_PERFORMANCE_FIELDS);
@@ -924,6 +913,65 @@ public class ParallelTournamentService {
             summarizeRounds(match);
         }
         return view;
+    }
+
+    /**
+     * /player 专用状态：保留阶段标量、本队、当前对手和当前比赛，移除其余队伍与历史快照。
+     */
+    public JsonNode playerStateView(JsonNode state, String teamId, String playerId) {
+        ObjectNode view = (ObjectNode) publicStateView(state, teamId, playerId);
+        String ownTeamId = resolveTeamId(view, teamId, playerId);
+        Map.Entry<String, JsonNode> current = currentMatch(view.path("matches"), ownTeamId);
+        String opponentId = null;
+        if (current != null) {
+            JsonNode match = current.getValue();
+            opponentId = ownTeamId != null && ownTeamId.equals(match.path("a").asText())
+                    ? match.path("b").asText(null) : match.path("a").asText(null);
+        }
+
+        ArrayNode visibleTeams = mapper.createArrayNode();
+        String championId = view.path("champion").asText(null);
+        for (JsonNode team : view.path("teams")) {
+            String id = team.path("id").asText();
+            if (id.equals(championId)) view.put("championName", team.path("name").asText(id));
+            if (id.equals(ownTeamId) || id.equals(opponentId)) visibleTeams.add(team);
+        }
+        ObjectNode visibleMatches = mapper.createObjectNode();
+        if (current != null) visibleMatches.set(current.getKey(), current.getValue());
+        view.set("teams", visibleTeams);
+        view.set("matches", visibleMatches);
+        view.remove(List.of("dayResults", "overallResult", "sandboxPlayers", "sandboxSolo"));
+        return view;
+    }
+
+    private String resolveTeamId(JsonNode state, String teamId, String playerId) {
+        if (teamId != null) return teamId;
+        if (playerId == null) return null;
+        for (JsonNode team : state.path("teams")) {
+            for (JsonNode player : team.path("players"))
+                if (playerId.equals(player.path("id").asText())) return team.path("id").asText();
+        }
+        return null;
+    }
+
+    private Map.Entry<String, JsonNode> currentMatch(JsonNode matches, String teamId) {
+        if (teamId == null || !matches.isObject()) return null;
+        Map.Entry<String, JsonNode> latest = null;
+        int latestRank = -1;
+        var iterator = matches.fields();
+        while (iterator.hasNext()) {
+            Map.Entry<String, JsonNode> entry = iterator.next();
+            JsonNode match = entry.getValue();
+            if (!teamId.equals(match.path("a").asText()) && !teamId.equals(match.path("b").asText())) continue;
+            if ("active".equals(match.path("status").asText())) return entry;
+            String id = entry.getKey();
+            int rank = id.startsWith("f") ? 3 : id.startsWith("s") ? 2 : 1;
+            if (rank >= latestRank) {
+                latest = entry;
+                latestRank = rank;
+            }
+        }
+        return latest;
     }
 
     /**
@@ -1087,6 +1135,10 @@ public class ParallelTournamentService {
             states.save(record);
             // 阶段推进：立即广播，玩家端不依赖到点兜底
             events.gameChangedNow();
+        } else {
+            // 盲盒结果虽独立成行，仍属于玩家可见状态；推进版本供 SSE/ETag 判断。
+            record.touch(user.getUsername());
+            states.save(record);
         }
         return new BlindBoxResult(value, boxes, picked);
     }

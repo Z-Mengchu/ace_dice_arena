@@ -32,6 +32,11 @@ public class GameStateRecord {
 
     public void update(String content, String updatedBy) {
         this.content = content;
+        touch(updatedBy);
+    }
+
+    /** 玩家可见的关联数据变化时，只推进状态版本，不重写正文。 */
+    public void touch(String updatedBy) {
         this.updatedBy = updatedBy;
         this.updatedAt = Instant.now();
         this.version++;

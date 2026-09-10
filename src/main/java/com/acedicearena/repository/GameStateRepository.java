@@ -8,6 +8,9 @@ import jakarta.persistence.LockModeType;
 import java.util.Optional;
 
 public interface GameStateRepository extends JpaRepository<GameStateRecord, Long> {
+    @Query("select g.version from GameStateRecord g where g.id = :id")
+    Optional<Long> findVersionById(Long id);
+
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select g from GameStateRecord g where g.id = :id")
     Optional<GameStateRecord> findLockedById(Long id);

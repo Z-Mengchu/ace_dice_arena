@@ -26,6 +26,7 @@ class GameDataControllerCacheTest {
         GameStateRepository states = mock(GameStateRepository.class);
         GameStateRecord record = new GameStateRecord(1L, "{\"stage\":\"ACCUMULATION\"}", "test");
         when(states.findById(1L)).thenReturn(Optional.of(record));
+        when(states.findVersionById(1L)).thenAnswer(ignored -> Optional.of(record.getVersion()));
         GameDataController controller = new GameDataController(states, mock(BattleReportRepository.class),
                 new ObjectMapper(), mock(LobbyEventService.class), mock(UserAccountRepository.class),
                 mock(com.acedicearena.service.ParallelTournamentService.class),
@@ -43,6 +44,7 @@ class GameDataControllerCacheTest {
         GameStateRepository states = mock(GameStateRepository.class);
         GameStateRecord record = new GameStateRecord(1L, "{\"stage\":\"ACCUMULATION\",\"teams\":[]}", "test");
         when(states.findById(1L)).thenReturn(Optional.of(record));
+        when(states.findVersionById(1L)).thenAnswer(ignored -> Optional.of(record.getVersion()));
         UserAccountRepository users = mock(UserAccountRepository.class);
         UserAccount account = mock(UserAccount.class);
         when(account.getTeamId()).thenReturn("t1");
@@ -65,5 +67,27 @@ class GameDataControllerCacheTest {
         controller.saveGameState(new ObjectMapper().createObjectNode(), session);
         assertThat(controller.getGameState(session).getStatusCode().is2xxSuccessful()).isTrue();
         verify(tournament, times(2)).publicStateView(any(), any(), any());
+    }
+
+    @Test
+    void matchingGameStateEtagReturnsNotModifiedWithoutBuildingAnotherView() {
+        GameStateRepository states = mock(GameStateRepository.class);
+        GameStateRecord record = new GameStateRecord(1L, "{\"stage\":\"ROLL\",\"teams\":[]}", "test");
+        when(states.findById(1L)).thenReturn(Optional.of(record));
+        when(states.findVersionById(1L)).thenReturn(Optional.of(record.getVersion()));
+        GameDataController controller = new GameDataController(states, mock(BattleReportRepository.class),
+                new ObjectMapper(), mock(LobbyEventService.class), mock(UserAccountRepository.class),
+                mock(ParallelTournamentService.class), mock(MatchReportRepository.class), 1000);
+        MockHttpSession admin = new MockHttpSession();
+        admin.setAttribute("role", "ADMIN");
+
+        var first = controller.getGameState(null, null, admin);
+        String etag = first.getHeaders().getETag();
+        var unchanged = controller.getGameState(null, etag, admin);
+
+        assertThat(etag).isEqualTo("\"game-state-1-admin\"");
+        assertThat(unchanged.getStatusCode().value()).isEqualTo(304);
+        assertThat(unchanged.getBody()).isNull();
+        verify(states, times(1)).findById(1L);
     }
 }

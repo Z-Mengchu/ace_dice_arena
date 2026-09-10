@@ -512,6 +512,31 @@ class ParallelTournamentServiceTest {
         assertThat(team(sandbox, "t1").has("squads")).isFalse();
     }
 
+    @Test
+    void playerStateViewKeepsOnlyOwnTeamCurrentOpponentAndCurrentMatch() {
+        ParallelTournamentService service = service();
+        ObjectNode root = battleRoot();
+        root.withArray("teams").add(team("t3", 0.9)).add(team("t4", 0.8));
+        ObjectNode unrelated = root.withObject("/matches").putObject("g2");
+        unrelated.put("id", "g2").put("a", "t3").put("b", "t4").put("status", "active");
+        unrelated.putArray("rounds");
+        root.put("champion", "t3");
+        root.putObject("dayResults").putObject("day1").put("largeHistory", true);
+
+        ObjectNode view = (ObjectNode) service.playerStateView(root, "t1", "u1");
+
+        assertThat(view.path("teams").findValuesAsText("id")).containsExactly("t1", "t2");
+        assertThat(view.at("/teams/0/players")).hasSize(30);
+        assertThat(view.at("/teams/1/players")).hasSize(30);
+        List<String> matchIds = new ArrayList<>();
+        view.path("matches").fieldNames().forEachRemaining(matchIds::add);
+        assertThat(matchIds).containsExactly("g1");
+        assertThat(view.path("championName").asText()).isEqualTo("t3");
+        assertThat(view.has("dayResults")).isFalse();
+        assertThat(root.path("teams")).hasSize(4);
+        assertThat(root.has("dayResults")).isTrue();
+    }
+
     /* ---------- 猜阵与单局结算 ---------- */
 
     @Test

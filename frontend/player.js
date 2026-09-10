@@ -68,6 +68,35 @@
     });
   }
 
+  function loadGameState() {
+    var headers = {};
+    if (gameStateEtag) headers['If-None-Match'] = gameStateEtag;
+    return fetchWithTimeout('/api/game-state?scope=player', { headers: headers }, 8000).then(function (response) {
+      if (response.status === 304) return { notModified: true };
+      if (response.status === 204) return { notModified: false, state: null, version: null };
+      return response.json().catch(function () { return {}; }).then(function (body) {
+        if (!response.ok) {
+          var error = new Error(body.error || ('访问玩家状态失败（HTTP ' + response.status + '）'));
+          error.status = response.status;
+          error.endpoint = '/api/game-state?scope=player';
+          throw error;
+        }
+        gameStateEtag = response.headers.get('ETag');
+        gameStateVersion = body.version == null ? null : String(body.version);
+        return { notModified: false, state: body.state || null, version: gameStateVersion };
+      });
+    });
+  }
+
+  function applyGameState(result) {
+    if (!result || result.notModified) return;
+    gameState = result.state;
+    if (result.version == null) {
+      gameStateVersion = null;
+      gameStateEtag = null;
+    }
+  }
+
   /* ==================== 2. 状态 ==================== */
 
   var SKEY = 'dice-arena-player-v2';
@@ -76,6 +105,8 @@
   var loginUser = null;
   var assignment = null;        // /api/roll-assignment 响应 {eligible, stage, rollGoAt, stageDeadlineAt, alreadyRolled, teamId}
   var gameState = null;         // /api/game-state 的 state 部分（取队名与已掷点数用）
+  var gameStateVersion = null;
+  var gameStateEtag = null;
   var ui = {
     screen: 'loading',          // loading / idle / main / ended / error
     sub: 'calibrating',         // main 内：countdown / go / rolled / kick / blindbox / battle / waiting（calibrating 仅作 join 期间的瞬时占位）
@@ -98,7 +129,8 @@
   };
   var es = null;
   var refreshTimer = null;
-  var assignmentLoading = false, assignmentPending = false;
+  var refreshExpectedVersion = null, refreshForced = false;
+  var assignmentLoading = false, assignmentPending = false, assignmentPendingVersion = null;
   var matchDetails = {}, matchDetailPending = {};
   var rerollBaseline = -1;      // 首次见到本队重掷日志时只建基线，不弹历史记录；日志重置（下一 bracket）时重建
   var rerollQueue = [];
@@ -145,7 +177,9 @@
   function myTeam() { return findTeamById(myTeamId()); }
   function teamNameOf(id) {
     var team = findTeamById(id);
-    return team && team.name ? team.name : id || '';
+    if (team && team.name) return team.name;
+    if (gameState && id === gameState.champion && gameState.championName) return gameState.championName;
+    return id || '';
   }
   function myTeamName() {
     var name = teamNameOf(myTeamId());
@@ -362,41 +396,75 @@
   function connectEvents() {
     if (es) return;
     try { es = new EventSource('/api/lobby/events'); } catch (e) { return; }
-    // （重）连上后补拉一次：断线期间错过的阶段推进靠这次回源追平
-    es.onopen = function () { setNet('已连接服务器', false); scheduleRefresh(); };
+    // 建连后的 sync 事件只带版本：相同版本不请求，延迟连接/重连时才按需追平。
+    es.onopen = function () { setNet('已连接服务器', false); };
     es.onerror = function () { setNet('连接中断，重连中…', true); };
     es.onmessage = function (ev) {
       var msg = null;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg && msg.type === 'game') scheduleRefresh();
+      var gameChanged = msg && msg.type === 'game' &&
+        (msg.version == null || gameStateVersion == null || String(msg.version) !== gameStateVersion);
+      var syncChanged = msg && msg.type === 'sync' && msg.version != null &&
+        (gameStateVersion == null || String(msg.version) !== gameStateVersion);
+      if (gameChanged || syncChanged) {
+        scheduleRefresh(msg.version);
+      }
     };
   }
 
   /** 阶段变化通知可能连发，短去抖后统一回源资格与整局状态（保留随机抖动削峰） */
-  function scheduleRefresh() {
+  function scheduleRefresh(expectedVersion) {
+    if (expectedVersion != null) {
+      expectedVersion = String(expectedVersion);
+      if (gameStateVersion != null && expectedVersion === gameStateVersion) return;
+      refreshExpectedVersion = expectedVersion;
+    } else {
+      refreshForced = true;
+    }
     if (refreshTimer) return;
+    if (assignmentLoading) {
+      if (refreshForced) assignmentPending = true;
+      else assignmentPendingVersion = refreshExpectedVersion;
+      refreshForced = false;
+      refreshExpectedVersion = null;
+      return;
+    }
     refreshTimer = setTimeout(function () {
       refreshTimer = null;
-      refreshAssignment();
+      var forced = refreshForced;
+      var version = refreshExpectedVersion;
+      refreshForced = false;
+      refreshExpectedVersion = null;
+      if (!forced && version != null && version === gameStateVersion) return;
+      refreshAssignment(forced ? null : version);
     }, 120 + Math.floor(Math.random() * 120));
   }
 
   /** 资格与整局状态回源：in-flight 去重，并发触发合并为一次，期间到达的请求在完成后补一轮 */
-  function refreshAssignment() {
-    if (assignmentLoading) { assignmentPending = true; return; }
+  function refreshAssignment(expectedVersion) {
+    if (assignmentLoading) {
+      if (expectedVersion == null) assignmentPending = true;
+      else assignmentPendingVersion = String(expectedVersion);
+      return;
+    }
     assignmentLoading = true;
     Promise.all([
       bootJson('/api/roll-assignment'),
-      bootJson('/api/game-state', true)
+      loadGameState()
     ]).then(function (result) {
       assignment = result[0];
-      gameState = result[1] && result[1].state ? result[1].state : null;
+      applyGameState(result[1]);
       checkRerollPopups();
       onAssignmentChange();
     }).catch(function () { /* 网络抖动：等下一条通知 */ })
       .finally(function () {
         assignmentLoading = false;
-        if (assignmentPending) { assignmentPending = false; refreshAssignment(); }
+        var forcedPending = assignmentPending;
+        var pendingVersion = assignmentPendingVersion;
+        var retry = forcedPending || (pendingVersion != null && pendingVersion !== gameStateVersion);
+        assignmentPending = false;
+        assignmentPendingVersion = null;
+        if (retry) refreshAssignment(forcedPending ? null : pendingVersion);
       });
   }
 
@@ -1238,11 +1306,11 @@
     Promise.all([
       bootJson('/api/auth/me'),
       bootJson('/api/roll-assignment'),
-      bootJson('/api/game-state', true)
+      loadGameState()
     ]).then(function (result) {
       loginUser = result[0];
       assignment = result[1];
-      gameState = result[2] && result[2].state ? result[2].state : null;
+      applyGameState(result[2]);
       checkRerollPopups();
       var userEl = $('#pl-user');
       if (userEl) userEl.textContent = '👤 ' + loginUser.displayName;
