@@ -1,34 +1,36 @@
+import { icon } from './icons.js';
+
 (function () {
   'use strict';
 
   var rules = {
     CAPTAIN_VOTE: {
-      step: '第一阶段', title: '队长投票', summary: '开赛后先由全队独立投票选出队长，本阶段限时 20 秒。',
-      items: ['全员皆可被选为队长，不再限制前端/后端。', '每名真实玩家只能投一票；托管队友不参与投票。', '平票或无人投票时，按队员名单顺序取先者当选。', '20 秒内未提交视为弃票，系统按已投票计票。']
+      step: '第一阶段', title: '队长投票', icon: 'vote', summary: '开战前队内投票 pick 咱们的总指挥！全员每人 1 票，20 秒内完成。分队、排兵布阵全靠靠谱队长带队~',
+      items: ['队内所有人都可以参选，投给你信任的小伙伴！', '一人只有 1 票，系统托管的队友不能参与投票。', '票数打平 / 没人投票，直接取名单排序第一位当队长。', '20 秒没投票直接弃权，系统按现有票数统计。']
     },
     SQUAD_FORM: {
-      step: '第二阶段', title: '队长分队', summary: '队长把本队 30 人编排成 6 支 5 人小队（即 1~6 号出场位），限时 90 秒。',
-      items: ['只有当选队长可以操作，拖拽或点选均可。', '6 支小队各 5 人，必须覆盖全队 30 名队员且不重复。', '分队结果全天锁定不变；每个 bracket 轮次的掷骰/盲盒/重掷/排阵会重新进行。', '超时或队长缺席，由系统随机均分 6×5。']
+      step: '第二阶段', title: '队长分组', icon: 'squad', summary: '队长把 30 人划分 6 支小队，每队 5 人！同时定好 1-6 出场顺位，限时 90 秒。分组搭配很关键，田忌赛马的第一步！',
+      items: ['仅队长拥有操作权限，拖拽、点选都可以调整队员。', '6 个小队各 5 人，30 位小伙伴全部分配，不重复不漏人。', '当日分组持续生效；每一轮的掷骰、盲盒、重掷、出场顺序会重新计算。', '超时或者队长缺席，系统自动随机平均分成 6 个小队。']
     },
     ROLL: {
-      step: '第三阶段', title: '全员掷骰', summary: '全队同一倒计时，各小队按顺序间隔 1 秒错峰开掷，截止时刻全员统一。',
-      items: ['进入本阶段后全员同时看到倒计时，轮到本小队开掷后即可提交。', '每人只掷 1 枚骰子，截止时刻全员统一；点数由服务端生成，玩家无法挑选。', '同一小队 5 人的掷骰时刻首尾差 ≤0.5 秒，该小队触发 ×1.5 同步暴击。', '截止时未掷者由系统代掷，含代掷队员的小队必无暴击（不依赖时刻差）。']
+      step: '第三阶段', title: '全员掷骰', icon: 'dice', summary: '统一倒计时集体掷骰子拿到个人基础点数！同一小队 5 人 0.5 秒内全部掷完，直接解锁 ×1.5 默契暴击！手快有手慢无！',
+      items: ['小队间隔 1 秒错峰开启掷骰，截止时间全队统一。', '每人掷 1 颗骰子，点数系统随机生成，不能自选。', '同小队 5 人掷骰时间差 ≤0.5s，解锁全队 ×1.5 默契暴击！', '超时没手动掷骰，系统代掷；只要有代掷，小队无法触发暴击。']
     },
     BLIND_BOX: {
-      step: '第四阶段', title: '开盲盒', summary: '每人从 3 个盲盒中点选 1 个开启，效果只作用于本人，限时 25 秒。',
-      items: ['系统摆出 3 个盲盒，每人点选其中 1 个开启；开出后可见另外两个盒子的内容。', '盲盒对个人点数做 +5 / +4 / +3 / +2 / +1 / -1 / -2 的加减（不含 0）。', '默认概率分布为 1% / 4% / 10% / 25% / 35% / 17% / 8%（负档合计 25%）。', '25 秒内不选视为放弃（按 0 计），系统不代选不代开。']
+      step: '第四阶段', title: '开盲盒抽 buff', icon: 'gift', summary: '掷完骰子拆盲盒！三选一，有加分惊喜也有减益 debuff，直接刷新你的个人点数，限时 25 秒纯拼手气！',
+      items: ['3 个盲盒选 1 个开启，开完还可以偷看剩下两个盒子内容。', '点数有加分也有减益，开盒前完全保密，全看运气。', '大概率能拿到加分，但超级大奖极为稀有！锦鲤在哪里！', '25 秒不选择直接放弃，计 0 分，系统不会帮你开盲盒。']
     },
     TACTICS: {
-      step: '第五阶段', title: '战术窗口：重掷 + 排阵', summary: '队长在 90 秒内使用重掷次数、排定 1~6 号小队出场顺序，并确认完成战术布置。',
-      items: ['重掷配额 = 本队 GMV ÷ 10 万（向下取整），每场最多用 5 次。', '重掷只改点数，保留原掷骰时刻（暴击判定不变）与盲盒加成。', '出场顺序按 1~6 号锁定，锁定后本轮不可更改。', '队长确认完成后本队就绪；全部队伍确认后立即进入对局。确认后须先取消确认才能再调整。', '超时：未用重掷作废，顺序按小队编号默认锁定。']
+      step: '第五阶段', title: '战术窗口｜重掷 + 排阵', icon: 'brain', summary: '90 秒战术博弈时间！队伍 GMV 兑换重掷次数，队长指定队员重新摇骰子；排好 6 支小队出场顺序。用好机会极限翻盘！',
+      items: ['每 10 万 GMV 兑换 1 次重掷，单场最多 5 次，由队长指定重掷队员。', '重掷只刷新骰子点数，掷骰时间、盲盒加成保留，暴击不受干扰。', '出场顺序锁定不可修改！强弱小队怎么对位，考验队长田忌赛马的智慧。', '队长点确认代表本队就绪，需要修改可以先取消确认；全部队伍确认立刻开打。', '超时没有操作，剩余重掷次数直接作废，出场顺序默认小队编号锁定。']
     },
     BATTLE: {
-      step: '第六阶段', title: '六局对局', summary: '双方按 1~6 号小队逐局对垒，每局先猜阵、再揭晓胜负，串行推进。',
-      items: ['每局由本局出战小队的 5 人各提交一份对敌方出战 5 人的猜测，限时 30 秒，密封提交。', '第 2~6 局出战小队的成员可提前提交该局猜阵，轮到该局时自动生效；提交后仍可撤回或改投。', '双方交齐 5 份后最快 5 秒揭晓，未满 5 秒需稍等；30 秒倒计时结束强制揭晓。', '命中人次 ×0.4 加到本局出战小队战力，单局加成上限 10 分。', '小队战力 = 5 人个人点数之和 ×（同步暴击 ? 1.5 : 1）+ 猜阵加成。', '战力高者赢下本局；相等记平局，双方都不得分。每局揭晓展示 10 秒后进入下一局。']
+      step: '第六阶段', title: '六局对战', icon: 'swords', summary: '开打前秘密猜对手出场阵容，猜中直接涨战力！双方小队按顺序开启 6 场 5v5 PK，小队战力更高拿下单局胜利！',
+      items: ['本局出战的 5 位队员，30 秒内秘密提交猜阵，互相看不到对方猜测。', '还没轮到你的局可以提前猜，对局自动生效；提交后支持撤回和改选。', '双方 5 份猜阵全部交齐，最快 5 秒揭晓；倒计时结束强制揭晓，不等晚到的人。', '猜中 1 位对手，小队战力 +0.4，单局最多 +10 分上限。', '小队战力 = 5 人点数总和（暴击则 ×1.5）+ 猜阵加成；战力高赢下本局，战力相同则本局双方不得分。', '单局结果展示 10 秒自动进入下一局，一口气打完 6 场对决。']
     },
     RESULT: {
-      step: '第七阶段', title: '比赛结算', summary: '6 局打完后判定本场胜负，生成战报并晋级下一轮。',
-      items: ['先比 6 局胜场数，胜场多者胜。', '胜场相同（如 3:3）依次比：30 人最终个人点数总和 → 队伍 GMV。', '总点数与 GMV 全部打平则由管理员安排两队加赛重赛，直至分出胜负。', '战报记录每局双方战力、暴击、盲盒、重掷与猜阵明细。', '胜者晋级，直至决出当日冠军。']
+      step: '第七阶段', title: '比赛结算', icon: 'trophy', summary: '6 局结束算总账！赢局更多直接取胜；3:3 打平就比拼全队总点数。完整战报查看每一局细节，输赢原因一目了然。',
+      items: ['优先对比 6 局小局胜场数，胜场更高队伍获胜。', '3-3 大平局，依次对比全队 30 人总点数、队伍 GMV。', '三项全部持平，管理员安排加赛，直到分出胜负。', '战报完整记录战力、暴击、盲盒、重掷、猜阵全部明细，复盘超方便。', '胜者晋级下一轮，一路厮杀决出当日总冠军！']
     }
   };
 
@@ -49,22 +51,16 @@
     return modal;
   }
 
-  function ruleHtml(key) {
-    var rule = rules[key];
-    if (!rule) return '';
-    return '<p class="rules-step">' + rule.step + '</p><h2 id="rules-title">' + rule.title + '</h2><p class="rules-summary">' + rule.summary + '</p><ol>' + rule.items.map(function (item) { return '<li>' + item + '</li>'; }).join('') + '</ol>';
-  }
-
   function allRulesHtml() {
-    return '<p class="rules-step">ACE DICE ARENA · 裁判手册</p><h2 id="rules-title">游戏规则</h2><p class="rules-summary">从队长投票到本场结算，比赛由系统按以下七个阶段固定推进。</p><div class="rules-index">' + order.map(function (key, index) {
+    return '<p class="rules-step">ACE DICE ARENA · 裁判手册</p><h2 id="rules-title">游戏规则</h2><p class="rules-summary">比赛一共七个阶段，从选队长一路打到出结果，跟着流程走就行。</p><div class="rules-index">' + order.map(function (key, index) {
       var rule = rules[key];
-      return '<article><i>' + String(index + 1).padStart(2, '0') + '</i><div><b>' + rule.title + '</b><span>' + rule.summary + '</span><ul>' + rule.items.map(function (item) { return '<li>' + item + '</li>'; }).join('') + '</ul></div></article>';
+      return '<article><i>' + String(index + 1).padStart(2, '0') + '</i><div><b>' + icon(rule.icon) + ' ' + rule.step + '｜' + rule.title + '</b><span>' + rule.summary + '</span><ul>' + rule.items.map(function (item) { return '<li>' + item + '</li>'; }).join('') + '</ul></div></article>';
     }).join('') + '</div>';
   }
 
-  function open(key) {
+  function open() {
     var shell = ensureModal();
-    document.getElementById('rules-content').innerHTML = key && rules[key] ? ruleHtml(key) : allRulesHtml();
+    document.getElementById('rules-content').innerHTML = allRulesHtml();
     shell.classList.add('open');
     shell.setAttribute('aria-hidden', 'false');
     document.body.classList.add('rules-open');
@@ -86,16 +82,6 @@
     });
   }
 
-  function announce(key, occurrence) {
-    if (!rules[key] || !occurrence) return;
-    var storageKey = 'ace-dice-rule-stage';
-    try {
-      if (sessionStorage.getItem(storageKey) === occurrence) return;
-      sessionStorage.setItem(storageKey, occurrence);
-    } catch (ignore) { }
-    open(key);
-  }
-
   /* 只读访问器：阶段侧栏等组件复用规则文案与下一阶段预览，不暴露内部结构 */
   function rule(key) { return rules[key] || null; }
   function next(key) {
@@ -103,5 +89,5 @@
     return index >= 0 && index < order.length - 1 ? rules[order[index + 1]] : null;
   }
 
-  window.GameRules = { init: init, open: open, announce: announce, rule: rule, next: next };
+  window.GameRules = { init: init, open: open, rule: rule, next: next };
 })();

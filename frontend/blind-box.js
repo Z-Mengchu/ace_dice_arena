@@ -2,6 +2,8 @@
  * 三选一盲盒：礼盒 HTML 与开盒动画（GSAP 时间轴），/player 与 /lobby 两个开盒入口共用。
  * 动画只是本地表演，开盒进度以 API 响应为准；GSAP 经 window.gsap 由页面入口注入。
  */
+import { icon } from './icons.js';
+
 (function () {
   'use strict';
 
@@ -36,7 +38,7 @@
         valueEl.className = 'bb-value show ' + (values[i] >= 0 ? 'pos' : 'neg');
         b.querySelector('.bb-tag').textContent = i === picked ? '你的选择' : '';
       });
-      if (koi) playKoiEffect({ text: '锦鲤附体' });
+      if (koi) playKoiEffect({ text: '锦鲤附体！🎉' });
       done();
     };
     if (!window.gsap) { finish(); return; }
@@ -57,7 +59,7 @@
         valueEl.className = 'bb-value show ' + (values[picked] >= 0 ? 'pos' : 'neg');
         pickedEl.querySelector('.bb-tag').textContent = '你的选择';
         // 彩蛋时刻：选中点数弹出瞬间触发锦鲤，与点数缩放动画同步
-        if (koi) playKoiEffect({ text: '锦鲤附体' });
+        if (koi) playKoiEffect({ text: '锦鲤附体！🎉' });
       }, 0.95)
       .fromTo(pickedEl.querySelector('.bb-value'), { scale: 0 }, { scale: 1, duration: 0.5, ease: 'back.out(2.2)' }, 0.95)
       // 陪跑值揭晓：另外两盒翻盖展示内容
@@ -84,7 +86,7 @@
    */
   function playKoiEffect(options) {
     options = options || {};
-    var text = options.text || '锦鲤附体';
+    var text = options.text || '锦鲤附体！🎉';
     if (reducedMotion()) return;
     var old = document.querySelector('.bb-koi-fx');
     if (old) old.parentNode.removeChild(old);
@@ -103,7 +105,7 @@
           '<i class="bb-koi-eye"></i><i class="bb-koi-fin"></i>' +
         '</span>' +
       '</div></div>' +
-      '<div class="bb-koi-title"><span class="bb-koi-title-main">' + text + '</span><span class="bb-koi-title-sub">好运正在发生</span></div>' +
+      '<div class="bb-koi-title"><span class="bb-koi-title-main">' + text + '</span><span class="bb-koi-title-sub">好运 buff 已降临 ' + icon('sparkle', 16) + '</span></div>' +
       '<div class="bb-koi-particles"></div>';
     document.body.appendChild(fx);
     var particles = fx.querySelector('.bb-koi-particles');

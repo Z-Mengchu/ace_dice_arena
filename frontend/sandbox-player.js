@@ -1,3 +1,5 @@
+import { icon } from './icons.js';
+
 (function () {
   'use strict';
   var teamIds = ['t1', 't2', 't3', 't4', 't5', 't6', 't7', 't8'];
@@ -74,25 +76,25 @@
       var votes = Object.keys(mine.roleVotes || {}).length;
       var eligible = (mine.players || []).filter(function (p) { return !p.managed; }).length;
       body = '<div class="flow-detail"><span>队长</span><b>' + esc(captain ? playerName(mine, captain) : '投票中') + '</b></div><div class="flow-detail"><span>已投票</span><b>' + votes + ' / ' + eligible + '</b></div>';
-      copy = '全员独立投票选出队长，平票或无人投票按名单顺序取先。';
+      copy = '全员投票选出队长；平票 / 零投票按名单顺位选出。';
     } else if (stage === 'SQUAD_FORM') {
       var squads = mine.squads;
       var formed = Array.isArray(squads) && squads.length === 6;
       body = '<div class="flow-detail"><span>分队</span><b>' + (formed ? '已分队 6×5' : '待队长分队') + '</b></div>' + (formed ? '<div class="flow-detail"><span>各小队人数</span><b>' + squads.map(function (s) { return (s || []).length; }).join(' / ') + '</b></div>' : '');
-      copy = '队长把 30 人分成 6 支 5 人小队（1~6 号出场位），超时由系统随机均分。';
+      copy = '队长把 30 人拆成 6 支 5 人小队（1-6 出战位），超时系统自动随机均分。';
     } else if (stage === 'ROLL') {
       var total = (mine.players || []).length;
       var rolled = (mine.players || []).filter(function (p) { return p.dice != null; }).length;
       body = '<div class="flow-detail"><span>已掷</span><b>' + rolled + ' / ' + total + '</b></div><div class="flow-detail"><span>' + (game.rollGoAt ? '倒计时' : '截止') + '</span><b>' + countdown(game.rollGoAt ? game.rollGoAt : game.stageDeadlineAt) + '</b></div>';
-      copy = '321 倒计时后 6 支小队按顺序间隔 1 秒开掷，截止时刻全员统一；小队 5 人时刻首尾差 ≤0.5s 触发 ×1.5 暴击。';
+      copy = '倒计时 3-2-1！6 个小队错峰 1 秒依次掷骰；同一小队 5 人掷骰时间差 ≤0.5s 解锁 ×1.5 默契暴击！' + icon('sparkle', 16);
     } else if (stage === 'BLIND_BOX') {
       var opened = (mine.players || []).filter(function (p) { return p.blindBox != null; }).length;
       body = '<div class="flow-detail"><span>已开</span><b>' + opened + ' / ' + (mine.players || []).length + '</b></div>';
-      copy = '每人手动开盲盒（+5/+4/+3/+2/+1/-1/-2），25 秒内不开视为放弃（按 0 计）。';
+      copy = '每人手动选盲盒，档位随机、有惊喜也有减益，25 秒不点按 0 分，系统不会帮你开盒。';
     } else if (stage === 'TACTICS') {
       var limit = Math.min(mine.rerollQuota || 0, 5);
       body = '<div class="flow-detail"><span>重掷</span><b>' + Number(mine.rerollUsed || 0) + ' / ' + limit + '</b></div><div class="flow-detail"><span>出场顺序</span><b>' + (mine.squadOrderLocked ? '已锁定' : '待锁定') + '</b></div>';
-      copy = '队长可用重掷（≤5 次/场）并排出场顺序；重掷只改点数，保留盲盒与暴击判定。';
+      copy = '队长消耗 GMV 兑换重掷机会（单场上限 5 次），自由调整小队出场顺序；重掷只刷新骰子点数，盲盒、暴击判定不受影响。';
     } else if (stage === 'BATTLE') {
       var match = activeMatch();
       if (match) {
@@ -105,7 +107,7 @@
         else if (match.phase === 'BATTLE') detail = '第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中');
         else detail = '等待开赛';
         body = '<div class="sandbox-action-head"><div><b>' + esc(a.name) + ' ' + Number(match.winsA || 0) + ' : ' + Number(match.winsB || 0) + ' ' + esc(b.name) + '</b><span>' + esc(detail) + '</span></div></div>' + scoreCells(match, match.a === teamId ? 'A' : 'B') + roundsList(match, a, b);
-        copy = '每局出战小队 5 人猜阵（30s 密封），命中人次 ×0.4（单局上限 10）加到本队战力。';
+        copy = '每局出战 5 人可以秘密猜敌方出战人员，猜中 1 人 +0.4 战力，单局上限 +10 分！田忌赛马，博弈拉满';
       } else {
         body = '<p class="sandbox-muted">本队本轮没有对阵，等待后续赛程。</p>';
       }
@@ -117,7 +119,7 @@
     var followHint = game.sandboxPlayers && game.sandboxPlayers.length
       ? '只读预览 · 双人沙盘：' + game.sandboxPlayers.map(function (player) { return player.displayName + ' / ' + teamName(player.teamId); }).join('，')
       : '只读预览 · 在总控台点击“推进入下一阶段”模拟玩家提交';
-    box.innerHTML = head + '<p class="sandbox-action-copy">' + esc(copy) + '</p>' + body + '<div class="sandbox-readonly-note">' + esc(followHint) + '</div>';
+    box.innerHTML = head + '<p class="sandbox-action-copy">' + copy + '</p>' + body + '<div class="sandbox-readonly-note">' + esc(followHint) + '</div>';
   }
 
   function render() {

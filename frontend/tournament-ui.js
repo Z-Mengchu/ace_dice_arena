@@ -65,7 +65,7 @@
   function resultRosterHtml(entries) {
     var members = resultMembers(entries), standIns = members.filter(function (member) { return member.standIn; }).length;
     if (!members.length) return '<div class="result-roster result-roster-empty">该场历史记录暂未包含成员明细</div>';
-    return '<div class="result-roster"><div class="result-roster-head"><div><small>CHAMPION ROSTER</small><b>胜利队伍成员</b></div><span>' + members.length + ' 名参赛队友' + (standIns ? ' · ' + standIns + ' 名沙盘队友' : '') + '</span></div>' +
+    return '<div class="result-roster"><div class="result-roster-head"><div><small>CHAMPION ROSTER</small><b>冠军队伍成员</b></div><span>' + members.length + ' 名参赛队友' + (standIns ? ' · ' + standIns + ' 名沙盘队友' : '') + '</span></div>' +
       '<div class="result-roster-grid">' + members.map(function (member, index) {
         var dayLabel = member.days.length ? 'DAY ' + member.days.join('·') : '本场';
         return '<div class="result-member ' + (member.standIn ? 'is-stand-in' : '') + '"><i>' + String(index + 1).padStart(2, '0') + '</i><span><b>' + esc(member.name) + '</b><small>' + esc(member.department || (member.standIn ? '系统托管席位' : '正式参赛成员')) + '</small></span><em>' + (member.standIn ? '沙盘队友' : '参赛队友') + '</em><u>' + dayLabel + '</u></div>';
@@ -80,15 +80,15 @@
   function tieBreakText(match, labelA, labelB) {
     var tieBreak = match && match.tieBreak;
     if (!tieBreak || tieBreak === '胜场') return '';
-    if (tieBreak === '加赛') return '胜场、总点数、GMV 全部打平，等待管理员安排两队加赛';
+    if (tieBreak === '加赛') return '胜场、总点数、GMV 全部平局，等待管理员安排加赛 battle';
     var a = labelA || 'A 队', b = labelB || 'B 队';
     if (tieBreak === '总点数') {
-      if (match.totalPointsA == null || match.totalPointsB == null) return '胜场相同，按 30 人总点数判定，总点数高者胜';
-      return '胜场相同，按 30 人总点数判定：' + a + ' ' + match.totalPointsA + ' : ' + match.totalPointsB + ' ' + b + '，总点数高者胜';
+      if (match.totalPointsA == null || match.totalPointsB == null) return '双方胜场打平！比拼全队 30 人总点数，总点数高的队伍拿下胜利';
+      return '双方胜场打平！比拼全队 30 人总点数：' + a + ' ' + match.totalPointsA + ' : ' + match.totalPointsB + ' ' + b + '，总点数高的队伍拿下胜利';
     }
     if (tieBreak === 'GMV') {
-      if (match.gmvA == null || match.gmvB == null) return '胜场与总点数均相同，按队伍 GMV 判定，GMV 高者胜';
-      return '胜场与总点数均相同，按队伍 GMV 判定：' + a + ' ' + match.gmvA + ' : ' + match.gmvB + ' ' + b + '，GMV 高者胜';
+      if (match.gmvA == null || match.gmvB == null) return '胜场、总点数都一样，对比队伍 GMV，GMV 更高获胜';
+      return '胜场、总点数都一样，对比队伍 GMV：' + a + ' ' + match.gmvA + ' : ' + match.gmvB + ' ' + b + '，GMV 更高获胜';
     }
     return '按' + tieBreak + '判定胜负';
   }

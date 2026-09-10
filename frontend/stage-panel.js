@@ -1,13 +1,26 @@
 /**
  * 阶段侧栏（stage-panel）—— lobby / player 共用的右侧浮动面板
  * 纯原生 JS，挂 window.StagePanel 全局（与 game-rules.js 同一模式）。
- * 展示：当前阶段名（大标题）+ 大号倒计时 + 一行动态状态 + 一行规则 + 下一阶段预览；
+ * 展示：当前阶段名（大标题）+ 大号倒计时 + 一行动态状态 + 本阶段规则入口（点击打开完整规则弹窗）+ 下一阶段预览；
  * 可折叠为窄条（阶段名 + 秒数），折叠状态存 sessionStorage，刷新后保持。
  */
+import { icon } from './icons.js';
+
 (function () {
   'use strict';
 
   var COLLAPSE_KEY = 'ace-dice-stage-panel-collapsed';
+
+  /** 阶段主图标（固定版式：标题行左侧一个主图标） */
+  var STAGE_ICON = {
+    CAPTAIN_VOTE: 'vote',
+    SQUAD_FORM: 'squad',
+    ROLL: 'dice',
+    BLIND_BOX: 'gift',
+    TACTICS: 'brain',
+    BATTLE: 'swords',
+    RESULT: 'trophy'
+  };
 
   var panel = null;
   var collapsed = false;
@@ -52,17 +65,17 @@
     box.classList.toggle('is-warn', s != null && s <= 30 && s > 10);
     box.classList.toggle('is-urgent', s != null && s <= 10);
     if (collapsed) {
-      box.innerHTML = '<div class="sp-strip"><b>' + esc(current.stageLabel) + '</b>' +
+      box.innerHTML = '<div class="sp-strip">' + icon(STAGE_ICON[current.stage] || '', 16) + '<b>' + esc(current.stageLabel) + '</b>' +
         (s == null ? '' : '<span>' + s + 's</span>') + '</div>' +
         '<button type="button" class="sp-toggle" aria-expanded="false" title="展开阶段面板">▸</button>';
     } else {
       var rule = ruleOf(current.stage);
       var next = nextOf(current.stage);
-      box.innerHTML = '<header><div class="sp-stage">' + esc(current.stageLabel) + '</div>' +
+      box.innerHTML = '<header><div class="sp-stage">' + icon(STAGE_ICON[current.stage] || '') + esc(current.stageLabel) + '</div>' +
         '<button type="button" class="sp-toggle" aria-expanded="true" title="收起阶段面板">▾</button></header>' +
-        (s == null ? '' : '<div class="sp-time"><b>' + s + '</b><span>秒</span></div>') +
+        (s == null ? '' : '<div class="sp-time"><small>' + icon('timer', 16) + ' 剩余时间</small><div class="sp-time-num"><b>' + s + '</b><span>秒</span></div></div>') +
         (current.extraLine ? '<p class="sp-extra">' + esc(current.extraLine) + '</p>' : '') +
-        (rule ? '<p class="sp-rule">' + esc(rule.summary) + '</p>' : '') +
+        (rule ? '<button type="button" class="sp-rule-btn">' + icon(rule.icon, 16) + '本阶段规则<span aria-hidden="true">›</span></button>' : '') +
         (next ? '<p class="sp-next">下一阶段 · ' + esc(next.title) + '</p>' : '');
     }
     var toggle = box.querySelector('.sp-toggle');
@@ -70,6 +83,10 @@
       collapsed = !collapsed;
       try { sessionStorage.setItem(COLLAPSE_KEY, collapsed ? '1' : '0'); } catch (e) { }
       render();
+    };
+    var ruleBtn = box.querySelector('.sp-rule-btn');
+    if (ruleBtn) ruleBtn.onclick = function () {
+      if (window.GameRules && window.GameRules.open) window.GameRules.open();
     };
   }
 

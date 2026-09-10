@@ -7,6 +7,7 @@
  * 阶段倒计时与动态状态统一由右侧阶段面板（stage-panel.js）承载；队长重投结果以弹窗通知本队队员；
  * 顶部队名默认收起为按钮，点击才展开战队信息弹层（纯前端，不发请求）。
  */
+import { icon } from './icons.js';
 (function () {
   'use strict';
 
@@ -135,6 +136,71 @@
   var rerollBaseline = -1;      // 首次见到本队重掷日志时只建基线，不弹历史记录；日志重置（下一 bracket）时重建
   var rerollQueue = [];
   var rerollShowing = false;
+
+  /* ---------- 赛况解说：指纹存 sessionStorage，轮询/刷新重渲染同一状态不重复播 ---------- */
+
+  var CMT_KEY = 'dice-arena-commentary-v1';
+  var GUESS_LOG_KEY = 'dice-arena-guess-submitted-v1';
+  var cmtSeen = loadJsonStore(CMT_KEY);
+  var guessSubmittedLog = loadJsonStore(GUESS_LOG_KEY);   // 本人猜阵提交标记（matchId:round），揭晓时 guessStatus 已清空，需本地留痕
+
+  function loadJsonStore(key) {
+    try { return JSON.parse(sessionStorage.getItem(key)) || {}; } catch (e) { return {}; }
+  }
+  function saveJsonStore(key, obj) {
+    try { sessionStorage.setItem(key, JSON.stringify(obj)); } catch (e) { }
+  }
+  /** 同一指纹只播一次；Commentary 缺失或数据异常时静默跳过，绝不影响主流程 */
+  function cmtOnce(fp, text, tone) {
+    try {
+      if (!fp || cmtSeen[fp]) return;
+      if (!window.Commentary || !window.Commentary.show) return;
+      cmtSeen[fp] = 1;
+      saveJsonStore(CMT_KEY, cmtSeen);
+      window.Commentary.show(text, tone);
+    } catch (e) { }
+  }
+
+  /** 本轮唯一键：阶段截止时间每轮唯一，用它做点评防重指纹（阶段名跨轮/跨天会重复，match 在 ROLL/BLIND_BOX 阶段常未生成） */
+  function roundKey() {
+    return String((assignment && (assignment.stageDeadlineAt || assignment.rollDeadlineAt || assignment.stage)) || '');
+  }
+
+  /** 掷骰结果点评：首次渲染 rolled 结果卡时按本人本轮点数播一次（含系统代掷） */
+  function commentRoll(mePlayer) {
+    try {
+      var dice = mePlayer && mePlayer.diceFinal != null ? Number(mePlayer.diceFinal)
+        : (mePlayer && mePlayer.dice != null ? Number(mePlayer.dice)
+        : (ui.die != null ? Number(ui.die) : null));
+      if (dice == null || !isFinite(dice)) return;
+      var fp = 'roll:' + roundKey() + ':' + dice;
+      if (dice >= 4) cmtOnce(fp, '这波手气在线，基础分直接拉满！', 'good');
+      else cmtOnce(fp, '开局底子一般，后面靠盲盒搏一搏翻盘！', 'bad');
+    } catch (e) { }
+  }
+
+  /** 盲盒结果点评：本人档位首次展示时播一次；档位 0 不播 */
+  function commentBox(boxValue) {
+    try {
+      var box = Number(boxValue);
+      if (!isFinite(box) || box === 0) return;
+      var fp = 'box:' + roundKey() + ':' + box;
+      if (box > 0) cmtOnce(fp, '欧气附体！个人点数蹭蹭上涨～', 'good');
+      else cmtOnce(fp, '非酋报到，点数直接被砍一刀！', 'bad');
+    } catch (e) { }
+  }
+
+  /** 猜阵揭晓点评：本人本局提交过猜阵才播，按本方猜中人次分档，同一 match+round 只播一次 */
+  function commentGuess(battle, last) {
+    try {
+      var key = battle.match.id + ':' + battle.round;
+      if (!guessSubmittedLog[key]) return;
+      var hits = Number(last['guessHits' + battle.side]);
+      if (!isFinite(hits)) return;
+      if (hits >= 2) cmtOnce('guess:' + key, '预判拉满！小队战力狠狠加成！', 'good');
+      else cmtOnce('guess:' + key, '预判落空，这次猜阵加成几乎没有！', 'bad');
+    } catch (e) { }
+  }
 
   function loadMy() {
     try {
@@ -327,8 +393,8 @@
   }
 
   function calibOkText() {
-    return '✓ 已校准 · 延迟 ' + (ui.lastRtt != null ? ui.lastRtt : '?') + ' ms' +
-      (ui.calibWarn ? '（网络较差，建议切换网络/靠近路由器）' : '');
+    return '已校准 · 延迟 ' + (ui.lastRtt != null ? ui.lastRtt : '?') + ' ms' +
+      (ui.calibWarn ? '（网络不太好，建议切网络 / 靠近路由器哦）' : '');
   }
 
   /**
@@ -557,12 +623,18 @@
     if (rerollShowing || !rerollQueue.length) return;
     rerollShowing = true;
     var item = rerollQueue.shift();
+    // 点评直接并进弹窗文案：弹窗本身逐条排队，不再走 Commentary 队列，避免两套队列互相遮挡
+    var cmtLine = '';
+    var fromVal = Number(item.from), toVal = Number(item.to);
+    if (toVal > fromVal) cmtLine = '<div class="pl-reroll-cmt is-up">' + icon('sparkle', 16) + ' 队长这波操作直接逆风抬一手！</div>';
+    else if (toVal < fromVal) cmtLine = '<div class="pl-reroll-cmt is-down">' + icon('warn', 16) + ' 呜呜重掷翻车，只能寄希望队友发力！</div>';
     var toast = document.createElement('div');
     toast.className = 'pl-reroll-toast';
     toast.innerHTML = '<div class="pl-reroll-card">' +
-      '<small>队长重投骰子</small>' +
-      '<div class="pl-reroll-main">🎲 <b>' + esc(item.playerName) + '</b> 的骰子被重投</div>' +
+      '<small>' + icon('dice', 16) + ' 队长帮你重投骰子啦！</small>' +
+      '<div class="pl-reroll-main"><b>' + esc(item.playerName) + '</b> 的骰子被重投</div>' +
       '<div class="pl-reroll-delta"><span>' + Number(item.from) + '</span><i>→</i><span>' + Number(item.to) + '</span></div>' +
+      cmtLine +
       '<button type="button" class="btn btn-primary">知道了</button></div>';
     document.body.appendChild(toast);
     var closed = false;
@@ -604,9 +676,9 @@
       CAPTAIN_VOTE: '队长投票',
       SQUAD_FORM: '小队组建',
       ROLL: '全员掷骰',
-      BLIND_BOX: '盲盒',
-      TACTICS: '战术布置',
-      BATTLE: '对局',
+      BLIND_BOX: '盲盒抽 buff',
+      TACTICS: '战术排兵',
+      BATTLE: '对局 PK',
       RESULT: '结果公布'
     };
     return names[stage] || stage || '未开始';
@@ -616,13 +688,13 @@
 
   function renderIdle(root) {
     var stage = assignment && assignment.stage;
-    var h = '<div class="pl-title">当前无需掷骰</div>';
+    var h = '<div class="pl-title">' + icon('eye') + ' 本轮你不用掷骰</div>';
     if (!(assignment && assignment.teamId)) {
-      h += '<div class="pl-wait"><span class="big-ico">🪑</span>你还没有加入任何队伍<br><small>请先到队伍大厅加入队伍</small></div>';
+      h += '<div class="pl-wait"><span class="big-ico">' + icon('squad') + '</span>还没有加入队伍<br><small>快去大厅入队吧！</small></div>';
     } else if (stage && stage !== 'ROLL') {
-      h += '<div class="pl-wait"><span class="big-ico">⏳</span>当前不在掷骰阶段<br><small>当前阶段：' + esc(stageText(stage)) + ' · 轮到本队掷骰时本页会自动进入</small></div>';
+      h += '<div class="pl-wait"><span class="big-ico">' + icon('timer') + '</span>还没轮到掷骰阶段<br><small>当前阶段：' + esc(stageText(stage)) + ' · 轮到你的队伍页面会自动切过来</small></div>';
     } else {
-      h += '<div class="pl-wait"><span class="big-ico">⏳</span>本轮你的队伍没有比赛<br><small>轮到本队掷骰时本页会自动进入</small></div>';
+      h += '<div class="pl-wait"><span class="big-ico">' + icon('timer') + '</span>本轮咱们队伍没有比赛<br><small>轮到本队掷骰时本页会自动进入</small></div>';
     }
     h += '<div class="pl-foot"><a class="btn btn-primary" href="/lobby">返回队伍大厅</a></div>';
     root.innerHTML = h;
@@ -714,37 +786,38 @@
     if (ui.sub !== 'battle') { ui.battleKey = ''; ui.preEdit = false; }
     var h = '';
     if (ui.sub === 'calibrating') {
-      h = '<div class="pl-wait"><span class="big-ico">⏱️</span>正在自动校准设备时钟…<br><small>无需任何操作</small></div>';
+      h = '<div class="pl-wait"><span class="big-ico">' + icon('loading') + '</span>正在校准设备时钟…<br><small>宝子啥都不用干</small></div>';
     } else if (ui.sub === 'calibration-error') {
-      h = '<div class="pl-status err">' + esc(ui.calibText || '设备时钟校准失败，暂时不能掷骰') + '</div>' +
+      h = '<div class="pl-status err">' + icon('warn', 16) + ' ' + esc(ui.calibText || '设备时钟校准失败，暂时不能掷骰') + '</div>' +
         '<div class="pl-foot"><button id="pl-retry-calibration" class="btn btn-primary btn-xl">重新校准</button></div>';
     } else if (ui.sub === 'countdown') {
       var remain = Math.max(1, Math.ceil((rollOpenAt() - serverNow()) / 1000));
-      h = '<div class="pl-command-countdown"><small>掷骰即将开始</small><strong>' + remain + '</strong>' +
-        '<p>秒后开掷 · 截止时刻全员统一，开掷后立即点击【掷！】</p></div>';
+      h = '<div class="pl-command-countdown"><small>' + icon('dice', 16) + ' 掷骰倒计时！</small><strong>' + remain + '</strong>' +
+        '<p>秒后统一开掷，时间到立刻点【掷！】</p></div>';
     } else if (ui.sub === 'go') {
       if (deadlinePassed()) {
-        h = '<div class="pl-wait"><span class="big-ico">⌛</span>本轮掷骰窗口已结束<br><small>未提交的掷骰将由系统代掷，等待稍后开盲盒…</small></div>';
+        h = '<div class="pl-wait"><span class="big-ico">' + icon('timer') + '</span>本轮掷骰窗口关闭啦<br><small>没手动掷骰的小伙伴系统会代掷，静待盲盒环节</small></div>';
       } else {
         var left = Math.max(0, Math.ceil((rollDeadlineAt() - serverNow()) / 1000));
         var liveRollBtn = $('#pl-roll');
         // 走秒时就地刷新文案：每 200ms 重建按钮会吞掉正在落下的点击
         if (liveRollBtn && (ui.notice || '') === ui.renderedNotice) {
           var subEl = stage.querySelector('.pl-sub');
-          if (subEl) subEl.textContent = '窗口剩余 ' + left + ' 秒 · 每人限掷 1 枚';
+          if (subEl) subEl.textContent = '窗口剩余 ' + left + ' 秒 · 一人只能掷一次！';
           liveRollBtn.disabled = !!ui.rolling;
           return;
         }
         h = (ui.notice ? '<div class="pl-status warn">' + esc(ui.notice) + '</div>' : '') +
           '<button id="pl-roll" class="pl-roll-btn"' + (ui.rolling ? ' disabled' : '') + '>掷！</button>' +
-          '<div class="pl-sub">窗口剩余 ' + left + ' 秒 · 每人限掷 1 枚</div>';
+          '<div class="pl-sub">窗口剩余 ' + left + ' 秒 · 一人只能掷一次！</div>';
       }
     } else if (ui.sub === 'rolled') {
       var mePlayer = findMyPlayer();
-      var rolledText = mePlayer && mePlayer.autoRolled ? '窗口已结束，由系统代掷，等待开盲盒' : '已扔完，等待稍后开盲盒';
-      h = '<div class="pl-title" style="font-size:24px">🎲 你的点数</div>' +
+      commentRoll(mePlayer);
+      var rolledText = mePlayer && mePlayer.autoRolled ? '窗口结束，系统帮你代掷，等开盲盒～' : '已掷完，坐等开盲盒';
+      h = '<div class="pl-title" style="font-size:24px">' + icon('dice') + ' 你的点数</div>' +
         '<div class="pl-reveal-dice"><div class="pl-reveal-slot mine">' + dieHTML('big', ui.die) + '</div></div>' +
-        '<div class="pl-wait" style="padding-top:0"><span class="big-ico">✅</span>' + rolledText + '<br><small>阶段推进后本页将自动进入开盲盒</small></div>';
+        '<div class="pl-wait" style="padding-top:0"><span class="big-ico">' + icon('check') + '</span>' + rolledText + '<br><small>阶段切换页面会自动跳转盲盒</small></div>';
     } else if (ui.sub === 'blindbox') {
       h = blindBoxHTML();
     } else if (ui.sub === 'battle') {
@@ -859,6 +932,7 @@
     var box = me.blindBox != null ? Number(me.blindBox) : ui.myBox;
     if (box == null) return '';
     box = Number(box);
+    commentBox(box);
     var tier = (box > 0 ? '+' : '') + box;
     var dice = me.diceFinal != null ? Number(me.diceFinal) : (me.dice != null ? Number(me.dice) : null);
     var finalPoints = dice != null ? dice + box : null;
@@ -881,9 +955,10 @@
     var me = findMyPlayer();
     var openedSelf = !!(me && me.blindBoxOpened) || ui.myBox != null;
     if (ui.myBox != null && !(me && me.blindBoxOpened)) opened++;   // 自己刚开、回源未至：本地先计入进度
-    var h = '<div class="pl-title" style="font-size:24px">🎁 开盲盒</div>';
+    var h = '<div class="pl-title" style="font-size:24px">' + icon('gift') + ' 来拆盲盒咯！</div>';
     if (openedSelf) {
       var box = me && me.blindBox != null ? Number(me.blindBox) : (ui.myBox != null ? ui.myBox : 0);
+      commentBox(box);
       var tier = (box > 0 ? '+' : '') + box;
       var dice = me.dice != null ? Number(me.dice) : null;
       var diceFinal = me.diceFinal != null ? Number(me.diceFinal) : dice;
@@ -891,21 +966,21 @@
       h += '<div class="pl-box-result">' +
         '<div class="pl-box-tier ' + (box >= 0 ? 'pos' : 'neg') + '">' + tier + '</div>' +
         '<div class="pl-box-formula">' +
-          '<div><small>原骰子</small>' + dieHTML('big', dice) + '</div>' +
+          '<div><small>原始骰子</small>' + dieHTML('big', dice) + '</div>' +
           '<i>→</i>' +
           '<div><small>盲盒档位</small><b>' + tier + '</b></div>' +
           '<i>→</i>' +
           '<div><small>最终点数</small><strong>' + (finalPoints != null ? finalPoints : '?') + '</strong></div>' +
         '</div>' +
       '</div>';
-      h += '<div class="pl-wait" style="padding-top:14px"><span class="big-ico">✅</span>等待全队开盒…<br>' +
-        '<small>本队进度 ' + opened + ' / ' + players.length + ' · 全员开完后进入队长战术阶段</small></div>' +
-        '<p class="pl-deadline-hint">本阶段剩余时间见右侧阶段面板</p>';
+      h += '<div class="pl-wait" style="padding-top:14px"><span class="big-ico">' + icon('check') + '</span>等队友全部开完盒…<br>' +
+        '<small>本队进度 ' + opened + ' / ' + players.length + ' · 全员开完进入队长战术环节</small></div>' +
+        '<p class="pl-deadline-hint">剩余时间查看右侧面板</p>';
     } else {
-      h += '<div class="pl-sub">从 3 个盲盒中选 1 个开启：档位 -2 ~ +5（不含 0）· 每人限开一次 · 25 秒内不选视为放弃（按 0 计），系统不代选不代开</div>' +
+      h += '<div class="pl-sub">3 选 1！档位完全随机，惊喜与减益全拼手气，每人只能开 1 次！25 秒不选直接算放弃（计 0 分），系统不会代开！</div>' +
         (ui.notice ? '<div class="pl-status warn">' + esc(ui.notice) + '</div>' : '') +
         window.BlindBoxUI.boxesHTML() +
-        '<p class="pl-deadline-hint">剩余时间见右侧阶段面板</p>';
+        '<p class="pl-deadline-hint">剩余时间看右侧阶段面板</p>';
     }
     return h;
   }
@@ -987,15 +1062,15 @@
     return '我方已交 ' + mine + ' / 5 · 对方已交 ' + theirs + ' / 5';
   }
 
-  /** 猜阵 5 秒下限提示：交齐后最快 5 秒揭晓；已交齐且未满 5 秒时提示"即将揭晓" */
+  /** 猜阵 5 秒下限提示：交齐后最快 5 秒揭晓；已交齐且未满 5 秒时提示"马上揭榜（最少等待 5 秒）" */
   function guessRevealLine(battle) {
     var counts = guessCounts(battle.match);
     if (counts.A >= 5 && counts.B >= 5) {
       var openedAt = Number(battle.match.guessOpenedAt || 0);
-      if (openedAt && serverNow() < openedAt + 5000) return '双方已交齐，即将揭晓（至少 5 秒）';
-      return '双方已交齐，即将揭晓';
+      if (openedAt && serverNow() < openedAt + 5000) return '双方提交完毕，马上揭榜（最少等待 5 秒）';
+      return '双方提交完毕，马上揭榜';
     }
-    return '双方交齐后最快 5 秒揭晓';
+    return '两边全部交齐，最快 5 秒揭晓结果';
   }
 
   function updateGuessCounts(battle) {
@@ -1037,25 +1112,25 @@
     }
     if (match.phase !== 'BATTLE') {
       // 下一 bracket 场次已生成但掷骰流程尚未开始：短暂过渡，避免误渲染猜阵
-      return '<div id="pl-battle"><div class="pl-wait"><span class="big-ico">⏳</span>等待本轮对局开始…<br>' +
-        '<small>新一轮掷骰即将开始，本页会自动进入</small></div></div>';
+      return '<div id="pl-battle"><div class="pl-wait"><span class="big-ico">' + icon('timer') + '</span>等待对局开启…<br>' +
+        '<small>下一轮掷骰倒计时，页面会自动跳转</small></div></div>';
     }
     var h = '<div id="pl-battle">' +
-      '<div class="pl-title" style="font-size:24px">⚔️ 第 ' + battle.round + ' / 6 局</div>' +
+      '<div class="pl-title" style="font-size:24px">' + icon('swords') + ' 第 ' + battle.round + ' / 6 局开战预警！</div>' +
       battleScoreHTML(match, battle.side) + plTrackHtml(match, battle.side);
     if (match.roundPhase === 'REVEAL') return h + battleRevealHTML(battle) + '</div>';
     // GUESS：密封猜阵，双方各 5 份
     h += '<div class="pl-guess-counts" id="pl-guess-counts">' + esc(guessCountsText(battle)) + '</div>' +
       '<p class="pl-guess-min" id="pl-guess-min">' + esc(guessRevealLine(battle)) + '</p>' +
-      '<p class="pl-deadline-hint">剩余时间见右侧阶段面板</p>';
+      '<p class="pl-deadline-hint">剩余时间看右侧阶段面板</p>';
     if (battle.submitted) {
-      h += '<div class="pl-wait"><span class="big-ico">🔒</span>猜阵已密封提交，等待揭晓<br>' +
-        '<small>双方都交齐 5 份后最快 5 秒揭晓，或倒计时结束后强制揭晓</small></div>';
+      h += '<div class="pl-wait"><span class="big-ico">' + icon('lock') + '</span>猜阵已经悄悄提交，坐等揭榜<br>' +
+        '<small>两边 5 份全部提交后最快 5 秒公布，倒计时结束强制揭晓，不等晚到的小伙伴</small></div>';
     } else if (battle.inSquad) {
       h += guessGridHTML(battle);
     } else {
-      h += '<div class="pl-wait"><span class="big-ico">👀</span>本轮你的小队不出战，观战中<br>' +
-        '<small>第 ' + battle.round + ' 局猜阵进行中 · 出战队友正在提交猜阵</small></div>';
+      h += '<div class="pl-wait"><span class="big-ico">' + icon('eye') + '</span>本轮你的小队不上场，沉浸式观战！<br>' +
+        '<small>第 ' + battle.round + ' 局猜阵中，出战队友正在提交猜测</small></div>';
     }
     // 提前猜阵：本人小队出战第 2~6 局且非本局时，可提前提交该局猜阵
     if (!battle.inSquad && battle.myRound > battle.round && battle.myRound >= 2) h += preGuessHTML(battle);
@@ -1072,8 +1147,8 @@
       ui.guessSel = [];
     }
     var h = '<div class="pl-sub">' + (preRound
-      ? '第 ' + preRound + ' 局你出战，选出你认为敌方该局出战的 5 名队员'
-      : '本轮你出战！选出你认为敌方本局出战的 5 名队员') + '</div>' +
+      ? '第 ' + preRound + ' 局你的战场！选出敌方该局出战 5 人'
+      : icon('crystal', 16) + ' 轮到你出战！猜一猜敌方本局上场 5 人') + '</div>' +
       (ui.notice ? '<div class="pl-status warn">' + esc(ui.notice) + '</div>' : '') +
       '<div class="pl-roster">';
     for (var i = 0; i < enemyPlayers.length; i++) {
@@ -1094,14 +1169,14 @@
   function preGuessHTML(battle) {
     if (battle.preSubmitted && !ui.preEdit) {
       return '<div class="pl-preguess">' +
-        '<div class="pl-sub">你将在第 ' + battle.myRound + ' 局出战 · 已提前提交，可撤回/改投</div>' +
-        '<div class="pl-wait"><span class="big-ico">🔒</span>提前猜阵已密封提交<br>' +
-        '<small>第 ' + battle.myRound + ' 局开始时自动生效</small></div>' +
+        '<div class="pl-sub">第 ' + battle.myRound + ' 局出战 · 已提前提交，支持撤回 / 改投</div>' +
+        '<div class="pl-wait"><span class="big-ico">' + icon('lock') + '</span>提前猜阵已保密提交<br>' +
+        '<small>第 ' + battle.myRound + ' 局开局自动生效</small></div>' +
         '<div class="pl-foot"><button id="pl-preguess-retract" class="btn btn-ghost">撤回提前猜阵</button>' +
         '<button id="pl-preguess-edit" class="btn btn-primary">改投</button></div></div>';
     }
     return '<div class="pl-preguess">' +
-      '<div class="pl-sub">提前猜阵 · 你将在第 ' + battle.myRound + ' 局出战，可现在就提交该局猜阵</div>' +
+      '<div class="pl-sub">' + icon('crystal', 16) + ' 提前猜阵 · 你第 ' + battle.myRound + ' 局会上场，可以提前预判对手！</div>' +
       guessGridHTML(battle, battle.myRound) + '</div>';
   }
 
@@ -1146,6 +1221,11 @@
     var type = ui.guessKey.indexOf(':pre:') >= 0 ? 'pre-guess' : 'round-guess';
     api('/api/lobby/player-action', { type: type, selections: ui.guessSel.slice() }).then(function () {
       if (type === 'pre-guess') { ui.preEdit = false; ui.battleKey = ''; }
+      // 本地留痕本人提交过猜阵（揭晓时服务端 guessStatus 已清空，点评据此判断是否播放）
+      try {
+        var gk = String(ui.guessKey || '').replace(':pre:', ':');
+        if (gk) { guessSubmittedLog[gk] = 1; saveJsonStore(GUESS_LOG_KEY, guessSubmittedLog); }
+      } catch (e) { }
       refreshAssignment();
     }).catch(function (err) {
       if (submit) submit.disabled = false;
@@ -1182,23 +1262,24 @@
     if (last && last.powerA == null) last = null;   // 摘要条目没有战力明细，等详情接口
     if (!last) {
       loadMatchDetail(match, function () { ui.battleKey = ''; paintStage(); });
-      return '<div class="pl-wait">正在加载本局结果…</div>';
+      return '<div class="pl-wait">本局结果加载中…</div>';
     }
     var nameA = teamNameOf(match.a);
     var nameB = teamNameOf(match.b);
     var winSide = last.winner || null;
+    commentGuess(battle, last);
     function sideHTML(side, name) {
       var crit = last['crit' + side];
       return '<div class="pl-reveal-side' + (winSide === side ? ' win' : '') + '">' +
-        '<h4>' + esc(name) + (winSide === side ? ' 🏅' : '') + '</h4>' +
+        '<h4>' + esc(name) + '</h4>' +
         '<div class="pl-reveal-power">' + esc(last['power' + side]) + '</div>' +
-        '<small>基础 ' + esc(last['base' + side]) + (crit ? ' × 1.5 同步暴击' : '') +
-        ' · 猜阵命中 ' + esc(last['guessHits' + side]) + '（+' + esc(last['guessBonus' + side]) + '）</small></div>';
+        '<small>基础 ' + esc(last['base' + side]) + (crit ? ' · ' + icon('sparkle', 16) + ' 暴击 ×1.5' : '') +
+        ' · 猜中 ' + esc(last['guessHits' + side]) + ' 人次 · 加成 +' + esc(last['guessBonus' + side]) + '</small></div>';
     }
-    return '<div class="pl-status' + (winSide ? '' : ' warn') + '" style="text-align:center">第 ' + esc(last.round) + ' 局揭晓：' +
-      (winSide ? esc(winSide === 'A' ? nameA : nameB) + ' 胜' : '双方战平') + '</div>' +
+    return '<div class="pl-status' + (winSide ? '' : ' warn') + '" style="text-align:center">第 ' + esc(last.round) + ' 局 / ' +
+      (winSide ? esc(winSide === 'A' ? nameA : nameB) + ' 胜利' : '平局') + '</div>' +
       '<div class="pl-reveal-sides">' + sideHTML('A', nameA) + sideHTML('B', nameB) + '</div>' +
-      '<p class="pl-deadline-hint">下一局倒计时见右侧阶段面板</p>';
+      '<p class="pl-deadline-hint">冲向下一局！</p>';
   }
 
   /** 本场打完（RESULT/FINISHED/OVERTIME_PENDING）：胜者、比分与平局链提示 */
@@ -1208,14 +1289,14 @@
     var won = !!winnerId && winnerId === battle.team.id;
     var overtimePending = match.phase === 'OVERTIME_PENDING';
     var h = '<div id="pl-battle">' +
-      '<div class="pl-title" style="font-size:24px">' + (overtimePending ? '三连环全平 · 待加赛' : winnerId ? (won ? '🎉 本场获胜' : '本场惜败') : '本场结束') + '</div>' +
+      '<div class="pl-title" style="font-size:24px">' + (overtimePending ? icon('warn') + ' 三项全部打平｜等待加赛！' : winnerId ? (won ? icon('trophy') + ' 本场胜利' : '本场惜败') : '对局结束') + '</div>' +
       battleScoreHTML(match, battle.side) + plTrackHtml(match, battle.side);
     if (winnerId) h += '<div class="pl-sub">胜者：' + esc(teamNameOf(winnerId)) + '</div>';
     var tieText = window.TournamentUI ? TournamentUI.tieBreakText(match, teamNameOf(match.a), teamNameOf(match.b)) : '';
     if (overtimePending && !tieText) tieText = '胜场、总点数、GMV 全部打平，等待管理员安排两队加赛';
     if (tieText) h += '<div class="pl-sub">' + esc(tieText) + '</div>';
-    h += '<div class="pl-wait"><span class="big-ico">📋</span>等待下一场对阵<br>' +
-      '<small>详细战报与后续赛程请在队伍大厅查看</small></div>' +
+    h += '<div class="pl-wait">等待下一轮 PK<br>' +
+      '<small>完整战报 & 后续赛程去队伍大厅查看</small></div>' +
       '<div class="pl-foot"><a class="btn btn-primary" href="/lobby">前往队伍大厅 →</a></div></div>';
     return h;
   }
@@ -1232,11 +1313,11 @@
         if (String(players[i].id) === String(captainId)) { captainName = players[i].name; break; }
       }
     }
-    return '<div class="pl-title" style="font-size:24px">🧠 战术布置中</div>' +
+    return '<div class="pl-title" style="font-size:24px">' + icon('brain') + ' 战术布置 ing ' + icon('loading') + '</div>' +
       (card || '') +
-      '<div class="pl-wait"><span class="big-ico">⏳</span>队长' + (captainName ? ' <b>' + esc(captainName) + '</b> ' : '') + '正在进行重掷与排阵<br>' +
-      '<small>当前阶段：' + esc(stageText(assignment && assignment.stage)) + ' · 对局开始后本页自动进入猜阵</small></div>' +
-      '<p class="pl-deadline-hint">本阶段剩余时间见右侧阶段面板</p>';
+      '<div class="pl-wait">队长' + (captainName ? ' <b>' + esc(captainName) + '</b> ' : '') + '正在重掷骰子 + 排兵布阵<br>' +
+      '<small>当前阶段：' + esc(stageText(assignment && assignment.stage)) + '｜开打后页面自动跳猜阵</small></div>' +
+      '<p class="pl-deadline-hint">剩余时间看右侧阶段面板</p>';
   }
 
   /* ---------- 4.4 赛程结束提示页 ---------- */
@@ -1247,12 +1328,12 @@
     if (champion) {
       if (champion === myTeamId()) {
         cls = 'is-victory'; mark = 'CHAMPION';
-        title = '🏆 恭喜！本队夺得冠军';
-        sub = '全部赛程已结束，荣耀属于你们';
+        title = '🏆 恭喜夺冠！';
+        sub = '全部赛程收官！荣耀属于我们！';
       } else {
         cls = 'is-end'; mark = 'GAME OVER';
-        title = '比赛已全部结束';
-        sub = '冠军已产生：' + esc(teamNameOf(champion));
+        title = '比赛全部结束';
+        sub = '冠军诞生：' + esc(teamNameOf(champion));
       }
     } else {
       var lost = null, allMatches = (gameState && gameState.matches) || {};
@@ -1265,14 +1346,14 @@
         var myScore = Number(mySideA ? lost.winsA : lost.winsB) || 0;
         var oppScore = Number(mySideA ? lost.winsB : lost.winsA) || 0;
         cls = 'is-elim'; mark = 'ELIMINATED';
-        title = '本场惜败 · 本队被淘汰';
+        title = '本场惜败，队伍淘汰';
         score = myScore + ' : ' + oppScore;
-        sub = '对手「' + esc(teamNameOf(mySideA ? lost.b : lost.a)) + '」晋级 · 后续赛程与战报请在队伍大厅查看';
+        sub = '对手「' + esc(teamNameOf(mySideA ? lost.b : lost.a)) + '」晋级，战报和赛程移步大厅查看';
         var lostTieText = window.TournamentUI ? TournamentUI.tieBreakText(lost, mySideA ? '我方' : '对方', mySideA ? '对方' : '我方') : '';
         if (lostTieText) sub = esc(lostTieText) + '<br>' + sub;
       } else {
         cls = 'is-end'; mark = 'GAME OVER';
-        title = '本队赛程已结束';
+        title = '本队赛程已经结束';
         sub = '本队本轮比赛已结束 · 后续赛程与战报请在队伍大厅查看';
       }
     }
@@ -1413,17 +1494,17 @@
       if (match && match.status === 'active') {
         if (match.phase === 'RESULT') {
           deadline = Number(match.resultReadyAt || 0) || deadline;
-          extra = '本场结果展示中';
+          extra = '本场比赛结果展示中';
         } else if (match.phase === 'BATTLE') {
           deadline = match.roundPhase === 'REVEAL' ? (Number(match.revealUntil || 0) || deadline) : (Number(match.guessDeadlineAt || 0) || deadline);
           var roundNo = Number(match.round || 1);
           if (match.roundPhase === 'REVEAL') {
-            extra = '第 ' + roundNo + ' / 6 局 · 结果揭晓中';
+            extra = '第 ' + roundNo + '/6 局｜结果揭晓';
           } else {
             var battle = battleInfo();
             extra = battle && !battle.inSquad
-              ? '第 ' + roundNo + ' / 6 局 · 本轮你的小队不出战，观战中'
-              : '第 ' + roundNo + ' / 6 局 · 猜阵进行中';
+              ? '第 ' + roundNo + '/6 局｜本轮不出战，观战中'
+              : '第 ' + roundNo + '/6 局｜猜阵 ing';
           }
         }
       }
@@ -1432,23 +1513,14 @@
       var bbPlayers = (bbTeam && bbTeam.players) || [];
       var bbOpened = 0;
       for (var bi = 0; bi < bbPlayers.length; bi++) if (bbPlayers[bi].blindBoxOpened) bbOpened++;
-      extra = '本队已开盒 ' + bbOpened + ' / ' + bbPlayers.length + ' 人';
+      extra = '队友开盒进度 ' + bbOpened + ' / ' + bbPlayers.length;
     } else if (stage === 'TACTICS') {
-      var tTeam = myTeam();
-      var captainId = tTeam && tTeam.roles && tTeam.roles.captain;
-      var captainName = '';
-      if (captainId && tTeam) {
-        var tPlayers = tTeam.players || [];
-        for (var ti = 0; ti < tPlayers.length; ti++) {
-          if (String(tPlayers[ti].id) === String(captainId)) { captainName = tPlayers[ti].name; break; }
-        }
-      }
-      extra = '队长' + (captainName ? ' ' + captainName + ' ' : '') + '正在重投骰子、排兵布阵';
+      extra = '队长正在重掷骰子，上演田忌赛马';
     } else if (stage === 'ROLL') {
       if (rollDeadlineAt()) deadline = rollDeadlineAt();
-      if (ui.sub === 'rolled') extra = '已扔完，等待稍后开盲盒';
-      else if (ui.sub === 'go' && goReached() && !deadlinePassed()) extra = '开掷了，立即点击【掷！】';
-      else if (rollOpenAt() && serverNow() < rollOpenAt()) extra = '掷骰即将开始，请准备';
+      if (ui.sub === 'rolled') extra = '掷完啦，蹲盲盒开奖';
+      else if (ui.sub === 'go' && goReached() && !deadlinePassed()) extra = '开掷！快点击【掷！】';
+      else if (rollOpenAt() && serverNow() < rollOpenAt()) extra = '准备好，马上掷骰子！';
     }
     window.StagePanel.update({ stage: stage, stageLabel: stageText(stage), deadline: deadline, serverOffset: ui.offset, extraLine: extra });
     return deadline;
