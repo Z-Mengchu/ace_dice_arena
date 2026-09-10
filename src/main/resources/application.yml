@@ -58,7 +58,7 @@ app:
     enabled: ${GAME_TEST_MODE:false}
   grouping:
     # 仅服务端读取，使用英文或中文逗号分隔；名单账号只进入观众席。
-    test-account-display-names: ${GROUPING_TEST_ACCOUNT_NAMES:测试账号,test,AD部门账号,AD运营账号,TD欧洲部门账号,TD欧洲运营账号,TD俄罗斯部门账号,TD俄罗斯运营账号,ND部门账号,ND运营账号,DD部门账号,DD运营账号,0001,01,烈焰战区,做货流水线,wms_openapi,许容杏,杨涛,谢松珉,许清霞,曾耀}
+    test-account-display-names: ${GROUPING_TEST_ACCOUNT_NAMES:测试账号,test,AD部门账号,AD运营账号,TD欧洲部门账号,TD欧洲运营账号,TD俄罗斯部门账号,TD俄罗斯运营账号,ND部门账号,ND运营账号,DD部门账号,DD运营账号,0001,01,烈焰战区,做货流水线,wms_openapi,许容杏,杨涛,谢松珉,黄龙,柯三中}
   organization-datasource:
     enabled: ${ORG_DB_ENABLED:false}
     jdbc-url: jdbc:mysql://${ORG_DB_HOST:localhost}:${ORG_DB_PORT:3306}/${ORG_DB_NAME:data-visual-manage}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
