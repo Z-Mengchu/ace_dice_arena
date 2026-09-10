@@ -10,6 +10,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -27,13 +29,14 @@ public class AdminTestModeService {
     private final ParallelTournamentService tournament;
     private final LobbyEventService events;
     private final ObjectMapper mapper;
+    private final BlindBoxRoundService blindBoxRounds;
 
     public AdminTestModeService(@Value("${app.test-mode.enabled:false}") boolean enabled,
                                 UserAccountRepository users, GameControlRepository controls,
                                 GameStateRepository states, PlayerBlindBoxRepository blindBoxes,
                                 LobbyService lobby,
                                 ParallelTournamentService tournament, LobbyEventService events,
-                                ObjectMapper mapper) {
+                                ObjectMapper mapper, BlindBoxRoundService blindBoxRounds) {
         this.enabled = enabled;
         this.users = users;
         this.controls = controls;
@@ -43,6 +46,7 @@ public class AdminTestModeService {
         this.tournament = tournament;
         this.events = events;
         this.mapper = mapper;
+        this.blindBoxRounds = blindBoxRounds;
     }
 
     @Transactional
@@ -94,7 +98,6 @@ public class AdminTestModeService {
         return status();
     }
 
-    @Transactional
     public TestStatus assignSandboxPlayers(String firstUsername, String firstTeamId,
                                            String secondUsername, String secondTeamId) {
         return assignSandboxPlayers(firstUsername, firstTeamId, inferredIdentity(firstUsername),
@@ -106,7 +109,11 @@ public class AdminTestModeService {
         return user.isFrontEnd() ? "front" : "back";
     }
 
-    @Transactional
+    /**
+     * 沙盘换人与盲盒阶段写锁的组合入口（本方法不挂事务）：阶段写锁必须先于事务开始，
+     * user/team 更新与 game_state、盲盒结果行改挂在同一个事务内完成；提交成功后
+     * 用最新状态整体重建运行态名单，回滚时 context 不变。
+     */
     public TestStatus assignSandboxPlayers(String firstUsername, String firstTeamId, String firstIdentity,
                                            String secondUsername, String secondTeamId, String secondIdentity) {
         requireEnabled();
@@ -138,11 +145,14 @@ public class AdminTestModeService {
         first.setReady(true);
         second.assignTeam(secondTeamId);
         second.setReady(true);
-        users.saveAll(List.of(firstReplaced, secondReplaced, first, second));
-        users.flush();
-        tournament.configureSandboxPlayers(List.of(
+        List<ParallelTournamentService.SandboxAssignment> assignments = List.of(
                 new ParallelTournamentService.SandboxAssignment(first, firstReplaced, firstTeamId, firstIdentity),
-                new ParallelTournamentService.SandboxAssignment(second, secondReplaced, secondTeamId, secondIdentity)));
+                new ParallelTournamentService.SandboxAssignment(second, secondReplaced, secondTeamId, secondIdentity));
+        blindBoxRounds.runExclusiveInTransaction(() -> {
+            users.saveAll(List.of(firstReplaced, secondReplaced, first, second));
+            users.flush();
+            return tournament.applySandboxAssignments(assignments);
+        }, root -> blindBoxRounds.replaceDefinitionAfterCommit(root.deepCopy()));
         return status();
     }
 
@@ -206,6 +216,13 @@ public class AdminTestModeService {
         blindBoxes.deleteAll();
         if (record != null) states.delete(record);
         control().changePhase("PREPARING");
+        // 数据库事务提交后才清空盲盒运行态；回滚时旧 context 仍可用
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                blindBoxRounds.clearAfterCommit();
+            }
+        });
         events.stateChanged();
         return status();
     }

@@ -33,4 +33,10 @@ public class RequestAudit {
         this.durationMs = durationMs;
         this.requestedAt = requestedAt;
     }
+
+    public String getMethod() { return method; }
+    public String getPath() { return path; }
+    public int getStatusCode() { return statusCode; }
+    public long getDurationMs() { return durationMs; }
+    public Instant getRequestedAt() { return requestedAt; }
 }

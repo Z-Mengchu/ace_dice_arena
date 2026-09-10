@@ -199,6 +199,15 @@ class AdminTestModeServiceTest {
             JsonNode root = readRoot();
             if (root.hasNonNull("champion")) break;
             forceDeadlinesPast();
+            // 盲盒阶段的截止由内存运行态持有：走管理员强制推进同步截止并立即统一关闭，不能只改数据库
+            if ("BLIND_BOX".equals(root.path("stage").asText())) {
+                for (JsonNode match : root.path("matches")) {
+                    if ("active".equals(match.path("status").asText())) {
+                        tournament.forceMatch(match.path("id").asText());
+                        break;
+                    }
+                }
+            }
             tournament.advanceDueResults();
         }
         JsonNode finished = readRoot();

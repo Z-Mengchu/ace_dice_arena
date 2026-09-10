@@ -64,7 +64,8 @@ class ApplicationIntegrationTest {
                         .content("{\"username\":\"admin\",\"password\":\"admin123\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.displayName").value("主持人"));
-        assertThat(requestAuditRepository.count()).isGreaterThanOrEqualTo(2);
+        // 审计降载后快速成功请求只做内存聚合、不逐条落库（慢请求/5xx 才落库），本用例请求均为快速请求。
+        assertThat(requestAuditRepository.count()).isZero();
     }
 
     @Test
@@ -328,7 +329,7 @@ class ApplicationIntegrationTest {
         root.put("stageDeadlineAt", System.currentTimeMillis() + 15_000L);
         saveState(root);
 
-        // 开盒先锁定 game_state，再把结果写入 player_blind_box 独立行并随响应返回；
+        // 开盒不再锁 game_state：盲盒内存运行态在独立事务内把结果写入 player_blind_box 并随响应返回；
         // 三选一：selections 带盒子序号，响应返回 3 个盒子内容与选中序号
         JsonNode opened = objectMapper.readTree(mockMvc.perform(post("/api/lobby/player-action").session(session)
                         .contentType(MediaType.APPLICATION_JSON)
@@ -359,7 +360,7 @@ class ApplicationIntegrationTest {
         assertThat(me.path("blindBox").asInt()).isEqualTo(box);
         assertThat(me.path("blindBoxOpened").asBoolean()).isTrue();
 
-        // 重复开盒幂等：锁内读取已有记录并返回同一结果；唯一键仅作完整性防线
+        // 重复开盒幂等：条带锁内读取已有记录并返回同一结果；唯一键仅作完整性防线
         mockMvc.perform(post("/api/lobby/player-action").session(session)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"type\":\"blind-box-open\",\"selections\":[]}"))

@@ -2,6 +2,7 @@ package com.acedicearena.service;
 
 import com.acedicearena.repository.GameStateRepository;
 import jakarta.annotation.PreDestroy;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -24,6 +25,8 @@ public class LobbyEventService {
     private static final long HEARTBEAT_INTERVAL_SECONDS = 25L;
     private final Set<Client> clients = ConcurrentHashMap.newKeySet();
     private final GameStateRepository gameStates;
+    /** 懒解析：快照存储依赖 BlindBoxRoundService 而后者依赖本类，Provider 打破构造环。 */
+    private final ObjectProvider<GameStateSnapshotStore> snapshotStore;
     private final ScheduledExecutorService broadcaster = Executors.newSingleThreadScheduledExecutor(runnable -> {
         Thread thread = new Thread(runnable, "lobby-event-broadcaster");
         thread.setDaemon(true);
@@ -31,11 +34,14 @@ public class LobbyEventService {
     });
     private final AtomicBoolean lobbyChangePending = new AtomicBoolean();
     private final AtomicBoolean gameChangePending = new AtomicBoolean();
+    private final AtomicBoolean blindGameChangePending = new AtomicBoolean();
     private final AtomicBoolean adminGameChangePending = new AtomicBoolean();
     private final ConcurrentHashMap<String, AtomicBoolean> teamGameChangePending = new ConcurrentHashMap<>();
 
-    public LobbyEventService(GameStateRepository gameStates) {
+    public LobbyEventService(GameStateRepository gameStates,
+                             ObjectProvider<GameStateSnapshotStore> snapshotStore) {
         this.gameStates = gameStates;
+        this.snapshotStore = snapshotStore;
         broadcaster.scheduleWithFixedDelay(this::heartbeat, HEARTBEAT_INTERVAL_SECONDS,
                 HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
     }
@@ -64,6 +70,24 @@ public class LobbyEventService {
      */
     public void gameChanged() {
         afterCommit(() -> scheduleChange("game", gameChangePending));
+    }
+
+    /**
+     * 盲盒结果变化：复用 game 的 600ms 合并广播，但事件不带版本号（version=null），
+     * 利用前端「event version 为 null 时强制条件回源」的既有逻辑；
+     * 不为每次开盒查询 game_state 版本。
+     */
+    public void blindBoxChanged() {
+        afterCommit(this::scheduleBlindBoxChange);
+    }
+
+    private void scheduleBlindBoxChange() {
+        if (!blindGameChangePending.compareAndSet(false, true)) return;
+        broadcaster.schedule(() -> {
+            blindGameChangePending.set(false);
+            Event event = new Event("game", null, null, null, null);
+            clients.forEach(client -> send(client, event));
+        }, CHANGE_COALESCE_MS, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -151,21 +175,31 @@ public class LobbyEventService {
 
     private Long currentVersion() {
         try {
-            return gameStates.findVersionById(STATE_ID).orElse(null);
+            GameStateSnapshotStore store = snapshotStore.getIfAvailable();
+            if (store == null) return gameStates.findVersionById(STATE_ID).orElse(null);
+            // 广播版本来自共享快照：提交后首个广播触发一次重载，后续读者共享
+            GameStateSnapshotStore.Snapshot current = store.current();
+            return current.present() ? current.version() : null;
         } catch (RuntimeException ignored) {
             return null;
         }
     }
 
     private void afterCommit(Runnable action) {
-        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+        // 所有 game/state/lobby 事件：提交后先失效统一快照，再广播
+        Runnable invalidateThenRun = () -> {
+            GameStateSnapshotStore store = snapshotStore.getIfAvailable();
+            if (store != null) store.invalidate();
             action.run();
+        };
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            invalidateThenRun.run();
             return;
         }
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                action.run();
+                invalidateThenRun.run();
             }
         });
     }

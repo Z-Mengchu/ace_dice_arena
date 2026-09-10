@@ -142,30 +142,48 @@ class DeadlockTimeoutTest {
                 assertThat(player.has("autoRolled")).isFalse()));
     }
 
+    /**
+     * 盲盒超时：未开者按放弃处理（不写字段，个人点数按 0 计），已开结果从 player_blind_box
+     * 合并回 JSON；推进由盲盒内存运行态的统一关闭入口完成。
+     */
     @Test
-    void blindBoxTimeoutForfeitsUnopenedBoxesAndMovesToTactics() {
+    void blindBoxTimeoutForfeitsUnopenedBoxesAndMovesToTactics() throws Exception {
         ObjectNode root = state("BLIND_BOX");
-        root.put("stageDeadlineAt", System.currentTimeMillis() - 1);
+        root.put("stageDeadlineAt", System.currentTimeMillis() + 60_000L);
         // 全员已掷骰但都还没开盲盒
         root.path("teams").forEach(team -> team.path("players").forEach(playerNode -> {
             ObjectNode player = (ObjectNode) playerNode;
             player.put("dice", 3).put("diceFinal", 3).put("rollTs", 1_000L);
         }));
-        // t1 一名队员已经自己开过
-        ObjectNode opened = (ObjectNode) root.path("teams").get(0).path("players").get(0);
-        opened.put("blindBox", 3).put("blindBoxOpened", true);
+        // t1 一名队员已经自己开过（结果在 player_blind_box 表，不在 JSON 行内）
+        var states = mock(com.acedicearena.repository.GameStateRepository.class);
+        var users = mock(com.acedicearena.repository.UserAccountRepository.class);
+        var blindBoxes = mock(com.acedicearena.repository.PlayerBlindBoxRepository.class);
+        var txManager = mock(org.springframework.transaction.PlatformTransactionManager.class);
+        org.mockito.Mockito.when(txManager.getTransaction(org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(inv -> new org.springframework.transaction.support.SimpleTransactionStatus());
+        var record = new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test");
+        org.mockito.Mockito.when(states.findLockedById(1L)).thenReturn(java.util.Optional.of(record));
+        org.mockito.Mockito.when(blindBoxes.findByGameDayAndBracketRound(1, 1)).thenReturn(
+                List.of(new com.acedicearena.domain.PlayerBlindBox(1, 1, "t1-p1", "t1", 3)));
+        BlindBoxRoundService rounds = new BlindBoxRoundService(states, users, blindBoxes, mapper,
+                mock(LobbyEventService.class), txManager);
+        rounds.activateAfterCommit(root);
 
-        assertThat(service().expireBlindBox(root, System.currentTimeMillis())).isTrue();
+        // 截止/强制推进：统一关闭入口合并已开结果并进入 TACTICS
+        assertThat(rounds.advanceIfReady(System.currentTimeMillis(), true)).isTrue();
 
+        ObjectNode advanced = (ObjectNode) mapper.readTree(record.getContent());
+        ObjectNode opened = (ObjectNode) advanced.path("teams").get(0).path("players").get(0);
         assertThat(opened.path("blindBox").asInt()).isEqualTo(3);
-        // 未开者按放弃处理：不写入盲盒字段，个人点数按 0 计
-        root.path("teams").forEach(team -> team.path("players").forEach(player -> {
+        assertThat(opened.path("blindBoxOpened").asBoolean()).isTrue();
+        advanced.path("teams").forEach(team -> team.path("players").forEach(player -> {
             if (player == opened) return;
             assertThat(player.has("blindBox")).isFalse();
             assertThat(player.has("blindBoxOpened")).isFalse();
         }));
-        assertThat(root.path("stage").asText()).isEqualTo("TACTICS");
-        assertThat(root.path("stageDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
+        assertThat(advanced.path("stage").asText()).isEqualTo("TACTICS");
+        assertThat(advanced.path("stageDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
     }
 
     @Test
@@ -281,7 +299,7 @@ class DeadlockTimeoutTest {
         assertThat(root.path("stage").asText()).isEqualTo("ROLL");
 
         root.put("stage", "BLIND_BOX");
-        assertThat(service.expireBlindBox(root, System.currentTimeMillis())).isFalse();
+        // 盲盒阶段的截止推进已由内存运行态接管：未全员完成且未到点时 advanceIfReady 不动（规格见 BlindBoxRoundServiceTest）
 
         root.put("stage", "TACTICS");
         assertThat(service.expireTactics(root, System.currentTimeMillis())).isFalse();
@@ -290,6 +308,99 @@ class DeadlockTimeoutTest {
         assertThat(service.expireGuesses(battleRoot, System.currentTimeMillis())).isFalse();
         assertThat(service.completeRoundReveals(battleRoot, System.currentTimeMillis())).isFalse();
         assertThat(match(battleRoot).path("rounds")).isEmpty();
+    }
+
+    /* ---------- 盲盒阶段读写锁 ---------- */
+
+    /**
+     * 公平阶段读写锁的确定性顺序：进行中的开盒（读锁）阻塞截止（写锁）；
+     * 写锁已排队后，新的开盒读锁不能插队，写锁释放后看到的是已关闭的运行态。
+     */
+    @Test
+    void blindBoxFairLockQueuesNewReadersBehindPendingWriter() throws Exception {
+        var states = mock(com.acedicearena.repository.GameStateRepository.class);
+        var users = mock(com.acedicearena.repository.UserAccountRepository.class);
+        var blindBoxes = mock(com.acedicearena.repository.PlayerBlindBoxRepository.class);
+        var events = mock(LobbyEventService.class);
+        var txManager = mock(org.springframework.transaction.PlatformTransactionManager.class);
+        org.mockito.Mockito.when(txManager.getTransaction(org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(inv -> new org.springframework.transaction.support.SimpleTransactionStatus());
+        java.util.Map<String, com.acedicearena.domain.PlayerBlindBox> committed = new java.util.concurrent.ConcurrentHashMap<>();
+        ThreadLocal<java.util.Map<String, com.acedicearena.domain.PlayerBlindBox>> pending =
+                ThreadLocal.withInitial(java.util.LinkedHashMap::new);
+        org.mockito.Mockito.doAnswer(inv -> {
+            committed.putAll(pending.get());
+            pending.remove();
+            return null;
+        }).when(txManager).commit(org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.doAnswer(inv -> {
+            pending.remove();
+            return null;
+        }).when(txManager).rollback(org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.when(blindBoxes.findByGameDayAndBracketRoundAndPlayerId(
+                        org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.anyInt(),
+                        org.mockito.ArgumentMatchers.anyString()))
+                .thenAnswer(inv -> java.util.Optional.ofNullable(committed.get(inv.getArgument(2))));
+        org.mockito.Mockito.when(blindBoxes.findByGameDayAndBracketRound(
+                        org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.anyInt()))
+                .thenAnswer(inv -> List.copyOf(committed.values()));
+
+        BlindBoxRoundService rounds = new BlindBoxRoundService(states, users, blindBoxes, mapper, events, txManager);
+        ObjectNode root = mapper.createObjectNode();
+        root.put("mode", "parallel");
+        root.put("day", 1);
+        root.put("stage", "BLIND_BOX");
+        root.put("stageDeadlineAt", System.currentTimeMillis() + 60_000L);
+        ArrayNode teams = root.putArray("teams");
+        teams.addObject().put("id", "t1").putArray("players")
+                .addObject().put("id", "u1").put("name", "甲");
+        teams.addObject().put("id", "t2").putArray("players");
+        ObjectNode match = root.putObject("matches").putObject("g1");
+        match.put("id", "g1").put("a", "t1").put("b", "t2").put("status", "active");
+        rounds.activateAfterCommit(root);
+        org.mockito.Mockito.when(states.findLockedById(1L)).thenReturn(java.util.Optional.of(
+                new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test")));
+        com.acedicearena.domain.UserAccount alice = new com.acedicearena.domain.UserAccount(
+                "alice", "甲", "技术部", "USER", "hash", "salt");
+        alice.assignTeam("t1");
+        org.springframework.test.util.ReflectionTestUtils.setField(alice, "id", 1L);
+        org.mockito.Mockito.when(users.findByUsername("alice")).thenReturn(java.util.Optional.of(alice));
+
+        // 开盒事务停在提交前（读锁持有中）
+        java.util.concurrent.CountDownLatch inTransaction = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(inv -> {
+            com.acedicearena.domain.PlayerBlindBox row = inv.getArgument(0);
+            pending.get().put(row.getPlayerId(), row);
+            inTransaction.countDown();
+            release.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            return row;
+        }).when(blindBoxes).saveAndFlush(org.mockito.ArgumentMatchers.any());
+
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(3);
+        var openFuture = pool.submit(() -> rounds.open("alice", 0));
+        assertThat(inTransaction.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        // 截止线程排队等写锁
+        var advanceFuture = pool.submit(() -> rounds.advanceIfReady(System.currentTimeMillis(), true));
+        Thread.sleep(200);
+        assertThat(advanceFuture.isDone()).isFalse();
+        // 写锁已排队后新读者不能插队：第二个开盒请求在写锁之后获得读锁，看到已关闭
+        var lateOpenFuture = pool.submit(() -> {
+            try {
+                rounds.open("alice", 0);
+                return null;
+            } catch (IllegalStateException e) {
+                return e;
+            }
+        });
+        Thread.sleep(100);
+        release.countDown();
+
+        assertThat(openFuture.get(5, java.util.concurrent.TimeUnit.SECONDS).boxes()).isNotNull();
+        assertThat(advanceFuture.get(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        assertThat(lateOpenFuture.get(5, java.util.concurrent.TimeUnit.SECONDS))
+                .isNotNull().hasMessage("当前不在开盲盒阶段");
+        pool.shutdown();
     }
 
     /* ---------- 构造 ---------- */
@@ -303,7 +414,9 @@ class DeadlockTimeoutTest {
                 mock(LobbyEventService.class), 6_000L,
                 mock(com.acedicearena.repository.BattleReportRepository.class),
                 mock(com.acedicearena.repository.MatchReportRepository.class),
-                mock(com.acedicearena.repository.PlayerBlindBoxRepository.class));
+                mock(com.acedicearena.repository.PlayerBlindBoxRepository.class),
+                mock(BlindBoxRoundService.class),
+                mock(org.springframework.transaction.PlatformTransactionManager.class));
     }
 
     /** t1/t2 各 30 人，一场 g1 进行中。 */

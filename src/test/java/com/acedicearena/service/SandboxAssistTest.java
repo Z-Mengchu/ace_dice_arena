@@ -119,14 +119,22 @@ class SandboxAssistTest {
         com.acedicearena.repository.GameStateRepository states =
                 mock(com.acedicearena.repository.GameStateRepository.class);
         when(states.findLockedById(1L)).thenReturn(Optional.of(record));
-        return new ParallelTournamentService(states,
-                mock(com.acedicearena.repository.UserAccountRepository.class),
+        var users = mock(com.acedicearena.repository.UserAccountRepository.class);
+        var blindBoxes = mock(com.acedicearena.repository.PlayerBlindBoxRepository.class);
+        var events = mock(LobbyEventService.class);
+        // 桩事务管理器：同步执行回调并视为已提交，运行态 seam 才能真实执行换人事务体
+        var txManager = mock(org.springframework.transaction.PlatformTransactionManager.class);
+        when(txManager.getTransaction(org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(inv -> new org.springframework.transaction.support.SimpleTransactionStatus());
+        return new ParallelTournamentService(states, users,
                 mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 mock(com.acedicearena.repository.GameControlRepository.class), mapper,
-                mock(LobbyEventService.class), 6_000L,
+                events, 6_000L,
                 mock(com.acedicearena.repository.BattleReportRepository.class),
                 mock(com.acedicearena.repository.MatchReportRepository.class),
-                mock(com.acedicearena.repository.PlayerBlindBoxRepository.class));
+                blindBoxes,
+                new BlindBoxRoundService(states, users, blindBoxes, mapper, events, txManager),
+                txManager);
     }
 
     private UserAccount user(long id, String username, String teamId) {

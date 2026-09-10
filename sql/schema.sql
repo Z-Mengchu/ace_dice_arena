@@ -82,5 +82,30 @@ CREATE TABLE IF NOT EXISTS request_audit (
     INDEX idx_request_username (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- 完赛对局逐局明细归档，game_state 行内只保留 {round, winner} 摘要。
+CREATE TABLE IF NOT EXISTS match_report (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    game_day INT NOT NULL,
+    match_id VARCHAR(8) NOT NULL,
+    content LONGTEXT NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    PRIMARY KEY (id),
+    INDEX idx_match_report_day_match (game_day, match_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 开盲盒结果按玩家独立成行，(game_day, bracket_round, player_id) 唯一键是
+-- 同一玩家同轮只开一次的完整性防线；推进 TACTICS 时合并回 game_state。
+CREATE TABLE IF NOT EXISTS player_blind_box (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    game_day INT NOT NULL,
+    bracket_round INT NOT NULL,
+    player_id VARCHAR(16) NOT NULL,
+    team_id VARCHAR(4) NOT NULL,
+    box_value INT NOT NULL,
+    opened_at DATETIME(6) NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_player_blind_box_round UNIQUE (game_day, bracket_round, player_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- admin 账户不在 SQL 中保存固定密码。
 -- 应用首次启动时会创建 admin，密码读取 ADMIN_PASSWORD 环境变量。

@@ -16,7 +16,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -29,67 +28,6 @@ import static org.mockito.Mockito.when;
 
 class ParallelTournamentServiceTest {
     private final ObjectMapper mapper = new ObjectMapper();
-
-    /* ---------- 盲盒事务 ---------- */
-
-    @Test
-    void lockedBlindBoxOpenUsesLockedStateAndReturnsExistingResult() {
-        var states = mock(com.acedicearena.repository.GameStateRepository.class);
-        var blindBoxes = mock(com.acedicearena.repository.PlayerBlindBoxRepository.class);
-        var user = new UserAccount("box_player", "开盒玩家", "技术部", "USER", "hash", "salt");
-        user.assignTeam("t1");
-        ReflectionTestUtils.setField(user, "id", 7L);
-        ObjectNode root = blindBoxRoot(7L);
-        when(states.findLockedById(1L)).thenReturn(Optional.of(
-                new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test")));
-        when(blindBoxes.findByGameDayAndBracketRoundAndPlayerId(1, 1, "u7"))
-                .thenReturn(Optional.of(new com.acedicearena.domain.PlayerBlindBox(1, 1, "u7", "t1", 4)));
-
-        var result = service(states, mock(com.acedicearena.repository.UserAccountRepository.class),
-                mock(LobbyEventService.class), blindBoxes).openBlindBoxLocked(user, 0);
-
-        assertThat(result.value()).isEqualTo(4);
-        assertThat(result.boxes()).isNull();
-        verify(states).findLockedById(1L);
-        verify(states, never()).findById(1L);
-        verify(blindBoxes, never()).saveAndFlush(any());
-    }
-
-    @Test
-    void lastBlindBoxOpenMergesRowsAndAdvancesCurrentLockedState() throws Exception {
-        var states = mock(com.acedicearena.repository.GameStateRepository.class);
-        var blindBoxes = mock(com.acedicearena.repository.PlayerBlindBoxRepository.class);
-        var events = mock(LobbyEventService.class);
-        var user = new UserAccount("last_box_player", "最后开盒玩家", "技术部", "USER", "hash", "salt");
-        user.assignTeam("t1");
-        ReflectionTestUtils.setField(user, "id", 8L);
-        ObjectNode root = blindBoxRoot(8L);
-        var record = new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test");
-        when(states.findLockedById(1L)).thenReturn(Optional.of(record));
-        when(blindBoxes.findByGameDayAndBracketRoundAndPlayerId(1, 1, "u8"))
-                .thenReturn(Optional.empty());
-        AtomicReference<com.acedicearena.domain.PlayerBlindBox> saved = new AtomicReference<>();
-        when(blindBoxes.saveAndFlush(any())).thenAnswer(invocation -> {
-            var row = invocation.<com.acedicearena.domain.PlayerBlindBox>getArgument(0);
-            saved.set(row);
-            return row;
-        });
-        // 开盒判定走 count 查询；合并回 JSON 仍走 findByGameDayAndBracketRound（末人分支调用）。
-        when(blindBoxes.countByGameDayAndBracketRoundAndPlayerIdIn(anyInt(), anyInt(), any()))
-                .thenAnswer(invocation -> saved.get() == null ? 0L : 1L);
-        when(blindBoxes.findByGameDayAndBracketRound(1, 1))
-                .thenAnswer(invocation -> saved.get() == null ? List.of() : List.of(saved.get()));
-
-        var result = service(states, mock(com.acedicearena.repository.UserAccountRepository.class),
-                events, blindBoxes).openBlindBoxLocked(user, 0);
-
-        ObjectNode updated = (ObjectNode) mapper.readTree(record.getContent());
-        assertThat(updated.path("stage").asText()).isEqualTo("TACTICS");
-        assertThat(updated.at("/teams/0/players/0/blindBox").asInt()).isEqualTo(result.value());
-        assertThat(updated.at("/teams/0/players/0/blindBoxOpened").asBoolean()).isTrue();
-        verify(states).save(record);
-        verify(events).gameChangedNow();
-    }
 
     /* ---------- 数值规则 ---------- */
 
@@ -222,9 +160,10 @@ class ParallelTournamentServiceTest {
         var record = new com.acedicearena.domain.GameStateRecord(1L, root.toString(), "test");
         var states = mock(com.acedicearena.repository.GameStateRepository.class);
         when(states.findLockedById(1L)).thenReturn(Optional.of(record));
+        var blindBoxes = mock(com.acedicearena.repository.PlayerBlindBoxRepository.class);
 
         service(states, mock(com.acedicearena.repository.UserAccountRepository.class),
-                mock(LobbyEventService.class)).rematch("admin", "g1");
+                mock(LobbyEventService.class), blindBoxes).rematch("admin", "g1");
 
         ObjectNode after = (ObjectNode) mapper.readTree(record.getContent());
         ObjectNode rematched = (ObjectNode) after.path("matches").path("g1");
@@ -234,6 +173,8 @@ class ParallelTournamentServiceTest {
         assertThat(rematched.path("winsA").asInt()).isZero();
         assertThat(rematched.path("rounds")).isEmpty();
         assertThat(after.path("stage").asText()).isEqualTo("ROLL");
+        // 重赛复用同一 day/round 的唯一键：开始新 ROLL 前定向删除当前在赛玩家的旧盲盒结果
+        verify(blindBoxes).deleteByGameDayAndBracketRoundAndPlayerIdIn(anyInt(), anyInt(), any());
     }
 
     @Test
@@ -529,7 +470,9 @@ class ParallelTournamentServiceTest {
 
         ObjectNode view = (ObjectNode) service.playerStateView(root, "t1", "u1");
 
-        assertThat(view.path("teams").findValuesAsText("id")).containsExactly("t1", "t2");
+        List<String> teamIds = new ArrayList<>();
+        view.path("teams").forEach(team -> teamIds.add(team.path("id").asText()));
+        assertThat(teamIds).containsExactly("t1", "t2");
         assertThat(view.at("/teams/0/players")).hasSize(30);
         assertThat(view.at("/teams/1/players")).hasSize(30);
         List<String> matchIds = new ArrayList<>();
@@ -1155,6 +1098,14 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.PlayerBlindBoxRepository.class));
     }
 
+    /** 桩事务管理器：同步执行回调并视为已提交，供运行态 seam 在单测中工作。 */
+    private static org.springframework.transaction.PlatformTransactionManager stubTransactions() {
+        var txManager = org.mockito.Mockito.mock(org.springframework.transaction.PlatformTransactionManager.class);
+        org.mockito.Mockito.when(txManager.getTransaction(org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(inv -> new org.springframework.transaction.support.SimpleTransactionStatus());
+        return txManager;
+    }
+
     private ParallelTournamentService service(com.acedicearena.repository.GameStateRepository states,
                                               com.acedicearena.repository.UserAccountRepository users,
                                               LobbyEventService events,
@@ -1165,25 +1116,10 @@ class ParallelTournamentServiceTest {
                 events, 6_000L,
                 org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.MatchReportRepository.class),
-                blindBoxes);
-    }
-
-    private ObjectNode blindBoxRoot(long userId) {
-        ObjectNode root = mapper.createObjectNode();
-        root.put("mode", "parallel");
-        root.put("stage", "BLIND_BOX");
-        root.put("stageDeadlineAt", System.currentTimeMillis() + 30_000L);
-        root.put("day", 1);
-        ArrayNode teams = root.putArray("teams");
-        teams.addObject().put("id", "t1").putArray("players")
-                .addObject().put("id", "u" + userId);
-        teams.addObject().put("id", "t2").putArray("players");
-        ObjectNode match = root.putObject("matches").putObject("g1");
-        match.put("id", "g1");
-        match.put("a", "t1");
-        match.put("b", "t2");
-        match.put("status", "active");
-        return root;
+                blindBoxes,
+                // 运行态用真实实例（同一批 mock 仓库 + 桩事务），simulateStep/forceMatch 才能走完盲盒关闭
+                new BlindBoxRoundService(states, users, blindBoxes, mapper, events, stubTransactions()),
+                stubTransactions());
     }
 
     /** ROLL 阶段：t1/t2 各 30 人，g1 进行中，go 与截止时间由参数指定；小队错峰时刻表与真实状态一致。 */

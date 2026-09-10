@@ -3,7 +3,6 @@ package com.acedicearena.service;
 import com.acedicearena.domain.GameControl;
 import com.acedicearena.domain.UserAccount;
 import com.acedicearena.repository.GameControlRepository;
-import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.UserAccountRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -22,24 +21,24 @@ public class LobbyService {
     public static final List<String> TEAM_NAMES = List.of("雷霆战区", "烈焰战区", "飓风战区", "磐石战区", "星驰战区", "锋芒战区", "凌云战区", "破晓战区");
     private final UserAccountRepository users;
     private final GameControlRepository controls;
-    private final GameStateRepository gameStates;
     private final LobbyEventService events;
     private final ObjectMapper objectMapper;
     private final ParallelTournamentService tournament;
+    private final GameStateSnapshotStore snapshotStore;
     private final long rosterCacheTtlMs;
     private final Object rosterCacheLock = new Object();
     private volatile RosterCache rosterCache;
 
     public LobbyService(UserAccountRepository users, GameControlRepository controls,
-                        GameStateRepository gameStates, LobbyEventService events, ObjectMapper objectMapper,
-                        ParallelTournamentService tournament,
+                        LobbyEventService events, ObjectMapper objectMapper,
+                        ParallelTournamentService tournament, GameStateSnapshotStore snapshotStore,
                         @Value("${app.cache.roster-ttl-ms:300}") long rosterCacheTtlMs) {
         this.users = users;
         this.controls = controls;
-        this.gameStates = gameStates;
         this.events = events;
         this.objectMapper = objectMapper;
         this.tournament = tournament;
+        this.snapshotStore = snapshotStore;
         this.rosterCacheTtlMs = Math.max(0, rosterCacheTtlMs);
     }
 
@@ -325,14 +324,9 @@ public class LobbyService {
                 isStandIn(u), originalId.orElse(null), originalName);
     }
 
+    /** 大厅读取的比赛状态来自统一快照：不再独立查询/解析整份 game_state。 */
     private JsonNode savedGame() {
-        return gameStates.findById(1L).map(record -> {
-            try {
-                return objectMapper.readTree(record.getContent());
-            } catch (Exception ignored) {
-                return objectMapper.createObjectNode();
-            }
-        }).orElseGet(objectMapper::createObjectNode);
+        return snapshotStore.current().state();
     }
 
     private List<UserView> playerRoster() {

@@ -39,12 +39,13 @@ FLUSH PRIVILEGES;
 mysql -u root -p < sql/schema.sql
 ```
 
-脚本会创建 `ace_dice_arena` 数据库及业务表。生产环境使用 `ddl-auto: validate`，应用只校验表结构，不自动修改数据库。若数据库已经执行过旧版脚本，请按版本顺序执行迁移脚本：
+脚本会创建 `ace_dice_arena` 数据库及业务表（含 v5 的 `player_blind_box` 与 `match_report`）。生产环境使用 `ddl-auto: validate`，应用只校验表结构，不自动修改数据库。若数据库已经执行过旧版脚本，请按版本顺序执行迁移脚本（已是最新 schema.sql 的新库无需执行）：
 
 ```bash
 mysql -u root -p ace_dice_arena < sql/migration_v2_lobby.sql
 mysql -u root -p ace_dice_arena < sql/migration_v3_performance.sql
 mysql -u root -p ace_dice_arena < sql/migration_v4_afk.sql
+mysql -u root -p ace_dice_arena < sql/migration_v5_blind_box_hotfix.sql
 ```
 
 ```bash
@@ -149,6 +150,10 @@ sudo cp deploy/nginx-ace-dice-arena.conf /etc/nginx/conf.d/ace-dice-arena.conf
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+> ⚠️ Windows 注意事项：配置里 `listen 80 backlog=1024` 这类 `listen` 指令参数的修改，**必须完整重启 nginx
+> （`nginx -s quit` 后重新启动）才生效**；`nginx -s reload` 只替换 worker，master 沿用启动时创建的旧 listen
+> socket，backlog 等新值不会生效（2026-09-10 压测实测：reload 后 250 同毫秒登录有 41 个 SYN 被 RST，完整重启后归零）。
 
 如果实际部署目录或 Java 端口不同，先修改配置中的 `root` 或 `upstream`。应用默认允许 24 个登录请求并发，
 其余浏览器会收到排队响应并自动随机重试；可通过 `LOGIN_MAX_CONCURRENT` 调整。主业务数据库连接池默认 50，

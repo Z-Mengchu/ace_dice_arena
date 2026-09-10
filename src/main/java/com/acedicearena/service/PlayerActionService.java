@@ -8,7 +8,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 import java.util.Map;
@@ -20,37 +21,51 @@ public class PlayerActionService {
     private final ObjectMapper mapper;
     private final LobbyEventService events;
     private final ParallelTournamentService tournament;
+    private final BlindBoxRoundService blindBoxRounds;
+    private final TransactionTemplate transactions;
 
     public PlayerActionService(GameStateRepository gameStates, UserAccountRepository users,
                                ObjectMapper mapper, LobbyEventService events,
-                               ParallelTournamentService tournament) {
+                               ParallelTournamentService tournament, BlindBoxRoundService blindBoxRounds,
+                               PlatformTransactionManager transactionManager) {
         this.gameStates = gameStates;
         this.users = users;
         this.mapper = mapper;
         this.events = events;
         this.tournament = tournament;
+        this.blindBoxRounds = blindBoxRounds;
+        this.transactions = new TransactionTemplate(transactionManager);
     }
 
-    @Transactional
+    /**
+     * 按动作分流事务入口：开盲盒走内存运行态模块（自身管理阶段锁与写穿事务），
+     * 其余动作在单个事务内锁 game_state 并走原有 JSON 状态机。
+     */
     public Map<String, Object> submit(String username, String type, List<String> selections) {
+        if ("blind-box-open".equals(type)) return submitBlindBoxOpen(username, selections);
+        Map<String, Object> body = transactions.execute(status -> submitStateAction(username, type, selections));
+        return body == null ? Map.of("ok", true) : body;
+    }
+
+    /** 开盲盒：不锁 game_state、不解析整份 JSON，用户/角色/挂机校验在盲盒模块的事务内完成。 */
+    private Map<String, Object> submitBlindBoxOpen(String username, List<String> selections) {
+        var result = blindBoxRounds.open(username, parseBoxIndex(selections));
+        Map<String, Object> body = new java.util.HashMap<>();
+        body.put("ok", true);
+        body.put("blindBox", result.value());
+        if (result.boxes() != null) {
+            body.put("boxes", java.util.Arrays.stream(result.boxes()).boxed().toList());
+            body.put("picked", result.picked());
+        }
+        return body;
+    }
+
+    private Map<String, Object> submitStateAction(String username, String type, List<String> selections) {
         UserAccount user = users.findByUsername(username).orElseThrow();
         if (!"USER".equals(user.getRole()) || user.getTeamId() == null) {
             throw new IllegalStateException("只有本轮已分组玩家可以提交比赛操作");
         }
         if (user.isAfk()) throw new IllegalStateException("你当前处于挂机状态，请先取消挂机再操作");
-        // 开盲盒在当前事务内先锁定 game_state，再写入 player_blind_box
-        if ("blind-box-open".equals(type)) {
-            var result = tournament.openBlindBoxLocked(user, parseBoxIndex(selections));
-            events.gameChanged();
-            Map<String, Object> body = new java.util.HashMap<>();
-            body.put("ok", true);
-            body.put("blindBox", result.value());
-            if (result.boxes() != null) {
-                body.put("boxes", java.util.Arrays.stream(result.boxes()).boxed().toList());
-                body.put("picked", result.picked());
-            }
-            return body;
-        }
         GameStateRecord record = gameStates.findLockedById(1L)
                 .orElseThrow(() -> new IllegalStateException("主持人尚未创建比赛"));
         ObjectNode root = parse(record.getContent());

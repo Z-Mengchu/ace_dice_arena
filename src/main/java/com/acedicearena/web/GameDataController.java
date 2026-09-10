@@ -8,6 +8,8 @@ import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.MatchReportRepository;
 import com.acedicearena.repository.UserAccountRepository;
 import com.acedicearena.service.AdminTestModeService;
+import com.acedicearena.service.GameStateSnapshotStore;
+import com.acedicearena.service.GameStateSnapshotStore.Snapshot;
 import com.acedicearena.service.LobbyEventService;
 import com.acedicearena.service.ParallelTournamentService;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -38,9 +40,9 @@ public class GameDataController {
     private final UserAccountRepository users;
     private final ParallelTournamentService tournament;
     private final MatchReportRepository matchReports;
+    private final GameStateSnapshotStore snapshotStore;
     private final long stateCacheTtlMs;
     private final Object stateCacheLock = new Object();
-    private volatile StateSnapshot stateCache;
     private volatile TestUserSnapshot testUserCache;
 
     public GameDataController(GameStateRepository gameStateRepository,
@@ -50,6 +52,7 @@ public class GameDataController {
                               UserAccountRepository users,
                               ParallelTournamentService tournament,
                               MatchReportRepository matchReports,
+                              GameStateSnapshotStore snapshotStore,
                               @Value("${app.cache.game-state-ttl-ms:250}") long stateCacheTtlMs) {
         this.gameStateRepository = gameStateRepository;
         this.battleReportRepository = battleReportRepository;
@@ -58,6 +61,7 @@ public class GameDataController {
         this.users = users;
         this.tournament = tournament;
         this.matchReports = matchReports;
+        this.snapshotStore = snapshotStore;
         this.stateCacheTtlMs = Math.max(0, stateCacheTtlMs);
     }
 
@@ -66,7 +70,7 @@ public class GameDataController {
             @RequestParam(required = false) String scope,
             @RequestHeader(value = HttpHeaders.IF_NONE_MATCH, required = false) String ifNoneMatch,
             HttpSession session) {
-        StateSnapshot snapshot = gameState();
+        Snapshot snapshot = gameState();
         boolean ordinaryUser = "USER".equals(session.getAttribute("role"));
         String username = (String) session.getAttribute(AuthController.SESSION_USER);
         if (ordinaryUser && sandboxHidden(username, snapshot)) return ResponseEntity.noContent().build();
@@ -79,7 +83,7 @@ public class GameDataController {
                 ? (playerScope ? "player:" : "public:") + (teamId != null ? "t:" + teamId
                         : playerId != null ? "p:" + playerId : "outsider")
                 : "admin";
-        String etag = stateEtag(snapshot.version(), viewKey);
+        String etag = stateEtag(snapshot.version(), snapshot.blindRevision(), viewKey);
         if (etagMatches(ifNoneMatch, etag)) {
             return ResponseEntity.status(HttpStatus.NOT_MODIFIED).eTag(etag)
                     .header(HttpHeaders.CACHE_CONTROL, STATE_CACHE_CONTROL).build();
@@ -109,7 +113,7 @@ public class GameDataController {
      */
     @GetMapping("/game-state/matches/{matchId}")
     public ResponseEntity<?> getMatchDetail(@PathVariable String matchId, HttpSession session) {
-        StateSnapshot snapshot = gameState();
+        Snapshot snapshot = gameState();
         boolean ordinaryUser = "USER".equals(session.getAttribute("role"));
         String username = (String) session.getAttribute(AuthController.SESSION_USER);
         if (ordinaryUser && sandboxHidden(username, snapshot)) return ResponseEntity.noContent().build();
@@ -143,7 +147,7 @@ public class GameDataController {
      * 私密沙盘拦截：测试账号（__arena_test_ 前缀）本身就是沙盘参赛者，放行走正常脱敏视图，
      * 与正式比赛真实用户路径一致；只有真实用户才被私密沙盘拦截。
      */
-    private boolean sandboxHidden(String username, StateSnapshot snapshot) {
+    private boolean sandboxHidden(String username, Snapshot snapshot) {
         if (!hasTestUsers()) return false;
         boolean sandboxPlayer = username != null && username.startsWith(AdminTestModeService.USERNAME_PREFIX);
         if (!sandboxPlayer && snapshot.present()) {
@@ -163,7 +167,8 @@ public class GameDataController {
         if (record == null) record = new GameStateRecord(STATE_ID, content, username);
         else record.update(content, username);
         gameStateRepository.save(record);
-        stateCache = null;
+        // 提交后失效统一快照（本方法在事务内，回滚不失效）
+        snapshotStore.invalidateAfterCommit();
         lobbyEvents.gameChanged();
         return Map.of("ok", true, "version", record.getVersion());
     }
@@ -184,37 +189,13 @@ public class GameDataController {
         catch (Exception e) { return objectMapper.createObjectNode(); }
     }
 
-    private StateSnapshot gameState() {
-        long now = System.currentTimeMillis();
-        StateSnapshot cached = stateCache;
-        long currentVersion = gameStateRepository.findVersionById(STATE_ID).orElse(0L);
-        if (stateCacheTtlMs > 0 && cached != null && cached.version() == currentVersion
-                && now - cached.loadedAt() < stateCacheTtlMs) return cached;
-        synchronized (stateCacheLock) {
-            cached = stateCache;
-            now = System.currentTimeMillis();
-            currentVersion = gameStateRepository.findVersionById(STATE_ID).orElse(0L);
-            if (stateCacheTtlMs > 0 && cached != null && cached.version() == currentVersion
-                    && now - cached.loadedAt() < stateCacheTtlMs) return cached;
-            long loadedAt = now;
-            StateSnapshot loaded = gameStateRepository.findById(STATE_ID)
-                    .map(record -> {
-                        JsonNode state = parse(record.getContent());
-                        // BLIND_BOX 阶段开盒结果在 player_blind_box 表，注入后再入缓存
-                        tournament.injectBlindBoxResults(state);
-                        return new StateSnapshot(true, state, record.getVersion(),
-                                record.getUpdatedAt(), record.getUpdatedBy() == null ? "" : record.getUpdatedBy(),
-                                loadedAt, new ConcurrentHashMap<>());
-                    })
-                    .orElseGet(() -> new StateSnapshot(false, objectMapper.createObjectNode(), 0,
-                            Instant.EPOCH, "", loadedAt, new ConcurrentHashMap<>()));
-            stateCache = loaded;
-            return loaded;
-        }
+    /** 比赛状态统一快照：失效/盲盒 revision 变化由存储负责，命中路径不查库。 */
+    private Snapshot gameState() {
+        return snapshotStore.current();
     }
 
-    private static String stateEtag(long version, String viewKey) {
-        return "\"game-state-" + version + "-" + viewKey + "\"";
+    private static String stateEtag(long version, long blindRevision, String viewKey) {
+        return "\"game-state-" + version + "-" + blindRevision + "-" + viewKey + "\"";
     }
 
     private static boolean etagMatches(String ifNoneMatch, String etag) {
@@ -241,7 +222,5 @@ public class GameDataController {
     }
 
     public record ReportBody(String content) {}
-    private record StateSnapshot(boolean present, JsonNode state, long version, Instant updatedAt,
-                                 String updatedBy, long loadedAt, ConcurrentHashMap<String, JsonNode> teamViews) {}
     private record TestUserSnapshot(boolean present, long loadedAt) {}
 }

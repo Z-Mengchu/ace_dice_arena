@@ -17,4 +17,10 @@ public interface PlayerBlindBoxRepository extends JpaRepository<PlayerBlindBox, 
      * 与只读视图注入仍会物化整轮行。
      */
     long countByGameDayAndBracketRoundAndPlayerIdIn(int gameDay, int bracketRound, Collection<String> playerIds);
+
+    /**
+     * 重赛/新一轮开始前定向清理：只删当前在赛玩家复用唯一键的旧结果，
+     * 与新 ROLL 状态在同一事务；不动其他历史比赛的行。
+     */
+    long deleteByGameDayAndBracketRoundAndPlayerIdIn(int gameDay, int bracketRound, Collection<String> playerIds);
 }
