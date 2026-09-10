@@ -19,6 +19,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
@@ -73,6 +74,9 @@ class ParallelTournamentServiceTest {
             saved.set(row);
             return row;
         });
+        // 开盒判定走 count 查询；合并回 JSON 仍走 findByGameDayAndBracketRound（末人分支调用）。
+        when(blindBoxes.countByGameDayAndBracketRoundAndPlayerIdIn(anyInt(), anyInt(), any()))
+                .thenAnswer(invocation -> saved.get() == null ? 0L : 1L);
         when(blindBoxes.findByGameDayAndBracketRound(1, 1))
                 .thenAnswer(invocation -> saved.get() == null ? List.of() : List.of(saved.get()));
 

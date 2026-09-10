@@ -1170,8 +1170,7 @@ public class ParallelTournamentService {
      */
     private boolean allBlindBoxesOpened(ObjectNode root, int day, int round) {
         Set<String> active = activePlayerIds(root);
-        long opened = blindBoxes.findByGameDayAndBracketRound(day, round).stream()
-                .filter(row -> active.contains(row.getPlayerId())).count();
+        long opened = blindBoxes.countByGameDayAndBracketRoundAndPlayerIdIn(day, round, active);
         return opened >= active.size();
     }
 
