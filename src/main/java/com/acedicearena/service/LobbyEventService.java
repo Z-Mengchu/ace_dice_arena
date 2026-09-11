@@ -134,6 +134,30 @@ public class LobbyEventService {
         clients.stream().filter(c -> teamId.equals(c.teamId())).forEach(c -> send(c, event));
     }
 
+    /**
+     * 赛况播报：掷骰/盲盒/重掷/猜阵事件作为 feed 消息推进队内频道。
+     * 与聊天同为即时转发：不落库、不存历史，后进入的成员看不到过往播报。
+     * kind 取值为 roll-big / roll-small / box-buff / box-debuff / reroll-up / reroll-down / guess-many / guess-few。
+     */
+    public void feed(String teamId, String kind, String sender, String content) {
+        Event event = new Event("feed:" + kind, null, sender, content, Instant.now().toString());
+        clients.stream().filter(c -> teamId.equals(c.teamId())).forEach(c -> send(c, event));
+    }
+
+    /** 事务内产生的播报：提交成功后才推送，回滚不广播；不触碰快照失效（纯转发，无状态变化）。 */
+    public void feedAfterCommit(String teamId, String kind, String sender, String content) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            feed(teamId, kind, sender, content);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                feed(teamId, kind, sender, content);
+            }
+        });
+    }
+
     private void send(Client client, Object value) {
         try {
             client.emitter().send(SseEmitter.event().data(value));

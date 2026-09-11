@@ -803,6 +803,10 @@ public class ParallelTournamentService {
                 player.put("rollTs", rollOpenAt(root, squadIndexOf(team, player.path("id").asText()))
                         + AUTO_ROLL_OFFSET_MS);
                 player.put("autoRolled", true);
+                events.feedAfterCommit(team.path("id").asText(), die >= 4 ? "roll-big" : "roll-small",
+                        player.path("name").asText(),
+                        die >= 4 ? "系统代掷 · 掷出大点数 · 手气爆棚，骰子给足排面！"
+                                : "系统代掷 · 掷出小点数 · 骰子偷偷摆烂了");
             }
         }
         enterBlindBox(root);
@@ -885,6 +889,9 @@ public class ParallelTournamentService {
             if (advanced) enterBlindBox(root);
             record.update(root.toString(), username);
             states.save(record);
+            events.feedAfterCommit(teamId, die >= 4 ? "roll-big" : "roll-small",
+                    player.path("name").asText(),
+                    die >= 4 ? "掷出大点数 · 手气爆棚，骰子给足排面！" : "掷出小点数 · 骰子偷偷摆烂了");
             // 阶段推进走立即广播，普通掷骰走合并广播
             if (advanced) events.gameChangedNow();
             else events.gameChanged();
@@ -1122,8 +1129,13 @@ public class ParallelTournamentService {
         if (player == null) throw new IllegalStateException("当前账号不在本队参赛名单中");
         if (player.has("blindBox")) throw new IllegalStateException("你已经开过本轮盲盒");
         int[] boxes = drawBlindBoxes();
-        player.put("blindBox", boxes[parseBoxIndex(values)]);
+        int boxValue = boxes[parseBoxIndex(values)];
+        player.put("blindBox", boxValue);
         player.put("blindBoxOpened", true);
+        if (boxValue != 0)
+            events.feedAfterCommit(team.path("id").asText(), boxValue > 0 ? "box-buff" : "box-debuff",
+                    player.path("name").asText(),
+                    boxValue > 0 ? "盲盒开出正向 buff · 欧气直接砸脸上！" : "盲盒踩中负面 debuff · 非酋 buff 已签收");
         startTacticsIfReady(root);
     }
 
@@ -1200,6 +1212,10 @@ public class ParallelTournamentService {
         log.put("playerName", player.path("name").asText());
         log.put("from", from);
         log.put("to", to);
+        if (to != from)
+            events.feedAfterCommit(team.path("id").asText(), to > from ? "reroll-up" : "reroll-down",
+                    player.path("name").asText(),
+                    "重掷 " + from + " → " + to + (to > from ? " · 队长这波赌对啦！" : " · 这下血压上来咯"));
     }
 
     /**
@@ -1431,10 +1447,21 @@ public class ParallelTournamentService {
             entry.put("winner", winner);
             match.put("wins" + winner, match.path("wins" + winner).asInt() + 1);
         }
+        feedGuessReveal(match, round, "A", entry.path("guessHitsA").asInt());
+        feedGuessReveal(match, round, "B", entry.path("guessHitsB").asInt());
         match.put("roundPhase", "REVEAL");
         match.put("revealUntil", System.currentTimeMillis() + REVEAL_DURATION_MS);
         match.remove("guessDeadlineAt");
         match.set("guesses", mapper.createObjectNode());
+    }
+
+    /** 猜阵揭晓播报：只推给本方队伍频道，按命中人次分档 */
+    private void feedGuessReveal(ObjectNode match, int round, String side, int hits) {
+        String copy = hits >= 2
+                ? "第 " + round + " 局猜阵命中 " + hits + " 人次 · 对手套路全被看透！"
+                : "第 " + round + " 局猜阵仅命中 " + hits + " 人次 · 猜了个寂寞";
+        events.feedAfterCommit(teamForSide(match, side), hits >= 2 ? "guess-many" : "guess-few",
+                "猜阵揭晓", copy);
     }
 
     private double settleSide(ObjectNode root, ObjectNode match, ObjectNode entry, int round, String side) {

@@ -202,7 +202,8 @@ public class BlindBoxRoundService {
     }
 
     /** 事务内开盒的内部结果：inserted 标记事务是否写入了新行，repair 标记需要事后修补内存。 */
-    private record OpenOutcome(BlindBoxResult result, boolean inserted, String playerId, Integer repairValue) {
+    private record OpenOutcome(BlindBoxResult result, boolean inserted, String playerId, Integer repairValue,
+                               String teamId, String playerName) {
     }
 
     /* ---------- 开盒写穿 ---------- */
@@ -239,6 +240,11 @@ public class BlindBoxRoundService {
                     }
                     // 首开提交成功：无版本合并广播，触发前端强制条件回源
                     events.blindBoxChanged();
+                    int boxValue = outcome.result().value();
+                    if (boxValue != 0)
+                        events.feed(outcome.teamId(), boxValue > 0 ? "box-buff" : "box-debuff",
+                                outcome.playerName(),
+                                boxValue > 0 ? "盲盒开出正向 buff · 欧气直接砸脸上！" : "盲盒踩中负面 debuff · 非酋 buff 已签收");
                     if (ctx.allEligibleOpened() && ctx.advanceSignal.compareAndSet(false, true))
                         signalAdvance = true;
                 } else if (outcome.repairValue() != null) {
@@ -268,20 +274,23 @@ public class BlindBoxRoundService {
         PlayerSlot slot = definition.players().get(playerId);
         if (slot == null) throw new IllegalStateException("当前账号不在本队参赛名单中");
         Integer inMemory = ctx.results.get(playerId);
-        if (inMemory != null) return new OpenOutcome(new BlindBoxResult(inMemory, null, -1), false, playerId, null);
+        if (inMemory != null)
+            return new OpenOutcome(new BlindBoxResult(inMemory, null, -1), false, playerId, null,
+                    slot.teamId(), user.getDisplayName());
         int day = definition.key().gameDay();
         int round = definition.key().bracketRound();
         var existing = blindBoxes.findByGameDayAndBracketRoundAndPlayerId(day, round, playerId);
         if (existing.isPresent()) {
             // 数据库已有而内存缺失：幂等返回落库值，事务提交后修补内存并标记 DIRTY
             return new OpenOutcome(new BlindBoxResult(existing.get().getBoxValue(), null, -1),
-                    false, playerId, existing.get().getBoxValue());
+                    false, playerId, existing.get().getBoxValue(), slot.teamId(), user.getDisplayName());
         }
         int picked = boxIndex == null ? ThreadLocalRandom.current().nextInt(BLIND_BOX_COUNT) : boxIndex;
         int[] boxes = drawBlindBoxes();
         int value = boxes[picked];
         blindBoxes.saveAndFlush(new PlayerBlindBox(day, round, playerId, slot.teamId(), value));
-        return new OpenOutcome(new BlindBoxResult(value, boxes, picked), true, playerId, null);
+        return new OpenOutcome(new BlindBoxResult(value, boxes, picked), true, playerId, null,
+                slot.teamId(), user.getDisplayName());
     }
 
     /* ---------- 阶段生命周期（供赛事模块在事务提交后调用） ---------- */
