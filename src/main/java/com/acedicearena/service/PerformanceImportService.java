@@ -108,6 +108,7 @@ public class PerformanceImportService {
         if (rows.isEmpty()) throw new IllegalArgumentException("表格中没有可导入的数据");
         if ("PLAYING".equals(control().getPhase())) throw new IllegalStateException("比赛进行中不能重新导入业绩");
 
+        // 姓名重复时再用部门消歧；仍不唯一就保留异常状态，不猜测账号。
         List<UserAccount> accounts = users.findAll().stream().filter(this::isPlayer).toList();
         Map<String, List<UserAccount>> byName = accounts.stream()
                 .collect(Collectors.groupingBy(u -> normalize(u.getDisplayName())));
@@ -144,6 +145,7 @@ public class PerformanceImportService {
         }
         if (imported.isEmpty()) throw new IllegalArgumentException("表格中没有可参与分组的业绩数据");
 
+        // 业绩表是一次完整快照：替换旧记录同时清空旧分组，避免新旧数据混用。
         accounts.forEach(user -> user.setPerformance(matchedIds.contains(user.getId()),
                 gmvByUser.getOrDefault(user.getId(), BigDecimal.ZERO)));
         users.saveAll(accounts);
@@ -180,7 +182,8 @@ public class PerformanceImportService {
         List<UserAccount> all = players.stream().filter(user -> !testAccounts.excludes(user)).toList();
         List<UserAccount> frontEnds = all.stream().filter(UserAccount::isFrontEnd).collect(Collectors.toCollection(ArrayList::new));
         List<UserAccount> backEnds = all.stream().filter(u -> !u.isFrontEnd()).collect(Collectors.toCollection(ArrayList::new));
-        // 人数超过席位时按用户 id 升序优先参赛，id 靠后的多余人员留在观战席
+
+        // 人数超过席位时按用户 id 升序优先参赛，id 靠后的多余人员留在观战席。
         int maxFrontEnds = TEAM_COUNT * (TEAM_SIZE - MIN_BACK_END);
         frontEnds.sort(Comparator.comparing(UserAccount::getId));
         List<UserAccount> selectedFrontEnds = new ArrayList<>(frontEnds.subList(0, Math.min(frontEnds.size(), maxFrontEnds)));
@@ -195,6 +198,8 @@ public class PerformanceImportService {
         List<TeamBucket> teams = new ArrayList<>();
         for (String teamId : LobbyService.TEAM_IDS) teams.add(new TeamBucket(teamId));
         Random random = new Random();
+
+        // 前端人员按 GMV 从高到低逐个放入当前业绩最低的可用队伍，随机只用于打破同值偏置。
         for (UserAccount user : selectedFrontEnds) {
             List<TeamBucket> available = teams.stream().filter(t -> t.frontCount() < TEAM_SIZE - MIN_BACK_END)
                     .collect(Collectors.toCollection(ArrayList::new));
@@ -204,6 +209,7 @@ public class PerformanceImportService {
             target.addFront(user);
         }
 
+        // 后端人员不参与业绩平衡，随机补齐每队的剩余席位。
         Collections.shuffle(selectedBackEnds, random);
         int backendIndex = 0;
         for (TeamBucket team : teams) {

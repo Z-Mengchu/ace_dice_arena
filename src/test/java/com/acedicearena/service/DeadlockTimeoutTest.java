@@ -108,7 +108,7 @@ class DeadlockTimeoutTest {
     void squadWindowPassedDoesNotAutoRollBeforeTheSharedDeadline() {
         ObjectNode root = state("ROLL");
         root.path("teams").forEach(team -> formSquads((ObjectNode) team));
-        // 1 号小队开掷已过 15.5s，但全局截止（go+20s，全员统一）还没到：不代掷、不推进
+        // 1 号小队已开掷，但全局截止时间未到：不代掷、不推进。
         long now = System.currentTimeMillis();
         long go = now - 15_500L;
         root.put("rollGoAt", go);

@@ -32,6 +32,19 @@ class PlayerActionServiceTest {
     }
 
     @Test
+    void blindBoxSelectionMustBeNumeric() {
+        BlindBoxRoundService blindBoxRounds = mock(BlindBoxRoundService.class);
+        PlayerActionService service = new PlayerActionService(mock(GameStateRepository.class),
+                mock(UserAccountRepository.class), new ObjectMapper(), mock(LobbyEventService.class),
+                mock(ParallelTournamentService.class), blindBoxRounds, stubTransactions());
+
+        assertThatThrownBy(() -> service.submit("player", "blind-box-open", List.of("x")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("盲盒序号必须是数字");
+        verifyNoInteractions(blindBoxRounds);
+    }
+
+    @Test
     void afkPlayerCannotSubmitGameActionsUntilRestored() {
         GameStateRepository states = mock(GameStateRepository.class);
         UserAccountRepository users = mock(UserAccountRepository.class);
@@ -81,7 +94,6 @@ class PlayerActionServiceTest {
         // 开盲盒改走内存运行态模块，不再锁 game_state、不走动作分发表；未带序号时为 null
         verify(blindBoxRounds).open("player", null);
         verify(tournament, never()).dispatchPlayerAction(any(), any(), eq("blind-box-open"), any());
-        verify(tournament, never()).submitSandboxAction(any(), any(), any(), any());
         // 响应字段保持：首次开盒携带 boxes 与 picked
         assertThat(blindBody.get("ok")).isEqualTo(true);
         assertThat(blindBody.get("blindBox")).isEqualTo(2);
@@ -128,7 +140,7 @@ class PlayerActionServiceTest {
     }
 
     @Test
-    void sandboxPlayersGoThroughTheSandboxDispatch() {
+    void sandboxPlayersUseTheRegularDispatchTable() {
         GameStateRepository states = mock(GameStateRepository.class);
         UserAccountRepository users = mock(UserAccountRepository.class);
         ParallelTournamentService tournament = mock(ParallelTournamentService.class);
@@ -140,15 +152,13 @@ class PlayerActionServiceTest {
                 "{\"mode\":\"parallel\",\"stage\":\"CAPTAIN_VOTE\",\"teams\":[{\"id\":\"t1\"}],"
                         + "\"sandboxPlayers\":[{\"username\":\"sandbox_player\"}]}", "admin");
         when(states.findLockedById(1L)).thenReturn(Optional.of(record));
-        when(tournament.isSandboxPlayer(any(), eq("sandbox_player"))).thenReturn(true);
         PlayerActionService service = new PlayerActionService(states, users, mapper,
                 mock(LobbyEventService.class), tournament,
                 mock(BlindBoxRoundService.class), stubTransactions());
 
         service.submit("sandbox_player", "role-vote", List.of("u1"));
 
-        verify(tournament).submitSandboxAction(any(), eq(player), eq("role-vote"), eq(List.of("u1")));
-        verify(tournament, never()).submitRoleVote(any(), any(), any());
+        verify(tournament).dispatchPlayerAction(any(), eq(player), eq("role-vote"), eq(List.of("u1")));
         verify(states).save(record);
     }
 

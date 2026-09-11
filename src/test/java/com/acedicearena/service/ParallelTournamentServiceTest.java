@@ -10,7 +10,6 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -82,28 +81,6 @@ class ParallelTournamentServiceTest {
         ObjectNode player = mapper.createObjectNode();
         player.put("diceFinal", 4).put("blindBox", -2);
         assertThat(ParallelTournamentService.personalPoints(player)).isEqualTo(2);
-    }
-
-    @Test
-    void blindBoxDrawsStayWithinDeclaredTiersAndCoverAllOfThem() {
-        ParallelTournamentService service = service();
-        int weightSum = 0;
-        for (int weight : ParallelTournamentService.BLIND_BOX_WEIGHTS) weightSum += weight;
-        assertThat(weightSum).isEqualTo(100);
-        Map<Integer, Integer> counts = new HashMap<>();
-        int total = 20_000;
-        for (int i = 0; i < total; i++) {
-            int value = service.drawBlindBox();
-            counts.merge(value, 1, Integer::sum);
-        }
-        for (int i = 0; i < ParallelTournamentService.BLIND_BOX_VALUES.length; i++) {
-            double expected = ParallelTournamentService.BLIND_BOX_WEIGHTS[i] / 100d;
-            double ratio = counts.getOrDefault(ParallelTournamentService.BLIND_BOX_VALUES[i], 0) / (double) total;
-            assertThat(ratio).isBetween(Math.max(0d, expected - 0.02d), expected + 0.02d);
-        }
-        // 负档（debuff）合计应为 25%
-        double debuff = (counts.getOrDefault(-1, 0) + counts.getOrDefault(-2, 0)) / (double) total;
-        assertThat(debuff).isBetween(0.22d, 0.28d);
     }
 
     /* ---------- 平局链 ---------- */
@@ -300,42 +277,6 @@ class ParallelTournamentServiceTest {
                 .hasMessage("本场重掷次数已用完");
     }
 
-    /* ---------- 盲盒 ---------- */
-
-    @Test
-    void blindBoxOpenDrawsOnceAndRequiresTheStage() {
-        ParallelTournamentService service = service();
-        ObjectNode root = blindBoxRoot();
-        UserAccount member = user(1L, "t1");
-
-        ObjectNode notOpenYet = blindBoxRoot();
-        notOpenYet.put("stage", "TACTICS");
-        assertThatThrownBy(() -> service.openBlindBox(notOpenYet, member))
-                .hasMessage("当前不在开盲盒阶段");
-
-        service.openBlindBox(root, member);
-        ObjectNode opened = player(team(root, "t1"), "u1");
-        assertThat(opened.path("blindBox").asInt()).isBetween(-2, 3);
-        assertThat(opened.path("blindBoxOpened").asBoolean()).isTrue();
-        assertThat(opened.has("autoOpened")).isFalse();
-        assertThatThrownBy(() -> service.openBlindBox(root, member))
-                .hasMessage("你已经开过本轮盲盒");
-    }
-
-    @Test
-    void blindBoxOpenRejectsOutOfRangeBoxIndex() {
-        ParallelTournamentService service = service();
-        ObjectNode root = blindBoxRoot();
-        UserAccount member = user(1L, "t1");
-
-        assertThatThrownBy(() -> service.openBlindBox(root, member, List.of("3")))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("盲盒序号超出范围");
-        assertThatThrownBy(() -> service.openBlindBox(root, member, List.of("x")))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("盲盒序号必须是数字");
-    }
-
     /* ---------- 排阵 ---------- */
 
     @Test
@@ -384,7 +325,7 @@ class ParallelTournamentServiceTest {
     /* ---------- 阶段截止守卫 ---------- */
 
     @Test
-    void tacticAndBlindBoxActionsRejectAfterTheStageDeadline() {
+    void tacticActionsRejectAfterTheStageDeadline() {
         ParallelTournamentService service = service();
         ObjectNode tactics = tacticsRoot(10);
         formSquads(team(tactics, "t1"));
@@ -396,11 +337,6 @@ class ParallelTournamentServiceTest {
                 .hasMessage("战术阶段时间已经结束");
         assertThatThrownBy(() -> service.submitSquadOrder(tactics, captain, List.of("1", "2", "3", "4", "5", "6")))
                 .hasMessage("战术阶段时间已经结束");
-
-        ObjectNode blindBox = blindBoxRoot();
-        blindBox.put("stageDeadlineAt", System.currentTimeMillis() - 1L);
-        assertThatThrownBy(() -> service.openBlindBox(blindBox, user(1L, "t1")))
-                .hasMessage("开盲盒时间已经结束");
     }
 
     /* ---------- 玩家视角脱敏 ---------- */
@@ -1184,13 +1120,6 @@ class ParallelTournamentServiceTest {
         root.put("stageDeadlineAt", System.currentTimeMillis() + 60_000L);
         team(root, "t1").withObject("/roles").put("captain", "u1");
         team(root, "t2").withObject("/roles").put("captain", "u101");
-        return root;
-    }
-
-    /** BLIND_BOX 阶段：t1/t2 的 g1 进行中，截止时间在将来。 */
-    private ObjectNode blindBoxRoot() {
-        ObjectNode root = twoTeamRoot("BLIND_BOX");
-        root.put("stageDeadlineAt", System.currentTimeMillis() + 60_000L);
         return root;
     }
 
