@@ -3,7 +3,7 @@
  * 用法：import { icon } from './icons.js';
  *       html += icon('dices');            // 标题行 20px
  *       html += icon('timer', 16);        // 正文行内 16px
- * 图标颜色跟随 currentColor；占位符与图标的对应关系见《阶段面板提示文案-优化版.md》第 0 节。
+ * 图标颜色跟随 currentColor。
  */
 import Vote from 'lucide/dist/esm/icons/vote.mjs';
 import Crown from 'lucide/dist/esm/icons/crown.mjs';
