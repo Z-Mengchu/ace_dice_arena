@@ -97,6 +97,26 @@ class BlindBoxRoundServiceTest {
     /* ---------- 幂等与并发 ---------- */
 
     @Test
+    void drawsFollowTheDeclaredWeightTable() {
+        int weightSum = 0;
+        for (int weight : BlindBoxRoundService.BLIND_BOX_WEIGHTS) weightSum += weight;
+        assertThat(weightSum).isEqualTo(100);
+        Map<Integer, Integer> counts = new LinkedHashMap<>();
+        int total = 20_000;
+        for (int i = 0; i < total; i++) {
+            int value = BlindBoxRoundService.drawBlindBox();
+            counts.merge(value, 1, Integer::sum);
+        }
+        for (int i = 0; i < BlindBoxRoundService.BLIND_BOX_VALUES.length; i++) {
+            double expected = BlindBoxRoundService.BLIND_BOX_WEIGHTS[i] / 100d;
+            double ratio = counts.getOrDefault(BlindBoxRoundService.BLIND_BOX_VALUES[i], 0) / (double) total;
+            assertThat(ratio).isBetween(Math.max(0d, expected - 0.02d), expected + 0.02d);
+        }
+        double debuff = (counts.getOrDefault(-1, 0) + counts.getOrDefault(-2, 0)) / (double) total;
+        assertThat(debuff).isBetween(0.22d, 0.28d);
+    }
+
+    @Test
     void concurrentSamePlayerOpensProduceOneRowOneValueOneRevision() throws Exception {
         activate();
         UserAccount alice = player(1L, "alice", "t1");

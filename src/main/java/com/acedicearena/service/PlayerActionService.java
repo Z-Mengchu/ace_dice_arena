@@ -75,11 +75,7 @@ public class PlayerActionService {
         String captainBefore = "role-vote".equals(type) ? captainOf(root, user.getTeamId()) : null;
         String gameStageBefore = root.path("stage").asText();
         List<String> values = selections == null ? List.of() : selections;
-        if (tournament.isSandboxPlayer(root, username)) {
-            tournament.submitSandboxAction(root, user, type, values);
-        } else {
-            submitParallel(root, user, type, values);
-        }
+        tournament.dispatchPlayerAction(root, user, type, values);
         record.update(root.toString(), username);
         gameStates.save(record);
         notifyPlayerAction(type, captainBefore, gameStageBefore, root, user.getTeamId());
@@ -118,10 +114,6 @@ public class PlayerActionService {
             if (teamId.equals(team.path("id").asText())) return team.at("/roles/captain").asText(null);
         }
         return null;
-    }
-
-    private void submitParallel(ObjectNode root, UserAccount user, String type, List<String> values) {
-        tournament.dispatchPlayerAction(root, user, type, values);
     }
 
     private ObjectNode parse(String content) {

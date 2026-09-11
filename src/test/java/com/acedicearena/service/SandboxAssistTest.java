@@ -30,7 +30,7 @@ class SandboxAssistTest {
         UserAccount player = user(5001L, "player_a", "t3");
         UserAccount replaced = user(9001L, "__arena_test_061", "t3");
 
-        service.configureSandboxPlayers(List.of(
+        service.applySandboxAssignments(List.of(
                 new ParallelTournamentService.SandboxAssignment(player, replaced, "t3", "front")));
 
         ObjectNode saved = read(record);
@@ -57,7 +57,7 @@ class SandboxAssistTest {
         GameStateRecord record = new GameStateRecord(1L, root.toString(), "system");
         ParallelTournamentService service = service(record);
         UserAccount player = user(5001L, "player_a", "t3");
-        service.configureSandboxPlayers(List.of(
+        service.applySandboxAssignments(List.of(
                 new ParallelTournamentService.SandboxAssignment(player, user(9001L, "__arena_test_061", "t3"), "t3", "front")));
 
         ObjectNode voted = read(record);
@@ -80,7 +80,7 @@ class SandboxAssistTest {
         ParallelTournamentService service = service(record);
         UserAccount player = user(5001L, "player_a", "t3");
 
-        service.configureSandboxPlayers(List.of(
+        service.applySandboxAssignments(List.of(
                 new ParallelTournamentService.SandboxAssignment(player, user(9001L, "__arena_test_061", "t3"), "t3", "front")));
 
         ObjectNode saved = read(record);
@@ -100,17 +100,15 @@ class SandboxAssistTest {
         GameStateRecord record = new GameStateRecord(1L, root.toString(), "system");
         ParallelTournamentService service = service(record);
         UserAccount player = user(5001L, "player_a", "t3");
-        service.configureSandboxPlayers(List.of(
+        service.applySandboxAssignments(List.of(
                 new ParallelTournamentService.SandboxAssignment(player, user(9001L, "__arena_test_061", "t3"), "t3", "front")));
 
         ObjectNode saved = read(record);
-        service.submitSandboxAction(saved, player, "role-vote", List.of("u9002"));
+        service.dispatchPlayerAction(saved, player, "role-vote", List.of("u9002"));
         assertThat(team(saved, "t3").at("/roleVotes/u5001").asText()).isEqualTo("u9002");
-        assertThatThrownBy(() -> service.submitSandboxAction(saved, player, "prophet", List.of()))
+        assertThatThrownBy(() -> service.dispatchPlayerAction(saved, player, "prophet", List.of()))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("未知的玩家操作");
-        assertThatThrownBy(() -> service.submitSandboxAction(saved, user(777L, "stranger", "t1"), "role-vote", List.of("u1")))
-                .hasMessage("当前账号不是沙盘正式玩家");
     }
 
     /* ---------- 构造 ---------- */
@@ -122,10 +120,7 @@ class SandboxAssistTest {
         var users = mock(com.acedicearena.repository.UserAccountRepository.class);
         var blindBoxes = mock(com.acedicearena.repository.PlayerBlindBoxRepository.class);
         var events = mock(LobbyEventService.class);
-        // 桩事务管理器：同步执行回调并视为已提交，运行态 seam 才能真实执行换人事务体
         var txManager = mock(org.springframework.transaction.PlatformTransactionManager.class);
-        when(txManager.getTransaction(org.mockito.ArgumentMatchers.any()))
-                .thenAnswer(inv -> new org.springframework.transaction.support.SimpleTransactionStatus());
         return new ParallelTournamentService(states, users,
                 mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 mock(com.acedicearena.repository.GameControlRepository.class), mapper,
@@ -133,7 +128,7 @@ class SandboxAssistTest {
                 mock(com.acedicearena.repository.BattleReportRepository.class),
                 mock(com.acedicearena.repository.MatchReportRepository.class),
                 blindBoxes,
-                new BlindBoxRoundService(states, users, blindBoxes, mapper, events, txManager),
+                mock(BlindBoxRoundService.class),
                 txManager);
     }
 

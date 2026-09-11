@@ -287,7 +287,7 @@ class ApplicationIntegrationTest {
         var squad0User = userAccountRepository.findByUsername("squad0_roller").orElseThrow();
         var squad5User = userAccountRepository.findByUsername("squad5_roller").orElseThrow();
 
-        // go 已过去 17s：1 号小队已开掷，6 号小队（go+5s 开）也在窗口内；全局截止 go+20s 未到，双方都能掷。
+        // go 已过去 17s：1 号和 6 号小队均已开掷，但全局截止时间尚未到。
         ObjectNode root = rollStateRoot(List.of(), List.of());
         long go = System.currentTimeMillis() - 17_000L;
         root.put("rollGoAt", go);

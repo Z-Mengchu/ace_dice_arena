@@ -55,9 +55,7 @@ public class ParallelTournamentService {
      * 全员掷骰总窗口：最后一个小队的开掷时刻加小队窗口；超时未掷者由系统代掷。
      */
     private static final long ROLL_DURATION_MS = rollDurationMs();
-    /**
-     * 321 倒计时：进入 ROLL 阶段后 3 秒才到 go，全员同一时刻起跑。
-     */
+    /** 321 倒计时：进入 ROLL 阶段后 3 秒到达基准 go 时刻。 */
     private static final long ROLL_COUNTDOWN_MS = 3_000L;
     /**
      * 相邻小队的开掷间隔：第 k 小队（0 起）在 go+k×1s 开掷。
@@ -75,10 +73,6 @@ public class ParallelTournamentService {
      * 开盲盒窗口；超时未开视为放弃（按 0 计），系统不再代开。
      */
     private static final long BLIND_BOX_DURATION_MS = 25_000L;
-    /**
-     * 队长重掷与排阵的战术窗口；超时未用重掷作废、顺序按小队编号锁定。
-     */
-    private static final long TACTICS_DURATION_MS = 90_000L;
     /**
      * 每轮出战小队的猜阵时限；超时视为放弃，命中记 0。
      */
@@ -102,11 +96,6 @@ public class ParallelTournamentService {
      * 系统代掷的掷骰时刻记为 go+1s；含代掷队员的小队不能触发同步暴击。
      */
     static final long AUTO_ROLL_OFFSET_MS = 1_000L;
-    static final int[] BLIND_BOX_VALUES = BlindBoxRoundService.BLIND_BOX_VALUES;
-    static final int[] BLIND_BOX_WEIGHTS = BlindBoxRoundService.BLIND_BOX_WEIGHTS;
-    /** 三选一盲盒：摆出供玩家选择的盒子数量。 */
-    static final int BLIND_BOX_COUNT = BlindBoxRoundService.BLIND_BOX_COUNT;
-
     private final GameStateRepository states;
     private final UserAccountRepository users;
     private final PerformanceRecordRepository performances;
@@ -120,9 +109,7 @@ public class ParallelTournamentService {
     private final BlindBoxRoundService blindBoxRounds;
     private final TransactionTemplate transactions;
 
-    /**
-     * ROLL 阶段总窗口 = 最后一个小队的开掷时刻（go+5s）+ 小队窗口（15s）= go+20s。
-     */
+    /** ROLL 阶段截止时间 = 最后一队开掷时间 + 单队掷骰窗口。 */
     private static long rollDurationMs() {
         return (SQUAD_COUNT - 1) * SQUAD_ROLL_STAGGER_MS + SQUAD_ROLL_WINDOW_MS;
     }
@@ -150,6 +137,7 @@ public class ParallelTournamentService {
 
     @Transactional
     public void start(String username) {
+        // 保留两日赛事的累计结果，新一日只重建当日运行状态。
         GameStateRecord record = states.findById(1L).orElse(null);
         ObjectNode previous = readState(record);
         ObjectNode dayResults = previous != null && previous.path("dayResults").isObject()
@@ -164,6 +152,8 @@ public class ParallelTournamentService {
         root.put("startedAt", startedAt);
         root.put("stage", "CAPTAIN_VOTE");
         root.set("dayResults", dayResults);
+
+        // 参赛名单和业绩在开赛时固化，赛中不再跟随账号表变化。
         ArrayNode teams = root.putArray("teams");
         List<UserAccount> accounts = users.findAll().stream()
                 .filter(u -> "USER".equals(u.getRole()) && AccountService.hasUsableDepartment(u.getDepartment()))
@@ -240,6 +230,8 @@ public class ParallelTournamentService {
         root.put("stage", "CAPTAIN_VOTE");
         root.set("dayResults", dayResults);
         root.set("overallResult", overallResult.deepCopy());
+
+        // 加赛沿用第二日的参赛快照，当前账号只用于刷新挂机和前后端身份。
         Map<String, UserAccount> accountsById = new LinkedHashMap<>();
         users.findAll().forEach(u -> accountsById.put("u" + u.getId(), u));
         Map<String, ObjectNode> snapshots = new LinkedHashMap<>();
@@ -304,16 +296,6 @@ public class ParallelTournamentService {
         return currentGmv.divide(lastWeekGmv, 4, RoundingMode.HALF_UP);
     }
 
-    /**
-     * 沙盘换人入口（非事务协调方法）：阶段写锁先于事务开始，事务提交后用最新状态
-     * 整体重建盲盒运行态名单与结果；回滚时 context 不变。
-     */
-    public void configureSandboxPlayers(List<SandboxAssignment> assignments) {
-        blindBoxRounds.runExclusiveInTransaction(
-                () -> applySandboxAssignments(assignments),
-                root -> blindBoxRounds.replaceDefinitionAfterCommit(root.deepCopy()));
-    }
-
     /** 沙盘换人的事务体：game_state JSON、user/team 与盲盒结果行改挂在同一事务内完成。 */
     ObjectNode applySandboxAssignments(List<SandboxAssignment> assignments) {
         GameStateRecord record = states.findLockedById(1L)
@@ -322,6 +304,7 @@ public class ParallelTournamentService {
             ObjectNode root = (ObjectNode) mapper.readTree(record.getContent());
             root.remove("sandboxSolo");
             ArrayNode configured = root.putArray("sandboxPlayers");
+            // 同时替换花名册和运行中席位，避免后续结算仍引用被替换玩家。
             for (SandboxAssignment assignment : assignments) {
                 UserAccount player = assignment.player();
                 ObjectNode entry = configured.addObject();
@@ -436,10 +419,6 @@ public class ParallelTournamentService {
         }
     }
 
-    public boolean isSandboxPlayer(ObjectNode root, String username) {
-        return sandboxPlayer(root, username) != null;
-    }
-
     @Transactional
     public void restoreAfkPlayer(UserAccount user, String username) {
         GameStateRecord record = states.findLockedById(1L).orElse(null);
@@ -469,20 +448,11 @@ public class ParallelTournamentService {
         }
     }
 
-    /**
-     * 沙盘正式玩家与正式玩家走同一张动作表；沙盘模式只是允许指定真人顶替沙盘队员。
-     */
-    public void submitSandboxAction(ObjectNode root, UserAccount player, String type, List<String> values) {
-        JsonNode configuredPlayer = sandboxPlayer(root, player.getUsername());
-        if (configuredPlayer == null) throw new IllegalStateException("当前账号不是沙盘正式玩家");
-        dispatchPlayerAction(root, player, type, values);
-    }
-
+    /** 正式玩家和沙盘玩家共用同一张动作表。 */
     public void dispatchPlayerAction(ObjectNode root, UserAccount player, String type, List<String> values) {
         switch (type == null ? "" : type) {
             case "role-vote" -> submitRoleVote(root, player, values);
             case "squad-form" -> submitSquadForm(root, player, values);
-            case "blind-box-open" -> openBlindBox(root, player, values);
             case "reroll" -> submitReroll(root, player, values);
             case "squad-order" -> submitSquadOrder(root, player, values);
             case "tactics-confirm" -> submitTacticsConfirm(root, player, true);
@@ -496,7 +466,7 @@ public class ParallelTournamentService {
 
     /* ---------- 队长投票 ---------- */
 
-    public void submitRoleVote(ObjectNode root, UserAccount voter, List<String> values) {
+    void submitRoleVote(ObjectNode root, UserAccount voter, List<String> values) {
         if (!"CAPTAIN_VOTE".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在队长投票阶段");
         if (values.size() != 1) throw new IllegalArgumentException("每次只能选择一名队长候选人");
@@ -560,7 +530,7 @@ public class ParallelTournamentService {
         }
     }
 
-    public void requireRole(ObjectNode root, UserAccount user, String role, String message) {
+    private void requireRole(ObjectNode root, UserAccount user, String role, String message) {
         ObjectNode team = findTeam(root, user.getTeamId());
         if (!team.path("roles").hasNonNull(role)) throw new IllegalStateException("请等待全队完成队长投票");
         if (!("u" + user.getId()).equals(team.path("roles").path(role).asText()))
@@ -648,7 +618,7 @@ public class ParallelTournamentService {
     /**
      * 队长提交分队：selections 为本队 30 个队员 id，按 6×5 顺序扁平排列，序号即 1~6 号小队。
      */
-    public void submitSquadForm(ObjectNode root, UserAccount captain, List<String> values) {
+    void submitSquadForm(ObjectNode root, UserAccount captain, List<String> values) {
         if (!"SQUAD_FORM".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在分队阶段");
         requireRole(root, captain, "captain", "只有当选队长可以分队");
@@ -1090,66 +1060,6 @@ public class ParallelTournamentService {
         match.set("rounds", summary);
     }
 
-    int drawBlindBox() {
-        return BlindBoxRoundService.drawBlindBox();
-    }
-
-    /** 三选一：一次抽出全部盒子的内容，玩家选中的那个落库，其余仅用于展示对比。 */
-    int[] drawBlindBoxes() {
-        return BlindBoxRoundService.drawBlindBoxes();
-    }
-
-    /** 解析可选的盒子序号；缺省时服务端随机选一个（玩家主动开盒为前提，系统不代开）。 */
-    private int parseBoxIndex(List<String> values) {
-        if (values == null || values.isEmpty())
-            return ThreadLocalRandom.current().nextInt(BLIND_BOX_COUNT);
-        int index;
-        try {
-            index = Integer.parseInt(values.getFirst());
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("盲盒序号必须是数字");
-        }
-        if (index < 0 || index >= BLIND_BOX_COUNT) throw new IllegalArgumentException("盲盒序号超出范围");
-        return index;
-    }
-
-    public void openBlindBox(ObjectNode root, UserAccount user) {
-        openBlindBox(root, user, List.of());
-    }
-
-    public void openBlindBox(ObjectNode root, UserAccount user, List<String> values) {
-        if (!"BLIND_BOX".equals(root.path("stage").asText()))
-            throw new IllegalStateException("当前不在开盲盒阶段");
-        if (root.path("stageDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
-            throw new IllegalStateException("开盲盒时间已经结束");
-        ObjectNode team = findTeam(root, user.getTeamId());
-        if (!activeTeamIds(root).contains(team.path("id").asText()))
-            throw new IllegalStateException("本队本轮没有比赛");
-        ObjectNode player = findPlayer(team, "u" + user.getId());
-        if (player == null) throw new IllegalStateException("当前账号不在本队参赛名单中");
-        if (player.has("blindBox")) throw new IllegalStateException("你已经开过本轮盲盒");
-        int[] boxes = drawBlindBoxes();
-        int boxValue = boxes[parseBoxIndex(values)];
-        player.put("blindBox", boxValue);
-        player.put("blindBoxOpened", true);
-        if (boxValue != 0)
-            events.feedAfterCommit(team.path("id").asText(), boxValue > 0 ? "box-buff" : "box-debuff",
-                    player.path("name").asText(),
-                    boxValue > 0 ? "盲盒开出正向 buff · 欧气直接砸脸上！" : "盲盒踩中负面 debuff · 非酋 buff 已签收");
-        startTacticsIfReady(root);
-    }
-
-    private boolean startTacticsIfReady(ObjectNode root) {
-        if (!"BLIND_BOX".equals(root.path("stage").asText())) return false;
-        Set<String> activeTeams = activeTeamIds(root);
-        for (JsonNode teamNode : root.path("teams")) {
-            if (!activeTeams.contains(teamNode.path("id").asText())) continue;
-            for (JsonNode player : teamNode.path("players")) if (!player.has("blindBox")) return false;
-        }
-        startTactics(root);
-        return true;
-    }
-
     /* ---------- 开盲盒（内存运行态接管生产路径） ---------- */
 
     /**
@@ -1174,17 +1084,12 @@ public class ParallelTournamentService {
         return ids;
     }
 
-    private void startTactics(ObjectNode root) {
-        root.put("stage", "TACTICS");
-        root.put("stageDeadlineAt", System.currentTimeMillis() + TACTICS_DURATION_MS);
-    }
-
     /* ---------- 战术窗口：重掷 + 排阵 ---------- */
 
     /**
      * 队长指定本队任意队员重掷：只改点数，保留原掷骰时刻（暴击判定不受影响）与盲盒。
      */
-    public void submitReroll(ObjectNode root, UserAccount captain, List<String> values) {
+    void submitReroll(ObjectNode root, UserAccount captain, List<String> values) {
         if (!"TACTICS".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在战术阶段");
         if (root.path("stageDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
@@ -1221,7 +1126,7 @@ public class ParallelTournamentService {
     /**
      * 队长重排 1~6 号小队出场顺序：selections 为小队编号的目标排列，如 ["3","1","2","4","5","6"]。
      */
-    public void submitSquadOrder(ObjectNode root, UserAccount captain, List<String> values) {
+    void submitSquadOrder(ObjectNode root, UserAccount captain, List<String> values) {
         if (!"TACTICS".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在战术阶段");
         if (root.path("stageDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
@@ -1260,7 +1165,7 @@ public class ParallelTournamentService {
     /**
      * 队长确认战术布置完成；取消确认可继续调整。所有在赛队伍都确认后立即进入对局。
      */
-    public void submitTacticsConfirm(ObjectNode root, UserAccount captain, boolean confirmed) {
+    void submitTacticsConfirm(ObjectNode root, UserAccount captain, boolean confirmed) {
         if (!"TACTICS".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在战术阶段");
         if (root.path("stageDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
@@ -1319,7 +1224,7 @@ public class ParallelTournamentService {
     /**
      * 本轮出战小队成员各提交一份对敌方出战 5 人的猜测，密封；双方都齐 5 份时提前揭晓。
      */
-    public void submitRoundGuess(ObjectNode root, UserAccount user, List<String> values) {
+    void submitRoundGuess(ObjectNode root, UserAccount user, List<String> values) {
         if (!"BATTLE".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在对局阶段");
         ObjectNode match = activeMatchFor(root, user.getTeamId());
@@ -1355,7 +1260,7 @@ public class ParallelTournamentService {
      * 提前猜阵：本人小队出战的轮次在当前轮之后时，可预交对敌方出战 5 人的猜测，开窗时自动生效；
      * 重复提交覆盖旧值（改投），当前轮请走普通猜阵通道。
      */
-    public void submitPreGuess(ObjectNode root, UserAccount user, List<String> values) {
+    void submitPreGuess(ObjectNode root, UserAccount user, List<String> values) {
         if (!"BATTLE".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在对局阶段");
         ObjectNode match = activeMatchFor(root, user.getTeamId());
@@ -1382,7 +1287,7 @@ public class ParallelTournamentService {
     /**
      * 撤回猜阵：先撤当前轮未揭晓的 live 猜阵（撤回后可重投），再撤本人后续轮次的提前猜阵。
      */
-    public void retractGuess(ObjectNode root, UserAccount user) {
+    void retractGuess(ObjectNode root, UserAccount user) {
         if (!"BATTLE".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在对局阶段");
         ObjectNode match = activeMatchFor(root, user.getTeamId());
@@ -1854,6 +1759,9 @@ public class ParallelTournamentService {
         }
     }
 
+    /**
+     * 固化单日结果：保留下一日建赛和总冠军判定所需的名单、业绩与胜负摘要。
+     */
     private void saveDayResult(ObjectNode root) {
         int day = root.path("day").asInt(1);
         ObjectNode results = root.withObject("/dayResults");
@@ -1865,6 +1773,8 @@ public class ParallelTournamentService {
         result.put("finishedAt", System.currentTimeMillis());
         ObjectNode stats = mapper.createObjectNode();
         ArrayNode teams = result.putArray("teams");
+
+        // 先创建全部队伍的零值统计，再用已完成场次累加，没有晋级的队伍也会出现在结果中。
         for (JsonNode source : root.path("teams")) {
             ObjectNode team = teams.addObject();
             String id = source.path("id").asText();
@@ -1890,6 +1800,8 @@ public class ParallelTournamentService {
             stats.set(id, team);
         }
         ArrayNode matchResults = result.putArray("matches");
+
+        // 只统计已完成场次，避免强制重赛中的临时状态污染日结果。
         root.path("matches").forEach(matchNode -> {
             if (!"done".equals(matchNode.path("status").asText())) return;
             ObjectNode match = matchResults.addObject();
@@ -1928,6 +1840,8 @@ public class ParallelTournamentService {
     static ObjectNode decideOverall(ObjectNode dayResults) {
         JsonNodeFactory nodes = JsonNodeFactory.instance;
         Map<String, ObjectNode> totals = new LinkedHashMap<>();
+
+        // 排名展示覆盖全部队伍，但总冠军候选只能来自两天的单日冠军。
         for (String dayKey : List.of("day1", "day2")) {
             for (JsonNode source : dayResults.path(dayKey).path("teams")) {
                 String id = source.path("id").asText();
@@ -2231,14 +2145,6 @@ public class ParallelTournamentService {
 
     /* ---------- 基础工具 ---------- */
 
-    private JsonNode sandboxPlayer(ObjectNode root, String username) {
-        if (username == null) return null;
-        for (JsonNode player : root.path("sandboxPlayers"))
-            if (username.equals(player.path("username").asText())) return player;
-        JsonNode legacy = root.path("sandboxSolo");
-        return username.equals(legacy.path("username").asText(null)) ? legacy : null;
-    }
-
     private String teamForSide(ObjectNode match, String side) {
         return match.path("A".equals(side) ? "a" : "b").asText();
     }
@@ -2302,7 +2208,7 @@ public class ParallelTournamentService {
         return matches.path(id).path("winner").asText();
     }
 
-    public record SandboxAssignment(UserAccount player, UserAccount replaced, String teamId, String identity) {
+    record SandboxAssignment(UserAccount player, UserAccount replaced, String teamId, String identity) {
     }
 
     public record TestStep(int advancedMatches, String champion, String phase) {
