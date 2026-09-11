@@ -40,10 +40,10 @@ public class RequestAuditWriter {
     private volatile boolean running = true;
 
     public RequestAuditWriter(RequestAuditRepository repository,
-                              @Value("${app.audit.queue-capacity:50000}") int queueCapacity,
+                              @Value("${app.audit.queue-capacity:1000}") int queueCapacity,
                               @Value("${app.audit.slow-threshold-ms:500}") long slowThresholdMs) {
         this.repository = repository;
-        this.queue = new ArrayBlockingQueue<>(Math.max(1000, queueCapacity));
+        this.queue = new ArrayBlockingQueue<>(Math.max(100, queueCapacity));
         this.slowThresholdMs = slowThresholdMs;
     }
 
@@ -134,14 +134,10 @@ public class RequestAuditWriter {
                 Thread.currentThread().interrupt();
                 break;
             } catch (RuntimeException e) {
-                batch.forEach(queue::offer);
+                // 审计日志不重要，写失败直接丢弃本批，不回填队列也不重试
+                log.warn("request-audit persist failed, dropping batch of {}: {}", batch.size(), e.toString());
+                dropped.addAndGet(batch.size());
                 batch.clear();
-                try {
-                    TimeUnit.SECONDS.sleep(1);
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
             }
         }
     }
