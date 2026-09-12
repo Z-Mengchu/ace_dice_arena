@@ -912,6 +912,22 @@ public class ParallelTournamentService {
         }
     }
 
+    /** 掷骰席位的 HTTP 视图：字段按固定顺序组装，供 /api/roll-assignment 直接作为响应体返回。 */
+    public Map<String, Object> rollAssignmentView(String username) {
+        RollAssignmentView view = rollAssignment(username);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("eligible", view.eligible());
+        result.put("stage", view.stage());
+        result.put("rollGoAt", view.rollGoAt());
+        result.put("stageDeadlineAt", view.stageDeadlineAt());
+        result.put("alreadyRolled", view.alreadyRolled());
+        result.put("teamId", view.teamId());
+        result.put("squadIndex", view.squadIndex());
+        result.put("rollOpenAt", view.rollOpenAt());
+        result.put("rollDeadlineAt", view.rollDeadlineAt());
+        return result;
+    }
+
     /* ---------- 玩家视角脱敏 ---------- */
 
     /**

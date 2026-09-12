@@ -14,6 +14,7 @@ import java.util.HexFormat;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Semaphore;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
 
@@ -23,13 +24,17 @@ public class AccountService {
     private final String initialAdminPassword;
     private final SecureRandom random = new SecureRandom();
     private final Optional<ExternalDirectoryService> externalDirectory;
+    /** 登录并发限流（信号量，满额快速失败由控制器映射为 429）。 */
+    private final Semaphore loginSlots;
 
     public AccountService(UserAccountRepository repository,
                           @Value("${app.admin-password:admin123}") String initialAdminPassword,
-                          Optional<ExternalDirectoryService> externalDirectory) {
+                          Optional<ExternalDirectoryService> externalDirectory,
+                          @Value("${app.login.max-concurrent:48}") int maxConcurrentLogins) {
         this.repository = repository;
         this.initialAdminPassword = initialAdminPassword;
         this.externalDirectory = externalDirectory;
+        this.loginSlots = new Semaphore(Math.max(1, maxConcurrentLogins), true);
     }
 
     @PostConstruct
@@ -52,6 +57,19 @@ public class AccountService {
         random.nextBytes(saltBytes);
         String salt = HexFormat.of().formatHex(saltBytes);
         return repository.save(new UserAccount(username, displayName, department, role, hash(password, salt), salt));
+    }
+
+    /**
+     * 尝试在并发额度内完成登录；额度已满立即返回 empty，
+     * 凭证错误抛 IllegalArgumentException，由控制器分别映射为 429 / 400。
+     */
+    public Optional<UserAccount> tryLogin(String username, String password) {
+        if (!loginSlots.tryAcquire()) return Optional.empty();
+        try {
+            return Optional.of(login(username, password));
+        } finally {
+            loginSlots.release();
+        }
     }
 
     @Transactional

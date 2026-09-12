@@ -39,7 +39,7 @@ class ExternalDirectoryPasswordTest {
                 "external-directory", "00");
         account.assignTeam("t1");
         when(repository.findAll()).thenReturn(List.of(account));
-        var service = new AccountService(repository, "admin123", Optional.empty());
+        var service = new AccountService(repository, "admin123", Optional.empty(), 48);
 
         service.deactivateMissingExternalUsers(Set.of());
 
@@ -56,7 +56,7 @@ class ExternalDirectoryPasswordTest {
         account.deactivateExternalDirectoryAccount();
         when(repository.findByUsername("restored_user")).thenReturn(Optional.of(account));
         when(repository.save(account)).thenReturn(account);
-        var service = new AccountService(repository, "admin123", Optional.empty());
+        var service = new AccountService(repository, "admin123", Optional.empty(), 48);
 
         service.syncExternalUser(new ExternalDirectoryService.DirectoryUser(
                 1L, "restored_user", "恢复用户", "新部门"));

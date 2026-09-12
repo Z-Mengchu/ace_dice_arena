@@ -50,7 +50,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *
  * 内存一致性约定：
  * - 先提交数据库事务，再更新内存；事务失败时内存结果、计数、revision 一律不变；
- * - 提交成功后内存更新异常不撤销已提交事实，context 置为 DIRTY，下一次读取/协调时从数据库重建；
+ * - 提交成功后内存更新异常不撤销已提交事实，context 置为 DIRTY，下一次读取/协调时在写锁内单飞重建；
  * - context 只保存从 JSON 提取的标量与不可变集合，不持有可变 JsonNode 引用。
  */
 @Service
@@ -209,8 +209,8 @@ public class BlindBoxRoundService {
     /* ---------- 开盒写穿 ---------- */
 
     /**
-     * 开盒完整流程：纯参数校验 → 阶段读锁 → 玩家条带锁 → 事务内校验/幂等/插入，
-     * 事务提交后才更新内存与 revision，释放读锁后再投递快速推进信号。
+     * 开盒完整流程：纯参数校验 → DIRTY 时先经写锁单飞重建 → 阶段读锁 → 玩家条带锁 →
+     * 事务内校验/幂等/插入，事务提交后才更新内存与 revision，释放读锁后再投递快速推进信号。
      */
     public BlindBoxResult open(String username, Integer boxIndex) {
         if (boxIndex != null && (boxIndex < 0 || boxIndex >= BLIND_BOX_COUNT))
@@ -218,44 +218,59 @@ public class BlindBoxRoundService {
         ensureInitialized();
         ReentrantLock stripe = stripeFor(username);
         boolean signalAdvance = false;
-        BlindBoxResult result;
-        stageLock.readLock().lock();
-        try {
-            RoundContext ctx = currentOpenContext();
+        BlindBoxResult result = null;
+        boolean opened = false;
+        int rebuildAttempts = 0;
+        while (!opened) {
+            RoundContext ctx = context;
             if (ctx == null) throw new IllegalStateException("当前不在开盲盒阶段");
-            if (ctx.effectiveDeadline() <= System.currentTimeMillis())
-                throw new IllegalStateException("开盲盒时间已经结束");
-            stripe.lock();
-            try {
-                OpenOutcome outcome = transactions.execute(status -> doOpen(ctx, username, boxIndex));
-                if (outcome == null) throw new IllegalStateException("比赛状态暂不可用");
-                // TransactionTemplate 返回即已提交：此后才允许改内存
-                if (outcome.inserted()) {
-                    try {
-                        ctx.recordResult(outcome.playerId(), outcome.result().value());
-                    } catch (RuntimeException e) {
-                        // 已提交事实不撤销；标记 DIRTY 由后续读取/协调重建
-                        log.error("盲盒结果已提交但内存更新失败，标记等待重建", e);
-                        ctx.state = State.DIRTY;
-                    }
-                    // 首开提交成功：无版本合并广播，触发前端强制条件回源
-                    events.blindBoxChanged();
-                    int boxValue = outcome.result().value();
-                    if (boxValue != 0)
-                        events.feed(outcome.teamId(), boxValue > 0 ? "box-buff" : "box-debuff",
-                                outcome.playerName(),
-                                boxValue > 0 ? "盲盒开出正向 buff · 欧气直接砸脸上！" : "盲盒踩中负面 debuff · 非酋 buff 已签收");
-                    if (ctx.allEligibleOpened() && ctx.advanceSignal.compareAndSet(false, true))
-                        signalAdvance = true;
-                } else if (outcome.repairValue() != null) {
-                    ctx.repairResult(outcome.playerId(), outcome.repairValue());
-                }
-                result = outcome.result();
-            } finally {
-                stripe.unlock();
+            if (ctx.state == State.DIRTY) {
+                if (++rebuildAttempts > 2) throw new IllegalStateException("比赛状态暂不可用");
+                ctx = rebuildDirtyContext(ctx);
+                if (ctx == null) throw new IllegalStateException("当前不在开盲盒阶段");
+            } else if (ctx.state != State.OPEN) {
+                throw new IllegalStateException("当前不在开盲盒阶段");
             }
-        } finally {
-            stageLock.readLock().unlock();
+            RoundContext openCtx = ctx;
+            stageLock.readLock().lock();
+            try {
+                // 取读锁期间 context 可能被替换/关闭/再次置 DIRTY：有变化则放锁后走下一轮重新判定
+                if (context != openCtx || openCtx.state != State.OPEN) continue;
+                if (openCtx.effectiveDeadline() <= System.currentTimeMillis())
+                    throw new IllegalStateException("开盲盒时间已经结束");
+                stripe.lock();
+                try {
+                    OpenOutcome outcome = transactions.execute(status -> doOpen(openCtx, username, boxIndex));
+                    if (outcome == null) throw new IllegalStateException("比赛状态暂不可用");
+                    // TransactionTemplate 返回即已提交：此后才允许改内存
+                    if (outcome.inserted()) {
+                        try {
+                            openCtx.recordResult(outcome.playerId(), outcome.result().value());
+                        } catch (RuntimeException e) {
+                            // 已提交事实不撤销；标记 DIRTY 由后续读取/协调重建
+                            log.error("盲盒结果已提交但内存更新失败，标记等待重建", e);
+                            openCtx.state = State.DIRTY;
+                        }
+                        // 首开提交成功：无版本合并广播，触发前端强制条件回源
+                        events.blindBoxChanged();
+                        int boxValue = outcome.result().value();
+                        if (boxValue != 0)
+                            events.feed(outcome.teamId(), boxValue > 0 ? "box-buff" : "box-debuff",
+                                    outcome.playerName(),
+                                    boxValue > 0 ? "盲盒开出正向 buff · 欧气直接砸脸上！" : "盲盒踩中负面 debuff · 非酋 buff 已签收");
+                        if (openCtx.allEligibleOpened() && openCtx.advanceSignal.compareAndSet(false, true))
+                            signalAdvance = true;
+                    } else if (outcome.repairValue() != null) {
+                        openCtx.repairResult(outcome.playerId(), outcome.repairValue());
+                    }
+                    result = outcome.result();
+                    opened = true;
+                } finally {
+                    stripe.unlock();
+                }
+            } finally {
+                stageLock.readLock().unlock();
+            }
         }
         // 推进投递必须在释放阶段读锁之后，避免读锁线程同步申请写锁
         if (signalAdvance) submitAdvance(System.currentTimeMillis());
@@ -504,28 +519,36 @@ public class BlindBoxRoundService {
 
     /* ---------- 内部实现 ---------- */
 
-    /** DIRTY context 在读取路径上从数据库重建；阶段已离开盲盒或运行代失配时直接关闭并拒绝。 */
-    private RoundContext currentOpenContext() {
-        RoundContext ctx = context;
-        if (ctx == null) return null;
-        if (ctx.state == State.OPEN) return ctx;
-        if (ctx.state != State.DIRTY) return null;
-        RoundContext rebuilt;
+    /**
+     * DIRTY context 的单飞重建：写锁内复核目标仍是同一个待重建 context 才访问数据库，
+     * 并发调用者在写锁上排队后直接看到重建结果（或已关闭/替换后的状态），不重复查库、不竞态发布。
+     * 阶段已离开盲盒或运行代失配时关闭旧 context 并返回 null。
+     */
+    private RoundContext rebuildDirtyContext(RoundContext dirty) {
+        stageLock.writeLock().lock();
         try {
-            rebuilt = restoreFromDatabase();
-        } catch (RuntimeException e) {
-            log.error("盲盒运行态重建失败", e);
-            throw new IllegalStateException("比赛状态暂不可用");
+            RoundContext ctx = context;
+            if (ctx != dirty || ctx.state != State.DIRTY)
+                return ctx != null && ctx.state == State.OPEN ? ctx : null;
+            RoundContext rebuilt;
+            try {
+                rebuilt = restoreFromDatabase();
+            } catch (RuntimeException e) {
+                log.error("盲盒运行态重建失败", e);
+                throw new IllegalStateException("比赛状态暂不可用");
+            }
+            RoundKey key = ctx.definition.key();
+            if (rebuilt == null || rebuilt.definition.key().gameDay() != key.gameDay()
+                    || rebuilt.definition.key().bracketRound() != key.bracketRound()
+                    || rebuilt.definition.key().deadlineAt() != ctx.effectiveDeadline()) {
+                ctx.state = State.CLOSED;
+                return null;
+            }
+            context = rebuilt;
+            return rebuilt;
+        } finally {
+            stageLock.writeLock().unlock();
         }
-        RoundKey key = ctx.definition.key();
-        if (rebuilt == null || rebuilt.definition.key().gameDay() != key.gameDay()
-                || rebuilt.definition.key().bracketRound() != key.bracketRound()
-                || rebuilt.definition.key().deadlineAt() != ctx.effectiveDeadline()) {
-            ctx.state = State.CLOSED;
-            return null;
-        }
-        context = rebuilt;
-        return rebuilt;
     }
 
     /** 统一关闭事务：锁定 game_state、复核运行代、合并本轮 eligible 结果并推进战术阶段。 */

@@ -26,11 +26,12 @@ class GameDataControllerCacheTest {
     private GameDataController newController(GameStateRepository states, UserAccountRepository users,
                                           ParallelTournamentService tournament,
                                           com.acedicearena.service.BlindBoxRoundService blindBoxRounds) {
-        return new GameDataController(states, mock(BattleReportRepository.class),
+        return new GameDataController(new com.acedicearena.service.GameDataService(states,
+                mock(BattleReportRepository.class),
                 new ObjectMapper(), mock(LobbyEventService.class), users, tournament,
                 mock(MatchReportRepository.class),
                 new com.acedicearena.service.GameStateSnapshotStore(states, new ObjectMapper(), blindBoxRounds),
-                1000);
+                1000));
     }
 
     @Test

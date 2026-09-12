@@ -299,6 +299,18 @@ public class LobbyService {
         return users.findByUsername(username).orElseThrow();
     }
 
+    /**
+     * 发送队伍聊天：观战用户（无队伍）抛 IllegalStateException，
+     * 内容去空白后为空或超过 300 字抛 IllegalArgumentException。
+     */
+    public void chat(String username, String content) {
+        UserAccount u = requireUser(username);
+        if (u.getTeamId() == null) throw new IllegalStateException("观战用户不能发送队伍消息");
+        String text = content == null ? "" : content.trim();
+        if (text.isEmpty() || text.length() > 300) throw new IllegalArgumentException("消息长度需为 1-300 字");
+        events.chat(u.getTeamId(), u.getDisplayName(), text);
+    }
+
     private GameControl control() {
         return controls.findById(1L).orElseGet(() -> controls.save(new GameControl(1L)));
     }

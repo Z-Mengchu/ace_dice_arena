@@ -3,16 +3,15 @@ package com.acedicearena.web;
 import com.acedicearena.domain.UserAccount;
 import com.acedicearena.service.AccountService;
 import jakarta.servlet.http.HttpSession;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 
+/** 认证接口：登录/注册/当前用户/登出。 */
 @RestController
 @RequestMapping("/api/auth")
 public class AuthController {
@@ -21,38 +20,36 @@ public class AuthController {
     /** 会话里保存的账号主键；/api/auth/me 需要向玩家端暴露 id 以在整局状态里定位"自己"。 */
     public static final String SESSION_USER_ID = "userId";
     private final AccountService accountService;
-    private final Semaphore loginSlots;
 
-    public AuthController(AccountService accountService,
-                          @Value("${app.login.max-concurrent:48}") int maxConcurrentLogins) {
+    public AuthController(AccountService accountService) {
         this.accountService = accountService;
-        this.loginSlots = new Semaphore(Math.max(1, maxConcurrentLogins), true);
     }
 
+    /** 前端登录页配置：是否开放注册。 */
     @GetMapping("/config")
     public Map<String, Boolean> config() {
         return Map.of("registrationEnabled", accountService.isRegistrationEnabled());
     }
 
+    /** 登录：并发额度满返回 429 排队提示，凭证错误返回 400。 */
     @PostMapping("/login")
     public ResponseEntity<?> login(@RequestBody Credentials body, HttpSession session) {
-        if (!loginSlots.tryAcquire()) {
-            int retryAfterMs = ThreadLocalRandom.current().nextInt(500, 1301);
-            return ResponseEntity.status(429)
-                    .header(HttpHeaders.RETRY_AFTER, "1")
-                    .body(Map.of("error", "当前登录人数较多，正在排队，请稍候", "retryAfterMs", retryAfterMs));
-        }
         try {
-            UserAccount user = accountService.login(trim(body.username()), body.password());
+            UserAccount user = accountService.tryLogin(trim(body.username()), body.password()).orElse(null);
+            if (user == null) {
+                int retryAfterMs = ThreadLocalRandom.current().nextInt(500, 1301);
+                return ResponseEntity.status(429)
+                        .header(HttpHeaders.RETRY_AFTER, "1")
+                        .body(Map.of("error", "当前登录人数较多，正在排队，请稍候", "retryAfterMs", retryAfterMs));
+            }
             setSession(session, user);
             return ResponseEntity.ok(userView(user));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
-        } finally {
-            loginSlots.release();
         }
     }
 
+    /** 注册并直接登录。 */
     @PostMapping("/register")
     public ResponseEntity<?> register(@RequestBody Registration body, HttpSession session) {
         try {
@@ -64,6 +61,7 @@ public class AuthController {
         }
     }
 
+    /** 当前登录用户信息；未登录返回 401。 */
     @GetMapping("/me")
     public ResponseEntity<?> me(HttpSession session) {
         Object username = session.getAttribute(SESSION_USER);
@@ -77,6 +75,7 @@ public class AuthController {
         return ResponseEntity.ok(result);
     }
 
+    /** 登出并销毁会话。 */
     @PostMapping("/logout")
     public Map<String, Boolean> logout(HttpSession session) {
         session.invalidate();
