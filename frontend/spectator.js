@@ -155,9 +155,9 @@
 
   /* ---------- 顶层渲染 ---------- */
 
-  function renderStage(state, stageTitle) {
+  function renderStage(state) {
     var teams = state.teams || [];
-    var label = STAGE_TITLES[state.stage] || stageTitle;
+    var label = STAGE_TITLES[state.stage] || ['阶段进行中', ''];
     document.getElementById('tb-status').textContent = label[0];
     var body;
     if (state.stage === 'CAPTAIN_VOTE') body = teams.map(function (t, i) { return teamCard(t, i, voteBody(t)); }).join('');
@@ -166,20 +166,74 @@
     else if (state.stage === 'BLIND_BOX') body = teams.map(function (t, i) { return teamCard(t, i, blindBoxBody(t)); }).join('');
     else if (state.stage === 'TACTICS') body = teams.map(function (t, i) { return teamCard(t, i, tacticsBody(t)); }).join('');
     else body = '';
-    document.getElementById('spectator-root').innerHTML = wallHead(label[0], label[1], STAGE_TITLES[state.stage] ? '八支队伍按同一时间轴并行推进，超时由系统自动兜底。' : '') + (body ? '<section class="feed-grid">' + body + '</section>' : '');
+    document.getElementById('spectator-root').innerHTML = wallHead(label[0], label[1] || '阶段数据汇总中', STAGE_TITLES[state.stage] ? '八支队伍按同一时间轴并行推进，超时由系统自动兜底。' : '当前阶段暂无进度明细，请稍后查看。') + (body ? '<section class="feed-grid">' + body + '</section>' : '<section class="spectator-empty"><b>暂无进度明细</b><p>当前阶段没有可展示的队伍进度，稍后自动刷新。</p></section>');
+  }
+
+  function championCard(state) {
+    var results = state.dayResults || {};
+    var daily = results['day' + state.day] || {};
+    var championId = daily.champion || state.champion;
+    var championTeam = (daily.teams || []).find(function (t) { return t.id === championId; }) || team(state, championId);
+    return '<section class="hub-card champion-announcement is-daily">'
+      + '<div class="champion-summary"><div class="champion-crown">🏆</div><div>'
+      + '<p class="hub-eyebrow">DAY ' + Number(daily.day || state.day || 1) + ' CHAMPION</p>'
+      + '<h2>今日冠军 · ' + esc(championTeam.name || championId) + '</h2>'
+      + '<p>今日总决赛落幕！比赛战绩已保存。</p>'
+      + '</div></div>'
+      + (daily.teams ? TournamentUI.resultRosterHtml([{ day: Number(daily.day || state.day || 1), team: championTeam }]) : '')
+      + '</section>';
+  }
+
+  function grandChampionCard(state, overall) {
+    var decidedText = { BOTH_DAYS: '两日双冠', MATCH_WINS: '累计胜场决胜', GMV: 'GMV 决胜', OVERTIME: '加赛封神夺冠 🏆' }[overall.decidedBy] || '';
+    var winner = (overall.standings || []).find(function (t) { return t.id === overall.champion; }) || {};
+    var results = state.dayResults || {};
+    var entries = [1, 2].map(function (day) {
+      var result = results['day' + day];
+      var championTeam = result && (result.teams || []).find(function (t) { return t.id === overall.champion; });
+      return championTeam ? { day: day, team: championTeam } : null;
+    }).filter(Boolean);
+    return '<section class="hub-card champion-announcement is-overall">'
+      + '<div class="champion-summary"><div class="champion-crown">🏆</div><div>'
+      + '<p class="hub-eyebrow">TWO-DAY GRAND CHAMPION</p>'
+      + '<h2>两天总冠军 · ' + esc(winner.name || overall.champion) + '</h2>'
+      + '<p>两天累计 ' + Number(winner.totalMatchWins || 0) + ' 场胜利' + (decidedText ? ' · ' + decidedText : '') + '</p>'
+      + '</div></div>'
+      + TournamentUI.resultRosterHtml(entries)
+      + '</section>';
+  }
+
+  function overtimePendingCard(overall) {
+    var names = (overall.candidates || []).map(function (t) { return esc(t.name); }).join(' vs ');
+    return '<section class="hub-card champion-announcement is-overall">'
+      + '<div class="champion-summary"><div class="champion-crown">🏆</div><div>'
+      + '<p class="hub-eyebrow">TWO-DAY GRAND CHAMPION</p>'
+      + '<h2>两天总冠军仍需加赛 · ' + names + '</h2>'
+      + '<p>两天胜场 &amp; GMV 全部持平，等待管理员开启总决赛加赛！</p>'
+      + '</div></div></section>';
   }
 
   function render(state) {
     var root = document.getElementById('spectator-root');
+    if (state && state.champion) {
+      var overall = state.overallResult;
+      if (overall && overall.champion) {
+        document.getElementById('tb-status').textContent = '两天总冠军已产生';
+        root.innerHTML = grandChampionCard(state, overall);
+        return;
+      }
+      if (overall && overall.status === 'OVERTIME_PENDING') {
+        document.getElementById('tb-status').textContent = '两天总冠军待加赛';
+        root.innerHTML = overtimePendingCard(overall);
+        return;
+      }
+      document.getElementById('tb-status').textContent = '第 ' + state.day + ' 天冠军已产生';
+      root.innerHTML = championCard(state);
+      return;
+    }
     if (!state || state.mode !== 'parallel') {
       root.innerHTML = '<section class="spectator-empty"><b>等待管理员开始游戏</b><p>开赛后依次进入队长投票、分队、掷骰、盲盒、战术与六局对局。</p></section>';
       document.getElementById('tb-status').textContent = '等待开赛';
-      return;
-    }
-    if (state.champion) {
-      document.getElementById('tb-status').textContent = '第 ' + state.day + ' 天冠军已产生';
-      var champion = team(state, state.champion);
-      root.innerHTML = wallHead('CHAMPION · DAY ' + state.day, '今日冠军 · ' + champion.name, '总决赛已结束，比赛结果已同步保存。');
       return;
     }
     if (state.stage === 'BATTLE') {
@@ -189,14 +243,19 @@
         + '<section class="feed-grid">' + matches.map(function (m) { return matchCard(state, m); }).join('') + '</section>';
       return;
     }
-    renderStage(state, null);
+    renderStage(state);
   }
 
   function load() {
     fetch('/api/game-state').then(function (r) {
-      if (r.status === 401) { location.replace('/login'); throw new Error(); }
+      if (r.status === 401) { location.replace('/login'); throw new Error('unauthorized'); }
       return r.status === 204 ? null : r.json();
-    }).then(function (d) { lastState = d && d.state; render(lastState); refreshExpanded(lastState); }).catch(function () {});
+    }).then(function (d) { lastState = d && d.state; render(lastState); refreshExpanded(lastState); }).catch(function (err) {
+      if (err && err.message === 'unauthorized') return;
+      if (err) console.error('[spectator] 拉取赛况失败：', err);
+      var root = document.getElementById('spectator-root');
+      root.innerHTML = '<section class="spectator-empty"><b>赛况加载失败</b><p>网络连接异常，将自动重试刷新。</p></section>';
+    });
   }
 
   /* 逐局战况按需展开：事件委托，展开状态跨刷新保留 */
@@ -253,10 +312,17 @@
       return t;
     } catch (e) { return ''; }
   }
+  function setNetBadge(online) {
+    var badge = document.getElementById('net-badge');
+    if (!badge) return;
+    badge.className = 'net-badge ' + (online ? 'online' : 'offline');
+    badge.textContent = online ? '● 实时同步' : '● 连接中断，重连中';
+  }
   function connectEvents() {
     var source = new EventSource('/api/lobby/events?tab=' + sseTabId());
     // （重）连上后补拉一次：断线期间错过的推进靠这次回源追平
-    source.onopen = function () { queueLoad(); };
+    source.onopen = function () { setNetBadge(true); queueLoad(); };
+    source.onerror = function () { setNetBadge(false); };
     source.onmessage = function (e) {
       var m;
       try { m = JSON.parse(e.data); } catch (err) { return; }
