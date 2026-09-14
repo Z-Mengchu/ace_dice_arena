@@ -406,8 +406,9 @@ class DeadlockTimeoutTest {
     /* ---------- 构造 ---------- */
 
     private ParallelTournamentService service() {
+        var states = mock(com.acedicearena.repository.GameStateRepository.class);
         return new ParallelTournamentService(
-                mock(com.acedicearena.repository.GameStateRepository.class),
+                states,
                 mock(com.acedicearena.repository.UserAccountRepository.class),
                 mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 mock(com.acedicearena.repository.GameControlRepository.class), mapper,
@@ -416,6 +417,7 @@ class DeadlockTimeoutTest {
                 mock(com.acedicearena.repository.MatchReportRepository.class),
                 mock(com.acedicearena.repository.PlayerBlindBoxRepository.class),
                 mock(BlindBoxRoundService.class),
+                new GameStateSnapshotStore(states, mapper, mock(BlindBoxRoundService.class)),
                 mock(org.springframework.transaction.PlatformTransactionManager.class));
     }
 

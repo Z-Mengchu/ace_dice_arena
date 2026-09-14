@@ -5,6 +5,7 @@ import com.acedicearena.domain.UserAccount;
 import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.UserAccountRepository;
 import com.acedicearena.service.BlindBoxRoundService;
+import com.acedicearena.service.GameStateSnapshotStore;
 import com.acedicearena.service.LobbyEventService;
 import com.acedicearena.service.PlayerActionService;
 import com.acedicearena.service.ParallelTournamentService;
@@ -118,6 +119,7 @@ class PlayerActionServiceTest {
                 mock(com.acedicearena.repository.MatchReportRepository.class),
                 mock(com.acedicearena.repository.PlayerBlindBoxRepository.class),
                 mock(BlindBoxRoundService.class),
+                new GameStateSnapshotStore(states, mapper, mock(BlindBoxRoundService.class)),
                 mock(PlatformTransactionManager.class));
         UserAccount player = new UserAccount("player", "队员", "技术部", "USER", "hash", "salt");
         player.assignTeam("t1");

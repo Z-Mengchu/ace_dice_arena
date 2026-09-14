@@ -8,6 +8,7 @@ import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.GameControlRepository;
 import com.acedicearena.repository.RequestAuditRepository;
 import com.acedicearena.repository.UserAccountRepository;
+import com.acedicearena.service.GameStateSnapshotStore;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -39,6 +40,7 @@ class ApplicationIntegrationTest {
     @Autowired BattleReportRepository battleReportRepository;
     @Autowired RequestAuditRepository requestAuditRepository;
     @Autowired UserAccountRepository userAccountRepository;
+    @Autowired GameStateSnapshotStore snapshotStore;
 
     @Test
     void groupedPlayerCanSeeCurrentOpponentRosterButNotUnrelatedTeams() throws Exception {
@@ -518,6 +520,8 @@ class ApplicationIntegrationTest {
         if (state == null) state = new GameStateRecord(1L, root.toString(), "test");
         else state.update(root.toString(), "test");
         gameStateRepository.saveAndFlush(state);
+        // 直写仓库绕过了广播链路的 afterCommit 失效，测试线程内手动失效共享快照
+        snapshotStore.invalidateAfterCommit();
     }
 
     private String join(MockHttpSession session) throws Exception {

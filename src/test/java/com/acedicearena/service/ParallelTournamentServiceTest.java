@@ -1046,6 +1046,9 @@ class ParallelTournamentServiceTest {
                                               com.acedicearena.repository.UserAccountRepository users,
                                               LobbyEventService events,
                                               com.acedicearena.repository.PlayerBlindBoxRepository blindBoxes) {
+        // 运行态用真实实例（同一批 mock 仓库 + 桩事务），simulateStep/forceMatch 才能走完盲盒关闭
+        BlindBoxRoundService blindBoxRounds =
+                new BlindBoxRoundService(states, users, blindBoxes, mapper, events, stubTransactions());
         return new ParallelTournamentService(states, users,
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
@@ -1053,8 +1056,8 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.BattleReportRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.MatchReportRepository.class),
                 blindBoxes,
-                // 运行态用真实实例（同一批 mock 仓库 + 桩事务），simulateStep/forceMatch 才能走完盲盒关闭
-                new BlindBoxRoundService(states, users, blindBoxes, mapper, events, stubTransactions()),
+                blindBoxRounds,
+                new GameStateSnapshotStore(states, mapper, blindBoxRounds),
                 stubTransactions());
     }
 

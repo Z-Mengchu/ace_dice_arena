@@ -107,6 +107,7 @@ public class ParallelTournamentService {
     private final MatchReportRepository matchReports;
     private final PlayerBlindBoxRepository blindBoxes;
     private final BlindBoxRoundService blindBoxRounds;
+    private final GameStateSnapshotStore snapshotStore;
     private final TransactionTemplate transactions;
 
     /** ROLL 阶段截止时间 = 最后一队开掷时间 + 单队掷骰窗口。 */
@@ -120,6 +121,7 @@ public class ParallelTournamentService {
                                      @Value("${app.game.result-display-ms:16000}") long resultDisplayMs,
                                      BattleReportRepository reports, MatchReportRepository matchReports,
                                      PlayerBlindBoxRepository blindBoxes, BlindBoxRoundService blindBoxRounds,
+                                     GameStateSnapshotStore snapshotStore,
                                      PlatformTransactionManager transactionManager) {
         this.states = states;
         this.users = users;
@@ -132,6 +134,7 @@ public class ParallelTournamentService {
         this.matchReports = matchReports;
         this.blindBoxes = blindBoxes;
         this.blindBoxRounds = blindBoxRounds;
+        this.snapshotStore = snapshotStore;
         this.transactions = new TransactionTemplate(transactionManager);
     }
 
@@ -875,15 +878,16 @@ public class ParallelTournamentService {
 
     /**
      * 掷骰席位查询：供 /api/roll-assignment 与 join 令牌发放共用；不在 ROLL 或本队不在赛时 eligible=false。
+     * 比赛状态读 GameStateSnapshotStore 共享快照，命中时零查库零解析；快照由写路径 afterCommit 失效。
      */
     @Transactional(readOnly = true)
     public RollAssignmentView rollAssignment(String username) {
         UserAccount user = users.findByUsername(username).orElse(null);
         String teamId = user == null ? null : user.getTeamId();
-        GameStateRecord record = states.findById(1L).orElse(null);
-        if (record == null) return new RollAssignmentView(false, null, null, null, false, teamId, null, null, null);
+        GameStateSnapshotStore.Snapshot snapshot = snapshotStore.current();
+        if (!snapshot.present()) return new RollAssignmentView(false, null, null, null, false, teamId, null, null, null);
         try {
-            ObjectNode root = (ObjectNode) mapper.readTree(record.getContent());
+            ObjectNode root = (ObjectNode) snapshot.state();
             String stage = root.path("stage").asText(null);
             Long rollGoAt = root.hasNonNull("rollGoAt") ? root.path("rollGoAt").asLong() : null;
             Long deadline = root.hasNonNull("stageDeadlineAt") ? root.path("stageDeadlineAt").asLong() : null;

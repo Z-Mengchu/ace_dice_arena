@@ -129,6 +129,7 @@ class SandboxAssistTest {
                 mock(com.acedicearena.repository.MatchReportRepository.class),
                 blindBoxes,
                 mock(BlindBoxRoundService.class),
+                new GameStateSnapshotStore(states, mapper, mock(BlindBoxRoundService.class)),
                 txManager);
     }
 
