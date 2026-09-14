@@ -1,5 +1,5 @@
 /**
- * 赛况解说（commentary）—— 大厅 / 玩家页共用的弹幕气泡（右下角，聊天气球上方）
+ * 赛况解说（commentary）—— 大厅页专用的弹幕气泡（右下角，聊天气球上方）
  * 纯原生 JS，挂 window.Commentary 全局（与 stage-panel.js 同一模式）。
  * Commentary.show(text, tone)：个人即时点评，tone ∈ 'good' | 'bad'。
  * Commentary.event({ kind, name, title, text })：场景事件气泡，kind 决定专属样式与图标：

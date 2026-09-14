@@ -6,8 +6,7 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){retur
 /* ---------- 赛况解说：指纹存 sessionStorage，轮询/刷新重渲染同一状态不重复播；异常静默跳过 ---------- */
 var CMT_KEY='dice-arena-commentary-v1',cmtSeen={};
 try{cmtSeen=JSON.parse(sessionStorage.getItem(CMT_KEY))||{};}catch(e){cmtSeen={};}
-function cmtOnce(fp,text,tone){try{if(!fp||cmtSeen[fp])return;if(!window.Commentary||!window.Commentary.show)return;cmtSeen[fp]=1;try{sessionStorage.setItem(CMT_KEY,JSON.stringify(cmtSeen));}catch(e){}window.Commentary.show(text,tone);}catch(e){}}
-/* 本人猜阵提交留痕：与 player.js 共用同一份 sessionStorage，跨页揭晓时据此判断是否播弹幕 */
+/* 本人猜阵提交留痕：与 player.js 共用同一份 sessionStorage，跨页揭晓时据此判断播报文案用第一人称还是中性口径 */
 var GUESS_LOG_KEY='dice-arena-guess-submitted-v1',guessSubmittedLog={};
 try{guessSubmittedLog=JSON.parse(sessionStorage.getItem(GUESS_LOG_KEY))||{};}catch(e){guessSubmittedLog={};}
 function markGuessSubmitted(key){try{if(!key)return;guessSubmittedLog[key]=1;sessionStorage.setItem(GUESS_LOG_KEY,JSON.stringify(guessSubmittedLog));}catch(e){}}

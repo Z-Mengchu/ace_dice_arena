@@ -137,11 +137,9 @@ import { icon } from './icons.js';
   var rerollQueue = [];
   var rerollShowing = false;
 
-  /* ---------- 赛况解说：指纹存 sessionStorage，轮询/刷新重渲染同一状态不重复播 ---------- */
+  /* ---------- 本人猜阵提交留痕：与 lobby.js 共用同一份 sessionStorage，跨页揭晓时大厅据此选用第一人称点评文案 ---------- */
 
-  var CMT_KEY = 'dice-arena-commentary-v1';
   var GUESS_LOG_KEY = 'dice-arena-guess-submitted-v1';
-  var cmtSeen = loadJsonStore(CMT_KEY);
   var guessSubmittedLog = loadJsonStore(GUESS_LOG_KEY);   // 本人猜阵提交标记（matchId:round），揭晓时 guessStatus 已清空，需本地留痕
 
   function loadJsonStore(key) {
@@ -149,57 +147,6 @@ import { icon } from './icons.js';
   }
   function saveJsonStore(key, obj) {
     try { sessionStorage.setItem(key, JSON.stringify(obj)); } catch (e) { }
-  }
-  /** 同一指纹只播一次；Commentary 缺失或数据异常时静默跳过，绝不影响主流程 */
-  function cmtOnce(fp, text, tone) {
-    try {
-      if (!fp || cmtSeen[fp]) return;
-      if (!window.Commentary || !window.Commentary.show) return;
-      cmtSeen[fp] = 1;
-      saveJsonStore(CMT_KEY, cmtSeen);
-      window.Commentary.show(text, tone);
-    } catch (e) { }
-  }
-
-  /** 本轮唯一键：阶段截止时间每轮唯一，用它做点评防重指纹（阶段名跨轮/跨天会重复，match 在 ROLL/BLIND_BOX 阶段常未生成） */
-  function roundKey() {
-    return String((assignment && (assignment.stageDeadlineAt || assignment.rollDeadlineAt || assignment.stage)) || '');
-  }
-
-  /** 掷骰结果点评：首次渲染 rolled 结果卡时按本人本轮点数播一次（含系统代掷） */
-  function commentRoll(mePlayer) {
-    try {
-      var dice = mePlayer && mePlayer.diceFinal != null ? Number(mePlayer.diceFinal)
-        : (mePlayer && mePlayer.dice != null ? Number(mePlayer.dice)
-        : (ui.die != null ? Number(ui.die) : null));
-      if (dice == null || !isFinite(dice)) return;
-      var fp = 'roll:' + roundKey() + ':' + dice;
-      if (dice >= 4) cmtOnce(fp, '这波手气在线，基础分直接拉满！', 'good');
-      else cmtOnce(fp, '开局底子一般，后面靠盲盒搏一搏翻盘！', 'bad');
-    } catch (e) { }
-  }
-
-  /** 盲盒结果点评：本人档位首次展示时播一次；档位 0 不播 */
-  function commentBox(boxValue) {
-    try {
-      var box = Number(boxValue);
-      if (!isFinite(box) || box === 0) return;
-      var fp = 'box:' + roundKey() + ':' + box;
-      if (box > 0) cmtOnce(fp, '欧气附体！个人点数蹭蹭上涨～', 'good');
-      else cmtOnce(fp, '非酋报到，点数直接被砍一刀！', 'bad');
-    } catch (e) { }
-  }
-
-  /** 猜阵揭晓点评：本人本局提交过猜阵才播，按本方猜中人次分档，同一 match+round 只播一次 */
-  function commentGuess(battle, last) {
-    try {
-      var key = battle.match.id + ':' + battle.round;
-      if (!guessSubmittedLog[key]) return;
-      var hits = Number(last['guessHits' + battle.side]);
-      if (!isFinite(hits)) return;
-      if (hits >= 2) cmtOnce('guess:' + key, '预判拉满！小队战力狠狠加成！', 'good');
-      else cmtOnce('guess:' + key, '预判落空，这次猜阵加成几乎没有！', 'bad');
-    } catch (e) { }
   }
 
   function loadMy() {
@@ -822,7 +769,6 @@ import { icon } from './icons.js';
       }
     } else if (ui.sub === 'rolled') {
       var mePlayer = findMyPlayer();
-      commentRoll(mePlayer);
       var rolledText = mePlayer && mePlayer.autoRolled ? '窗口结束，系统帮你代掷，等开盲盒～' : '已掷完，坐等开盲盒';
       h = '<div class="pl-title" style="font-size:24px">' + icon('dice') + ' 你的点数</div>' +
         '<div class="pl-reveal-dice"><div class="pl-reveal-slot mine">' + dieHTML('big', ui.die) + '</div></div>' +
@@ -941,7 +887,6 @@ import { icon } from './icons.js';
     var box = me.blindBox != null ? Number(me.blindBox) : ui.myBox;
     if (box == null) return '';
     box = Number(box);
-    commentBox(box);
     var tier = (box > 0 ? '+' : '') + box;
     var dice = me.diceFinal != null ? Number(me.diceFinal) : (me.dice != null ? Number(me.dice) : null);
     var finalPoints = dice != null ? dice + box : null;
@@ -967,7 +912,6 @@ import { icon } from './icons.js';
     var h = '<div class="pl-title" style="font-size:24px">' + icon('gift') + ' 来拆盲盒咯！</div>';
     if (openedSelf) {
       var box = me && me.blindBox != null ? Number(me.blindBox) : (ui.myBox != null ? ui.myBox : 0);
-      commentBox(box);
       var tier = (box > 0 ? '+' : '') + box;
       var dice = me.dice != null ? Number(me.dice) : null;
       var diceFinal = me.diceFinal != null ? Number(me.diceFinal) : dice;
@@ -1276,7 +1220,6 @@ import { icon } from './icons.js';
     var nameA = teamNameOf(match.a);
     var nameB = teamNameOf(match.b);
     var winSide = last.winner || null;
-    commentGuess(battle, last);
     function sideHTML(side, name) {
       var crit = last['crit' + side];
       return '<div class="pl-reveal-side' + (winSide === side ? ' win' : '') + '">' +
