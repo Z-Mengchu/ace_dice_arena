@@ -66,11 +66,11 @@ public class LobbyController {
         }
     }
 
-    /** 大厅事件 SSE 订阅。 */
+    /** 大厅事件 SSE 订阅。tab 为前端标签页标识：同一标签页刷新/重连时新连接原子替换旧连接。 */
     @GetMapping("/lobby/events")
-    public SseEmitter events(HttpSession s) {
+    public SseEmitter events(@RequestParam(required = false) String tab, HttpSession s) {
         UserAccount u = lobby.requireUser(user(s));
-        return events.subscribe(u.getUsername(), u.getTeamId(), u.getRole());
+        return events.subscribe(u.getUsername(), u.getTeamId(), u.getRole(), tab);
     }
 
     /** 发送队伍聊天；观战用户 409，长度非法 400（校验在 LobbyService.chat）。 */

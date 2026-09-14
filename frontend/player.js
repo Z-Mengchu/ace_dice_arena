@@ -459,9 +459,18 @@ import { icon } from './icons.js';
     render();
   }
 
+  /* 标签页标识：sessionStorage 使同一标签页 F5 后 tabId 不变，服务端据此用新连接原子替换旧连接 */
+  function sseTabId() {
+    try {
+      var t = sessionStorage.getItem('sse-tab');
+      if (!t) { t = Date.now().toString(36) + Math.random().toString(36).slice(2); sessionStorage.setItem('sse-tab', t); }
+      return t;
+    } catch (e) { return ''; }
+  }
+
   function connectEvents() {
     if (es) return;
-    try { es = new EventSource('/api/lobby/events'); } catch (e) { return; }
+    try { es = new EventSource('/api/lobby/events?tab=' + sseTabId()); } catch (e) { return; }
     // 建连后的 sync 事件只带版本：相同版本不请求，延迟连接/重连时才按需追平。
     es.onopen = function () { setNet('已连接服务器', false); };
     es.onerror = function () { setNet('连接中断，重连中…', true); };

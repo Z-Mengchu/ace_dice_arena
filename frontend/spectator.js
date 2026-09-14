@@ -245,8 +245,16 @@
     if (document.hidden || refreshTimer) return;
     refreshTimer = setTimeout(function () { refreshTimer = null; load(); }, 300);
   }
+  /* 标签页标识：sessionStorage 使同一标签页 F5 后 tabId 不变，服务端据此用新连接原子替换旧连接 */
+  function sseTabId() {
+    try {
+      var t = sessionStorage.getItem('sse-tab');
+      if (!t) { t = Date.now().toString(36) + Math.random().toString(36).slice(2); sessionStorage.setItem('sse-tab', t); }
+      return t;
+    } catch (e) { return ''; }
+  }
   function connectEvents() {
-    var source = new EventSource('/api/lobby/events');
+    var source = new EventSource('/api/lobby/events?tab=' + sseTabId());
     // （重）连上后补拉一次：断线期间错过的推进靠这次回源追平
     source.onopen = function () { queueLoad(); };
     source.onmessage = function (e) {

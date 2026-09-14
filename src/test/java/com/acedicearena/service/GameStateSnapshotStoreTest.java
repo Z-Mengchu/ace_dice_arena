@@ -116,7 +116,7 @@ class GameStateSnapshotStoreTest {
         @SuppressWarnings("unchecked")
         ObjectProvider<GameStateSnapshotStore> provider = mock(ObjectProvider.class);
         when(provider.getIfAvailable()).thenReturn(store);
-        LobbyEventService events = new LobbyEventService(states, provider);
+        LobbyEventService events = new LobbyEventService(states, new ObjectMapper(), provider);
 
         events.blindBoxChanged();
 
