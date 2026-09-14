@@ -7,6 +7,8 @@
   var gameState = null;
   var eventRefreshTimer = null;
   var eventRefreshType = null;
+  var stateEvents = null;
+  var stateEventsRetryTimer = null;
 
   function api(path, method, body) {
     return fetch(path, {
@@ -411,8 +413,20 @@
     } catch (e) { return ''; }
   }
   function connectStateEvents() {
+    if (stateEvents || stateEventsRetryTimer) return;
     var events = new EventSource('/api/lobby/events?tab=' + sseTabId());
+    stateEvents = events;
     events.onopen = function () { queueEventRefresh('lobby'); };
+    events.onerror = function () {
+      if (stateEvents !== events) return;
+      stateEvents = null;
+      events.close();
+      if (document.hidden) return;
+      stateEventsRetryTimer = setTimeout(function () {
+        stateEventsRetryTimer = null;
+        if (!document.hidden) connectStateEvents();
+      }, Math.floor(Math.random() * 1000));
+    };
     events.onmessage = function (event) {
       var message = JSON.parse(event.data);
       if (message.type === 'lobby' || message.type === 'game') queueEventRefresh(message.type);
@@ -502,5 +516,5 @@
   load(); connectStateEvents();
   /* SSE 之外的兜底：慢轮询 + 回前台补拉，避免断线后流程监控失鲜 */
   setInterval(function () { if (!document.hidden) queueEventRefresh('game'); }, 15000);
-  document.addEventListener('visibilitychange', function () { if (!document.hidden) queueEventRefresh('lobby'); });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) { queueEventRefresh('lobby'); if (!stateEvents) connectStateEvents(); } });
 })();

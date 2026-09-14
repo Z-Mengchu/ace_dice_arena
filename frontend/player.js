@@ -129,6 +129,7 @@ import { icon } from './icons.js';
     battleKey: ''             // 对局视图结构指纹：未变化时只就地刷新人数/倒计时，避免打断点选
   };
   var es = null;
+  var esRetryTimer = null;
   var refreshTimer = null;
   var refreshExpectedVersion = null, refreshForced = false;
   var assignmentLoading = false, assignmentPending = false, assignmentPendingVersion = null;
@@ -416,12 +417,24 @@ import { icon } from './icons.js';
   }
 
   function connectEvents() {
-    if (es) return;
-    try { es = new EventSource('/api/lobby/events?tab=' + sseTabId()); } catch (e) { return; }
+    if (es || esRetryTimer) return;
+    var source;
+    try { source = new EventSource('/api/lobby/events?tab=' + sseTabId()); } catch (e) { return; }
+    es = source;
     // 建连后的 sync 事件只带版本：相同版本不请求，延迟连接/重连时才按需追平。
-    es.onopen = function () { setNet('已连接服务器', false); };
-    es.onerror = function () { setNet('连接中断，重连中…', true); };
-    es.onmessage = function (ev) {
+    source.onopen = function () { setNet('已连接服务器', false); };
+    source.onerror = function () {
+      setNet('连接中断，重连中…', true);
+      if (es !== source) return;
+      es = null;
+      source.close();
+      if (document.hidden) return;
+      esRetryTimer = setTimeout(function () {
+        esRetryTimer = null;
+        if (!document.hidden) connectEvents();
+      }, Math.floor(Math.random() * 1000));
+    };
+    source.onmessage = function (ev) {
       var msg = null;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       var gameChanged = msg && msg.type === 'game' &&
@@ -1513,6 +1526,9 @@ import { icon } from './icons.js';
   });
   document.addEventListener('keydown', function (event) {
     if (event.key === 'Escape') closeTeamPop();
+  });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && !es) connectEvents();
   });
 
   try { sessionStorage.removeItem('dice-arena-player-v1'); } catch (e) { }

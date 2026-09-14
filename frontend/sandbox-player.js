@@ -142,6 +142,7 @@ import { icon } from './icons.js';
   load();
   /* SSE 事件驱动 + 10 秒兜底慢轮询；页面隐藏时暂停，恢复可见立即补拉 */
   var refreshTimer = null;
+  var sseSource = null, sseRetryTimer = null;
   function queueLoad() {
     if (document.hidden || refreshTimer) return;
     refreshTimer = setTimeout(function () { refreshTimer = null; load(); }, 300);
@@ -154,14 +155,29 @@ import { icon } from './icons.js';
       return t;
     } catch (e) { return ''; }
   }
-  var source = new EventSource('/api/lobby/events?tab=' + sseTabId());
-  // （重）连上后补拉一次：断线期间错过的推进靠这次回源追平
-  source.onopen = function () { queueLoad(); };
-  source.onmessage = function (e) {
-    var m;
-    try { m = JSON.parse(e.data); } catch (err) { return; }
-    if (m.type === 'game' || m.type === 'lobby') queueLoad();
-  };
+  function connectEvents() {
+    if (sseSource || sseRetryTimer) return;
+    var source = new EventSource('/api/lobby/events?tab=' + sseTabId());
+    sseSource = source;
+    // （重）连上后补拉一次：断线期间错过的推进靠这次回源追平
+    source.onopen = function () { queueLoad(); };
+    source.onerror = function () {
+      if (sseSource !== source) return;
+      sseSource = null;
+      source.close();
+      if (document.hidden) return;
+      sseRetryTimer = setTimeout(function () {
+        sseRetryTimer = null;
+        if (!document.hidden) connectEvents();
+      }, Math.floor(Math.random() * 1000));
+    };
+    source.onmessage = function (e) {
+      var m;
+      try { m = JSON.parse(e.data); } catch (err) { return; }
+      if (m.type === 'game' || m.type === 'lobby') queueLoad();
+    };
+  }
+  connectEvents();
   setInterval(function () { if (!document.hidden) load(); }, 10000);
-  document.addEventListener('visibilitychange', function () { if (!document.hidden) load(); });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) { load(); if (!sseSource) connectEvents(); } });
 })();
