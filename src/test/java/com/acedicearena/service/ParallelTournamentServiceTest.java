@@ -4,11 +4,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.acedicearena.domain.PlayerGuess;
 import com.acedicearena.domain.UserAccount;
+import com.acedicearena.repository.PlayerGuessRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -18,6 +21,7 @@ import java.util.Set;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
@@ -348,7 +352,9 @@ class ParallelTournamentServiceTest {
         giveDice(team(root, "t1"), 6, 1_000L, 600L, false);
         giveDice(team(root, "t2"), 1, 1_000L, 600L, false);
         team(root, "t2").withArray("rerollLog").addObject().put("playerId", "u101").put("from", 1).put("to", 6);
-        service.submitRoundGuess(root, user(1L, "t1"), squadIds(team(root, "t2"), 0));
+        // 猜阵落 player_guess 表后由快照注入 guesses 节点：测试直接挂上注入后的形状
+        ((ObjectNode) match(root).at("/guesses/1/A"))
+                .set("u1", mapper.valueToTree(squadIds(team(root, "t2"), 0)));
 
         ObjectNode view = (ObjectNode) service.publicStateView(root, "t1", "u1");
 
@@ -367,13 +373,13 @@ class ParallelTournamentServiceTest {
         assertThat(enemyPlayer.path("name").asText()).isNotBlank();
         for (String field : List.of("dice", "diceFinal", "rollTs", "blindBox", "autoRolled"))
             assertThat(enemyPlayer.has(field)).as(field).isFalse();
-        // 猜阵密封：内容不可见，只能看到提交状态
+        // 猜阵密封：内容不可见，只能看到按局分桶的提交状态
         ObjectNode viewMatch = match(view);
         assertThat(viewMatch.has("guesses")).isFalse();
-        assertThat(viewMatch.at("/guessStatus/A/u1").asBoolean()).isTrue();
-        assertThat(viewMatch.path("guessStatus").path("B").size()).isZero();
+        assertThat(viewMatch.at("/guessStatus/1/A/u1").asBoolean()).isTrue();
+        assertThat(viewMatch.path("guessStatus").path("1").path("B").size()).isZero();
         // 原始状态不被视图过滤改动
-        assertThat(match(root).path("guesses").path("A").has("u1")).isTrue();
+        assertThat(match(root).path("guesses").path("1").path("A").has("u1")).isTrue();
         assertThat(player(team(root, "t2"), "u101").has("dice")).isTrue();
     }
 
@@ -423,23 +429,33 @@ class ParallelTournamentServiceTest {
     /* ---------- 猜阵与单局结算 ---------- */
 
     @Test
-    void roundGuessCountsHitsPerGuessAndRevealsEarlyWhenBothSidesAreComplete() {
+    void guessesSettleAllSixRoundsAtOnceWhenBothSidesAreComplete() {
         ParallelTournamentService service = service();
         ObjectNode root = battleRoot();
-        // t1 出战小队每人 6 点但不同步；t2 每人 1 点
+        // t1 每人 6 点但不同步；t2 每人 1 点
         giveDice(team(root, "t1"), 6, 1_000L, 600L, false);
         giveDice(team(root, "t2"), 1, 1_000L, 600L, false);
         ObjectNode match = match(root);
-        List<String> enemySquadB = squadIds(team(root, "t2"), 0);
-        for (long id = 1; id <= 5; id++)
-            service.submitRoundGuess(root, user(id, "t1"), enemySquadB);
+        // t1 全员都猜敌方 1 号小队：每局 5 人 × 5 命中 = 25 人次
+        when(guesses.findByGameDayAndMatchId(anyInt(), anyString()))
+                .thenReturn(allGuessRows(root, "t1", "A", squadIds(team(root, "t2"), 0)));
+        assertThat(service.expireGuesses(root, System.currentTimeMillis())).isFalse();
         assertThat(match.path("rounds")).isEmpty();   // B 方未交齐，密封不揭晓
 
-        List<String> wrongGuesses = List.of("u6", "u7", "u8", "u9", "u10");
-        for (long id = 101; id <= 105; id++)
-            service.submitRoundGuess(root, user(id, "t2"), wrongGuesses);
+        List<PlayerGuess> all = new ArrayList<>(allGuessRows(root, "t1", "A", squadIds(team(root, "t2"), 0)));
+        all.addAll(allGuessRows(root, "t2", "B", List.of("u26", "u27", "u28", "u29", "u30")));
+        when(guesses.findByGameDayAndMatchId(anyInt(), anyString())).thenReturn(all);
+        // 交齐：首次扫描只把倒计时收到 5 秒后，仍未揭晓
+        long completedAt = System.currentTimeMillis();
+        assertThat(service.expireGuesses(root, completedAt)).isTrue();
+        assertThat(match.path("roundPhase").asText()).isEqualTo("GUESS");
+        assertThat(match.path("guessRevealAt").asLong()).isEqualTo(completedAt + 5_000L);
+        // 宽限 5 秒到期后扫描器整批揭晓
+        assertThat(service.expireGuesses(root, completedAt + 5_000L)).isTrue();
 
         assertThat(match.path("roundPhase").asText()).isEqualTo("REVEAL");
+        assertThat(match.path("rounds")).hasSize(6);
+        assertThat(match.has("guesses")).isFalse();
         JsonNode round = match.path("rounds").get(0);
         // 每人 5 猜全中：5 人 × 5 命中 = 25 人次，×0.4 = 10 触发单局上限
         assertThat(round.path("guessHitsA").asInt()).isEqualTo(25);
@@ -449,42 +465,24 @@ class ParallelTournamentServiceTest {
         assertThat(round.path("powerA").asDouble()).isEqualTo(40d);  // 30 基础 + 10 猜阵
         assertThat(round.path("powerB").asDouble()).isEqualTo(5d);
         assertThat(round.path("winner").asText()).isEqualTo("A");
-        assertThat(match.path("winsA").asInt()).isEqualTo(1);
+        assertThat(match.path("winsA").asInt()).isEqualTo(6);
     }
 
     @Test
-    void roundGuessValidationRejectsStrangersWrongTargetsAndDuplicates() {
-        ParallelTournamentService service = service();
-        ObjectNode root = battleRoot();
-        giveDice(team(root, "t1"), 3, 1_000L, 600L, false);
-        giveDice(team(root, "t2"), 3, 1_000L, 600L, false);
-        List<String> enemySquadB = squadIds(team(root, "t2"), 0);
-
-        assertThatThrownBy(() -> service.submitRoundGuess(root, user(6L, "t1"), enemySquadB))
-                .hasMessage("只有本轮出战小队成员可以提交猜阵");
-        assertThatThrownBy(() -> service.submitRoundGuess(root, user(1L, "t1"), enemySquadB.subList(0, 4)))
-                .hasMessage("猜阵必须选择 5 名敌方队员");
-        assertThatThrownBy(() -> service.submitRoundGuess(root, user(1L, "t1"),
-                        List.of("u1", "u2", "u3", "u4", "u5")))
-                .hasMessage("猜阵目标必须是敌方队员");
-        service.submitRoundGuess(root, user(1L, "t1"), enemySquadB);
-        assertThatThrownBy(() -> service.submitRoundGuess(root, user(1L, "t1"), enemySquadB))
-                .hasMessage("你已经提交过本轮猜阵");
-    }
-
-    @Test
-    void equalPowersMakeTheRoundATieAndNobodyScores() {
+    void equalPowersMakeEveryRoundATieAndNobodyScores() {
         ParallelTournamentService service = service();
         ObjectNode root = battleRoot();
         giveDice(team(root, "t1"), 3, 1_000L, 600L, false);
         giveDice(team(root, "t2"), 3, 1_000L, 600L, false);
         ObjectNode match = match(root);
 
-        service.revealRound(root, match);
+        service.revealAllRounds(root, match);
 
-        JsonNode round = match.path("rounds").get(0);
-        assertThat(round.path("powerA").asDouble()).isEqualTo(round.path("powerB").asDouble());
-        assertThat(round.path("winner").isNull()).isTrue();
+        assertThat(match.path("rounds")).hasSize(6);
+        for (JsonNode round : match.path("rounds")) {
+            assertThat(round.path("powerA").asDouble()).isEqualTo(round.path("powerB").asDouble());
+            assertThat(round.path("winner").isNull()).isTrue();
+        }
         assertThat(match.path("winsA").asInt() + match.path("winsB").asInt()).isZero();
     }
 
@@ -612,7 +610,7 @@ class ParallelTournamentServiceTest {
         player(team(root, "t1"), squadIds(team(root, "t1"), 0).get(4)).put("autoRolled", true);
         ObjectNode match = match(root);
 
-        service.revealRound(root, match);
+        service.revealAllRounds(root, match);
 
         JsonNode round = match.path("rounds").get(0);
         assertThat(round.path("critA").asBoolean()).isFalse();
@@ -675,21 +673,25 @@ class ParallelTournamentServiceTest {
         formSquads(team(root, "t2"));
         UserAccount captain = user(1L, "t1");
 
-        assertThatThrownBy(() -> service.submitTacticsConfirm(root, user(2L, "t1"), true))
+        assertThatThrownBy(() -> service.submitTacticsConfirm(root, user(2L, "t1"), List.of(), true))
                 .hasMessage("只有当选队长可以确认战术布置");
 
-        service.submitTacticsConfirm(root, captain, true);
+        service.submitTacticsConfirm(root, captain, List.of(), true);
         assertThat(team(root, "t1").path("tacticsConfirmed").asBoolean()).isTrue();
+        assertThat(team(root, "t1").path("squadOrderLocked").asBoolean()).as("确认即锁出场顺序").isTrue();
         assertThatThrownBy(() -> service.submitReroll(root, captain, List.of("u5")))
                 .hasMessage("已确认完成战术布置，请先取消确认再调整");
         assertThatThrownBy(() -> service.submitSquadOrder(root, captain, List.of("1", "2", "3", "4", "5", "6")))
                 .hasMessage("已确认完成战术布置，请先取消确认再调整");
         assertThat(root.path("stage").asText()).as("t2 未确认，不提前推进").isEqualTo("TACTICS");
 
-        service.submitTacticsConfirm(root, captain, false);
+        service.submitTacticsConfirm(root, captain, List.of(), false);
         assertThat(team(root, "t1").path("tacticsConfirmed").asBoolean()).isFalse();
         service.submitReroll(root, captain, List.of("u5"));
         assertThat(player(team(root, "t1"), "u5").path("rerolled").asBoolean()).isTrue();
+        assertThatThrownBy(() -> service.submitSquadOrder(root, captain, List.of("1", "2", "3", "4", "5", "6")))
+                .as("取消确认只重新开放重掷，顺序锁不解除")
+                .hasMessage("本队出场顺序已经锁定");
     }
 
     @Test
@@ -699,150 +701,213 @@ class ParallelTournamentServiceTest {
         formSquads(team(root, "t1"));
         formSquads(team(root, "t2"));
 
-        service.submitTacticsConfirm(root, user(101L, "t2"), true);
+        service.submitTacticsConfirm(root, user(101L, "t2"), List.of(), true);
         assertThat(root.path("stage").asText()).isEqualTo("TACTICS");
 
-        service.submitTacticsConfirm(root, user(1L, "t1"), true);
+        service.submitTacticsConfirm(root, user(1L, "t1"), List.of(), true);
         assertThat(root.path("stage").asText()).isEqualTo("BATTLE");
         ObjectNode match = match(root);
         assertThat(match.path("phase").asText()).isEqualTo("BATTLE");
-        assertThat(match.path("round").asInt()).isEqualTo(1);
+        assertThat(match.has("round")).isFalse();
         assertThat(match.path("roundPhase").asText()).isEqualTo("GUESS");
         assertThat(match.path("guessOpenedAt").asLong()).isPositive();
-        assertThat(match.path("preGuesses").isObject()).isTrue();
+        // 6 局共用一个猜阵窗口：猜阵落 player_guess 表，行内 JSON 不再初始化分桶，也没有提前猜阵
+        assertThat(match.has("preGuesses")).isFalse();
+        assertThat(match.has("guesses")).isFalse();
         assertThat(team(root, "t1").path("squadOrderLocked").asBoolean()).isTrue();
         assertThat(team(root, "t2").path("squadOrderLocked").asBoolean()).isTrue();
     }
 
-    /* ---------- 提前猜阵 ---------- */
-
     @Test
-    void preGuessSubmitsOverwritesAndRejectsCurrentRound() {
+    void tacticsConfirmWithOrderPayloadReordersLocksAndConfirmsAtomically() {
         ParallelTournamentService service = service();
-        ObjectNode root = battleRoot();
-        giveDice(team(root, "t1"), 3, 1_000L, 600L, false);
-        giveDice(team(root, "t2"), 3, 1_000L, 600L, false);
-        ObjectNode match = match(root);
-        // u11 属于 3 号小队，第 3 局出战；当前第 1 局
-        List<String> targets = List.of("u101", "u102", "u103", "u104", "u105");
+        ObjectNode root = tacticsRoot(10);
+        formSquads(team(root, "t1"));
+        formSquads(team(root, "t2"));
+        UserAccount captain = user(1L, "t1");
 
-        service.submitPreGuess(root, user(11L, "t1"), targets);
-        assertThat(match.at("/preGuesses/3/A/u11")).hasSize(5);
+        service.submitTacticsConfirm(root, captain, List.of("3", "1", "2", "4", "5", "6"), true);
 
-        // 改投：覆盖旧值
-        service.submitPreGuess(root, user(11L, "t1"), List.of("u106", "u107", "u108", "u109", "u110"));
-        assertThat(match.at("/preGuesses/3/A/u11").get(0).asText()).isEqualTo("u106");
-
-        // 当前轮（1 号小队 u1）请走普通猜阵通道
-        assertThatThrownBy(() -> service.submitPreGuess(root, user(1L, "t1"), targets))
-                .hasMessage("当前轮次请直接提交猜阵");
-        // 已结束轮次同样被拒
-        match.put("round", 2);
-        assertThatThrownBy(() -> service.submitPreGuess(root, user(1L, "t1"), targets))
-                .hasMessage("你们小队的轮次已经结束");
-        match.put("round", 1);
-        assertThatThrownBy(() -> service.submitPreGuess(root, user(11L, "t1"),
-                        List.of("u1", "u2", "u3", "u4", "u5")))
-                .hasMessage("猜阵目标必须是敌方队员");
+        ObjectNode t1 = team(root, "t1");
+        JsonNode squads = t1.path("squads");
+        assertThat(squads.get(0).get(0).asText()).isEqualTo("u11");
+        assertThat(squads.get(1).get(0).asText()).isEqualTo("u1");
+        assertThat(squads.get(2).get(0).asText()).isEqualTo("u6");
+        assertThat(t1.path("squadOrderLocked").asBoolean()).isTrue();
+        assertThat(t1.path("tacticsConfirmed").asBoolean()).isTrue();
     }
 
     @Test
-    void retractGuessRemovesLiveAndFutureGuesses() {
+    void tacticsConfirmWithInvalidOrderPayloadIsRejectedAtomically() {
         ParallelTournamentService service = service();
-        ObjectNode root = battleRoot();
-        giveDice(team(root, "t1"), 3, 1_000L, 600L, false);
-        giveDice(team(root, "t2"), 3, 1_000L, 600L, false);
-        ObjectNode match = match(root);
-        service.submitPreGuess(root, user(11L, "t1"), List.of("u101", "u102", "u103", "u104", "u105"));
-        service.submitRoundGuess(root, user(1L, "t1"), squadIds(team(root, "t2"), 0));
+        ObjectNode root = tacticsRoot(10);
+        formSquads(team(root, "t1"));
+        formSquads(team(root, "t2"));
+        UserAccount captain = user(1L, "t1");
 
-        // 撤回当前轮未揭晓的 live 猜阵，撤回后可重投
-        service.retractGuess(root, user(1L, "t1"));
-        assertThat(match.at("/guesses/A").has("u1")).isFalse();
-        service.submitRoundGuess(root, user(1L, "t1"), squadIds(team(root, "t2"), 0));
-        assertThat(match.at("/guesses/A").has("u1")).isTrue();
+        assertThatThrownBy(() -> service.submitTacticsConfirm(root, captain, List.of("1", "1", "2", "3", "4", "5"), true))
+                .hasMessage("小队编号必须是 1~6 且不重复");
 
-        // 撤回后续轮次的提前猜阵
-        service.retractGuess(root, user(11L, "t1"));
-        assertThat(match.at("/preGuesses/3/A").has("u11")).isFalse();
-        assertThatThrownBy(() -> service.retractGuess(root, user(11L, "t1")))
-                .hasMessage("你没有可撤回的猜阵");
+        ObjectNode t1 = team(root, "t1");
+        assertThat(t1.path("tacticsConfirmed").asBoolean()).as("顺序校验失败则不确认").isFalse();
+        assertThat(t1.path("squadOrderLocked").asBoolean()).as("顺序校验失败则不锁定").isFalse();
+        assertThat(t1.path("squads").get(0).get(0).asText()).as("squads 保持原序").isEqualTo("u1");
     }
 
     @Test
-    void preGuessesMergeIntoTheRoundWhenItOpensAndStaleTargetsAreFiltered() {
+    void tacticsConfirmIgnoresOrderPayloadWhenSquadOrderAlreadyLocked() {
         ParallelTournamentService service = service();
-        ObjectNode root = battleRoot();
-        giveDice(team(root, "t1"), 3, 1_000L, 600L, false);
-        giveDice(team(root, "t2"), 3, 1_000L, 600L, false);
-        ObjectNode match = match(root);
-        service.submitPreGuess(root, user(11L, "t1"), List.of("u101", "u102", "u103", "u104", "u105"));
+        ObjectNode root = tacticsRoot(10);
+        formSquads(team(root, "t1"));
+        formSquads(team(root, "t2"));
+        UserAccount captain = user(1L, "t1");
 
-        // 进到第 2 局：第 3 局的提前猜阵还不生效
-        match.put("roundPhase", "REVEAL");
-        match.put("revealUntil", System.currentTimeMillis() - 1);
-        assertThat(service.completeRoundReveals(root, System.currentTimeMillis())).isTrue();
-        assertThat(match.path("round").asInt()).isEqualTo(2);
-        assertThat(match.at("/guesses/A").has("u11")).isFalse();
+        service.submitSquadOrder(root, captain, List.of("2", "1", "3", "4", "5", "6"));
+        service.submitTacticsConfirm(root, captain, List.of("3", "1", "2", "4", "5", "6"), true);
 
-        // 沙盘中途换人：敌方花名册移除 u101，合并时按当前花名册过滤失效目标
-        ArrayNode enemyPlayers = (ArrayNode) team(root, "t2").path("players");
-        for (int i = enemyPlayers.size() - 1; i >= 0; i--)
-            if ("u101".equals(enemyPlayers.get(i).path("id").asText())) enemyPlayers.remove(i);
-
-        match.put("roundPhase", "REVEAL");
-        match.put("revealUntil", System.currentTimeMillis() - 1);
-        long before = System.currentTimeMillis();
-        assertThat(service.completeRoundReveals(root, System.currentTimeMillis())).isTrue();
-        assertThat(match.path("round").asInt()).isEqualTo(3);
-        assertThat(match.path("guessOpenedAt").asLong()).isGreaterThanOrEqualTo(before);
-        List<String> mergedIds = new ArrayList<>();
-        match.at("/guesses/A/u11").forEach(id -> mergedIds.add(id.asText()));
-        assertThat(mergedIds).containsExactly("u102", "u103", "u104", "u105");
-        assertThat(match.path("preGuesses").has("3")).isFalse();
+        ObjectNode t1 = team(root, "t1");
+        assertThat(t1.path("squads").get(0).get(0).asText()).as("已锁定则忽略确认载荷").isEqualTo("u6");
+        assertThat(t1.path("squadOrderLocked").asBoolean()).isTrue();
+        assertThat(t1.path("tacticsConfirmed").asBoolean()).isTrue();
     }
 
+    /* ---------- 统一猜阵：密封视图 ---------- */
+
     @Test
-    void publicStateViewSealsPreGuessesIntoStatusFlags() {
+    void publicStateViewSealsGuessesIntoPerRoundStatusFlags() {
         ParallelTournamentService service = service();
         ObjectNode root = battleRoot();
         giveDice(team(root, "t1"), 3, 1_000L, 600L, false);
         giveDice(team(root, "t2"), 3, 1_000L, 600L, false);
-        service.submitPreGuess(root, user(11L, "t1"), List.of("u101", "u102", "u103", "u104", "u105"));
+        // 快照加载时由 GuessRoundService 注入的 guesses 节点：测试直接挂上注入后的形状
+        ((ObjectNode) match(root).at("/guesses/3/A"))
+                .set("u11", mapper.valueToTree(List.of("u101", "u102", "u103", "u104", "u105")));
 
         ObjectNode view = (ObjectNode) service.publicStateView(root, "t1", "u1");
         ObjectNode viewMatch = match(view);
-        assertThat(viewMatch.has("preGuesses")).isFalse();
-        assertThat(viewMatch.at("/preGuessStatus/3/A/u11").asBoolean()).isTrue();
-        assertThat(viewMatch.path("preGuessStatus").path("3").path("B").size()).isZero();
+        assertThat(viewMatch.has("guesses")).isFalse();
+        assertThat(viewMatch.at("/guessStatus/3/A/u11").asBoolean()).isTrue();
+        assertThat(viewMatch.path("guessStatus").path("3").path("B").size()).isZero();
         // 原始状态不被视图过滤改动
-        assertThat(match(root).at("/preGuesses/3/A/u11")).hasSize(5);
+        assertThat(match(root).at("/guesses/3/A/u11")).hasSize(5);
     }
 
-    /* ---------- 猜阵 5 秒下限 ---------- */
+    /* ---------- 猜阵交齐宽限 ---------- */
 
     @Test
-    void earlyRevealWaitsForTheFiveSecondMinimumAndTheScannerRevealsAfterwards() {
+    void earlyRevealComesFiveSecondsAfterBothSidesComplete() {
         ParallelTournamentService service = service();
         ObjectNode root = battleRoot();
         giveDice(team(root, "t1"), 6, 1_000L, 600L, false);
         giveDice(team(root, "t2"), 1, 1_000L, 600L, false);
         ObjectNode match = match(root);
-        long openedAt = System.currentTimeMillis();
-        match.put("guessOpenedAt", openedAt);
-        for (long id = 1; id <= 5; id++)
-            service.submitRoundGuess(root, user(id, "t1"), squadIds(team(root, "t2"), 0));
-        // B 方最后一份提交也不立即揭晓：未满 5 秒
-        for (long id = 101; id <= 105; id++)
-            service.submitRoundGuess(root, user(id, "t2"), squadIds(team(root, "t1"), 0));
+        // 双方 30 份全部交齐（player_guess 行）
+        List<PlayerGuess> all = new ArrayList<>(allGuessRows(root, "t1", "A", squadIds(team(root, "t2"), 0)));
+        all.addAll(allGuessRows(root, "t2", "B", squadIds(team(root, "t1"), 0)));
+        when(guesses.findByGameDayAndMatchId(anyInt(), anyString())).thenReturn(all);
         assertThat(match.path("roundPhase").asText()).isEqualTo("GUESS");
 
-        // 5 秒下限之前扫描器不揭晓
-        assertThat(service.expireGuesses(root, openedAt + 3_000L)).isFalse();
+        // 交齐时刻剩余 >5s：首次扫描只把倒计时收到交齐后 5 秒，不立即揭晓
+        long completedAt = System.currentTimeMillis();
+        assertThat(service.expireGuesses(root, completedAt)).isTrue();
         assertThat(match.path("roundPhase").asText()).isEqualTo("GUESS");
-        // 满 5 秒后扫描器揭晓，不用等 30 秒硬截止
-        assertThat(service.expireGuesses(root, openedAt + 5_000L)).isTrue();
+        assertThat(match.path("guessRevealAt").asLong()).isEqualTo(completedAt + 5_000L);
+        // 宽限未满不揭晓，且 guessRevealAt 不被后续扫描改写
+        assertThat(service.expireGuesses(root, completedAt + 4_999L)).isFalse();
+        assertThat(match.path("guessRevealAt").asLong()).isEqualTo(completedAt + 5_000L);
+        // 满 5 秒揭晓，不用等 30 秒硬截止
+        assertThat(service.expireGuesses(root, completedAt + 5_000L)).isTrue();
         assertThat(match.path("roundPhase").asText()).isEqualTo("REVEAL");
+        assertThat(match.path("rounds")).hasSize(6);
+        assertThat(match.has("guessRevealAt")).isFalse();
+    }
+
+    @Test
+    void completingInsideTheLastFiveSecondsKeepsTheOriginalCountdown() {
+        ParallelTournamentService service = service();
+        ObjectNode root = battleRoot();
+        giveDice(team(root, "t1"), 6, 1_000L, 600L, false);
+        giveDice(team(root, "t2"), 1, 1_000L, 600L, false);
+        ObjectNode match = match(root);
+        List<PlayerGuess> all = new ArrayList<>(allGuessRows(root, "t1", "A", squadIds(team(root, "t2"), 0)));
+        all.addAll(allGuessRows(root, "t2", "B", squadIds(team(root, "t1"), 0)));
+        when(guesses.findByGameDayAndMatchId(anyInt(), anyString())).thenReturn(all);
+
+        // 剩余 3 秒时才交齐：揭晓时刻夹在硬截止上，按原倒计时到点揭晓
+        long deadline = match.path("guessDeadlineAt").asLong();
+        assertThat(service.expireGuesses(root, deadline - 3_000L)).isTrue();
+        assertThat(match.path("guessRevealAt").asLong()).isEqualTo(deadline);
+        assertThat(match.path("roundPhase").asText()).isEqualTo("GUESS");
+        assertThat(service.expireGuesses(root, deadline - 1L)).isFalse();
+        assertThat(service.expireGuesses(root, deadline)).isTrue();
+        assertThat(match.path("roundPhase").asText()).isEqualTo("REVEAL");
+    }
+
+    /* ---------- 猜阵迟到行与揭晓幂等 ---------- */
+
+    @Test
+    void guessesSubmittedAfterTheDeadlineAreExcludedFromEarlyRevealAndSettlement() {
+        ParallelTournamentService service = service();
+        ObjectNode root = battleRoot();
+        giveDice(team(root, "t1"), 6, 1_000L, 600L, false);
+        giveDice(team(root, "t2"), 1, 1_000L, 600L, false);
+        ObjectNode match = match(root);
+        long deadline = match.path("guessDeadlineAt").asLong();
+        List<PlayerGuess> all = new ArrayList<>(allGuessRows(root, "t1", "A", squadIds(team(root, "t2"), 0)));
+        all.addAll(allGuessRows(root, "t2", "B", List.of("u26", "u27", "u28", "u29", "u30")));
+        // t1 第 1 局 u1 的行在截止后才写入：提前齐交判定与结算都不计入
+        PlayerGuess late = all.stream().filter(row -> row.getPlayerId().equals("u1")).findFirst().orElseThrow();
+        ReflectionTestUtils.setField(late, "updatedAt", Instant.ofEpochMilli(deadline + 1));
+        when(guesses.findByGameDayAndMatchId(anyInt(), anyString())).thenReturn(all);
+
+        // A 方只有 29 份有效：未交齐不提前揭晓
+        assertThat(service.expireGuesses(root, System.currentTimeMillis())).isFalse();
+        assertThat(match.path("roundPhase").asText()).isEqualTo("GUESS");
+
+        // 到点强制揭晓：迟到行不参与命中，第 1 局 A 方命中 20 而非 25
+        assertThat(service.expireGuesses(root, deadline + 1)).isTrue();
+        assertThat(match.path("roundPhase").asText()).isEqualTo("REVEAL");
+        assertThat(match.path("rounds").get(0).path("guessHitsA").asInt()).isEqualTo(20);
+        assertThat(match.path("rounds").get(0).path("guessBonusA").asDouble()).isEqualTo(8d);
+    }
+
+    @Test
+    void scannerDoesNotSettleAgainOnceTheMatchLeftTheGuessPhase() {
+        ParallelTournamentService service = service();
+        ObjectNode root = battleRoot();
+        giveDice(team(root, "t1"), 3, 1_000L, 600L, false);
+        giveDice(team(root, "t2"), 3, 1_000L, 600L, false);
+        ObjectNode match = match(root);
+
+        service.revealAllRounds(root, match);
+        assertThat(match.path("roundPhase").asText()).isEqualTo("REVEAL");
+        assertThat(match.path("rounds")).hasSize(6);
+
+        // 扫描器再次触发（阶段已过 GUESS）：不重复结算、不追加 rounds
+        assertThat(service.expireGuesses(root, System.currentTimeMillis())).isFalse();
+        assertThat(match.path("rounds")).hasSize(6);
+        assertThat(match.path("winsA").asInt() + match.path("winsB").asInt()).isZero();
+    }
+
+    /* ---------- 时间与对阵结构常量 ---------- */
+
+    @Test
+    void guessAndRevealTimingConstantsArePinned() {
+        assertThat(ReflectionTestUtils.getField(ParallelTournamentService.class, "GUESS_DURATION_MS"))
+                .isEqualTo(30_000L);
+        assertThat(ParallelTournamentService.GUESS_COMPLETE_GRACE_MS).isEqualTo(5_000L);
+        assertThat(ReflectionTestUtils.getField(ParallelTournamentService.class, "REVEAL_DURATION_MS"))
+                .isEqualTo(20_000L);
+    }
+
+    @Test
+    void bracketRoundMapsKnownMatchIdPrefixesAndRejectsUnknownOnes() {
+        assertThat(TournamentLayout.bracketRoundOf("g1")).isEqualTo(1);
+        assertThat(TournamentLayout.bracketRoundOf("s2")).isEqualTo(2);
+        assertThat(TournamentLayout.bracketRoundOf("f1")).isEqualTo(3);
+        assertThatThrownBy(() -> TournamentLayout.bracketRoundOf("x1"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("x1");
     }
 
     /* ---------- 总冠军判定 ---------- */
@@ -1021,6 +1086,9 @@ class ParallelTournamentServiceTest {
 
     private record OverallTeam(String id, int matchWins, String gmv) {}
 
+    /** 猜阵行仓库：默认空表（未交齐）；用例需要已提交的行时在 service() 之后自行 stub 覆盖。 */
+    private final PlayerGuessRepository guesses = mock(PlayerGuessRepository.class);
+
     private ParallelTournamentService service() {
         return service(org.mockito.Mockito.mock(com.acedicearena.repository.GameStateRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.UserAccountRepository.class),
@@ -1049,6 +1117,7 @@ class ParallelTournamentServiceTest {
         // 运行态用真实实例（同一批 mock 仓库 + 桩事务），simulateStep/forceMatch 才能走完盲盒关闭
         BlindBoxRoundService blindBoxRounds =
                 new BlindBoxRoundService(states, users, blindBoxes, mapper, events, stubTransactions());
+        when(guesses.findByGameDayAndMatchId(anyInt(), anyString())).thenReturn(List.of());
         return new ParallelTournamentService(states, users,
                 org.mockito.Mockito.mock(com.acedicearena.repository.PerformanceRecordRepository.class),
                 org.mockito.Mockito.mock(com.acedicearena.repository.GameControlRepository.class), mapper,
@@ -1057,7 +1126,9 @@ class ParallelTournamentServiceTest {
                 org.mockito.Mockito.mock(com.acedicearena.repository.MatchReportRepository.class),
                 blindBoxes,
                 blindBoxRounds,
-                new GameStateSnapshotStore(states, mapper, blindBoxRounds),
+                guesses,
+                new GameStateSnapshotStore(states, mapper, blindBoxRounds,
+                        org.mockito.Mockito.mock(GuessRoundService.class)),
                 stubTransactions());
     }
 
@@ -1112,7 +1183,7 @@ class ParallelTournamentServiceTest {
         root.putArray("teams").add(team("t1", 1.2)).add(team("t2", 1.0));
         ObjectNode match = root.putObject("matches").putObject("g1");
         match.put("id", "g1"); match.put("a", "t1"); match.put("b", "t2");
-        match.put("winsA", 0); match.put("winsB", 0); match.put("round", 1);
+        match.put("winsA", 0); match.put("winsB", 0);
         match.put("status", "active"); match.put("phase", "PENDING");
         match.putArray("rounds");
         return root;
@@ -1144,11 +1215,26 @@ class ParallelTournamentServiceTest {
         formSquads(team(root, "t1"));
         formSquads(team(root, "t2"));
         ObjectNode match = match(root);
-        match.put("phase", "BATTLE").put("round", 1).put("roundPhase", "GUESS");
+        match.put("phase", "BATTLE").put("roundPhase", "GUESS");
         match.put("guessDeadlineAt", System.currentTimeMillis() + 30_000L);
-        match.putObject("guesses").putObject("A");
-        ((ObjectNode) match.path("guesses")).putObject("B");
+        ObjectNode guesses = match.putObject("guesses");
+        for (int round = 1; round <= 6; round++) {
+            ObjectNode bucket = guesses.putObject(String.valueOf(round));
+            bucket.putObject("A");
+            bucket.putObject("B");
+        }
         return root;
+    }
+
+    /** 指定队伍全员各一行的猜阵表数据（每人猜本人所在局，目标共用同一份 5 人名单）。 */
+    private List<PlayerGuess> allGuessRows(ObjectNode root, String teamId, String side, List<String> targets) {
+        String targetsJson = mapper.valueToTree(targets).toString();
+        List<PlayerGuess> rows = new ArrayList<>();
+        JsonNode squads = team(root, teamId).path("squads");
+        for (int s = 0; s < squads.size(); s++)
+            for (JsonNode id : squads.get(s))
+                rows.add(new PlayerGuess(root.path("day").asInt(1), 1, "g1", id.asText(), teamId, side, s + 1, targetsJson));
+        return rows;
     }
 
     private void formSquads(ObjectNode team) {

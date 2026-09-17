@@ -25,7 +25,7 @@ class GameStateSnapshotStoreTest {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private GameStateSnapshotStore newStore(GameStateRepository states, BlindBoxRoundService blindBoxRounds) {
-        return new GameStateSnapshotStore(states, mapper, blindBoxRounds);
+        return new GameStateSnapshotStore(states, mapper, blindBoxRounds, mock(GuessRoundService.class));
     }
 
     @Test
@@ -67,14 +67,14 @@ class GameStateSnapshotStoreTest {
         GameStateSnapshotStore store = newStore(states, blindBoxRounds);
 
         GameStateSnapshotStore.Snapshot first = store.current();
-        assertThat(first.blindRevision()).isZero();
+        assertThat(first.revisions().blind()).isZero();
         assertThat(store.current()).isSameAs(first);
 
         // 盲盒首开 revision +1：不查库即判定失效，下一次读取重载一次
         blindRevision.incrementAndGet();
         GameStateSnapshotStore.Snapshot reloaded = store.current();
         assertThat(reloaded).isNotSameAs(first);
-        assertThat(reloaded.blindRevision()).isEqualTo(1L);
+        assertThat(reloaded.revisions().blind()).isEqualTo(1L);
         verify(states, times(2)).findById(1L);
 
         // 显式失效后再读重载一次

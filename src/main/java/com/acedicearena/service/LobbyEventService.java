@@ -166,10 +166,10 @@ public class LobbyEventService {
     }
 
     /**
-     * 赛况播报：掷骰/盲盒/重掷/猜阵事件作为 feed 消息推进队内频道。
+     * 赛况播报：掷骰/盲盒/重掷事件作为 feed 消息推进队内频道。
      * 与聊天同为即时转发：不落库、不存历史，后进入的成员看不到过往播报。
      * 扇出统一在广播线程执行：请求线程（掷骰/开盒等热路径，开盒播报原先还持玩家条带锁）只负责入队，不做 SSE 写。
-     * kind 取值为 roll-big / roll-small / box-buff / box-debuff / reroll-up / reroll-down / guess-many / guess-few。
+     * kind 取值为 roll-big / roll-small / box-buff / box-debuff / reroll-up / reroll-down。
      */
     public void feed(String teamId, String kind, String sender, String content) {
         Event event = new Event("feed:" + kind, null, sender, content, Instant.now().toString());

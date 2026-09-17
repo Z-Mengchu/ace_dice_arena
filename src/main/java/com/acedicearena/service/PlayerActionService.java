@@ -22,11 +22,13 @@ public class PlayerActionService {
     private final LobbyEventService events;
     private final ParallelTournamentService tournament;
     private final BlindBoxRoundService blindBoxRounds;
+    private final GuessRoundService guessRounds;
     private final TransactionTemplate transactions;
 
     public PlayerActionService(GameStateRepository gameStates, UserAccountRepository users,
                                ObjectMapper mapper, LobbyEventService events,
                                ParallelTournamentService tournament, BlindBoxRoundService blindBoxRounds,
+                               GuessRoundService guessRounds,
                                PlatformTransactionManager transactionManager) {
         this.gameStates = gameStates;
         this.users = users;
@@ -34,15 +36,26 @@ public class PlayerActionService {
         this.events = events;
         this.tournament = tournament;
         this.blindBoxRounds = blindBoxRounds;
+        this.guessRounds = guessRounds;
         this.transactions = new TransactionTemplate(transactionManager);
     }
 
     /**
      * 按动作分流事务入口：开盲盒走内存运行态模块（自身管理阶段锁与写穿事务），
+     * 猜阵走 player_guess 单行 upsert（GuessRoundService，不锁 game_state），
      * 其余动作在单个事务内锁 game_state 并走原有 JSON 状态机。
      */
     public Map<String, Object> submit(String username, String type, List<String> selections) {
         if ("blind-box-open".equals(type)) return submitBlindBoxOpen(username, selections);
+        if ("round-guess".equals(type) || "pre-guess".equals(type)) {
+            // pre-guess 是旧客户端缓存页面的兼容别名：统一窗口内语义等同于 round-guess
+            guessRounds.submit(username, selections == null ? List.of() : selections);
+            return Map.of("ok", true);
+        }
+        if ("retract-guess".equals(type)) {
+            guessRounds.retract(username);
+            return Map.of("ok", true);
+        }
         Map<String, Object> body = transactions.execute(status -> submitStateAction(username, type, selections));
         return body == null ? Map.of("ok", true) : body;
     }

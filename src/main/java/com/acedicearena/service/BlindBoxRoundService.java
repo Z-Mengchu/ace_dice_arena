@@ -62,7 +62,7 @@ public class BlindBoxRoundService {
     /** 三选一盲盒：摆出供玩家选择的盒子数量。 */
     static final int BLIND_BOX_COUNT = 3;
     /** 全部开完/截止后进入战术阶段的窗口时长，与赛事模块的战术窗口保持一致。 */
-    private static final long TACTICS_DURATION_MS = 90_000L;
+    private static final long TACTICS_DURATION_MS = 45_000L;
     /** 同一玩家幂等提交的条带锁数量，固定数量避免无界 Map。 */
     private static final int STRIPE_COUNT = 256;
 

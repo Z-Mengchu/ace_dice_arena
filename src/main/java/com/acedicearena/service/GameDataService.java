@@ -7,6 +7,7 @@ import com.acedicearena.repository.BattleReportRepository;
 import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.MatchReportRepository;
 import com.acedicearena.repository.UserAccountRepository;
+import com.acedicearena.service.GameStateSnapshotStore.Revisions;
 import com.acedicearena.service.GameStateSnapshotStore.Snapshot;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -85,7 +86,7 @@ public class GameDataService {
                 ? (playerScope ? "player:" : "public:") + (teamId != null ? "t:" + teamId
                         : playerId != null ? "p:" + playerId : "outsider")
                 : "admin";
-        String etag = stateEtag(snapshot.version(), snapshot.blindRevision(), viewKey);
+        String etag = stateEtag(snapshot.version(), snapshot.revisions(), viewKey);
         if (etagMatches(ifNoneMatch, etag)) return new GameStateResult(FetchStatus.NOT_MODIFIED, etag, null, 0);
         JsonNode state = snapshot.state();
         if (ordinaryUser) {
@@ -180,8 +181,8 @@ public class GameDataService {
         catch (Exception e) { return objectMapper.createObjectNode(); }
     }
 
-    private static String stateEtag(long version, long blindRevision, String viewKey) {
-        return "\"game-state-" + version + "-" + blindRevision + "-" + viewKey + "\"";
+    private static String stateEtag(long version, Revisions revisions, String viewKey) {
+        return "\"game-state-" + version + "-" + revisions.blind() + "-" + revisions.guess() + "-" + viewKey + "\"";
     }
 
     private static boolean etagMatches(String ifNoneMatch, String etag) {

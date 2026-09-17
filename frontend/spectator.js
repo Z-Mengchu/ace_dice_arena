@@ -7,7 +7,7 @@
     ROLL: ['第三阶段 · 全员掷骰', '321 倒计时后 30 人各掷 1 枚'],
     BLIND_BOX: ['第四阶段 · 开盲盒', '每人手动开启个人盲盒'],
     TACTICS: ['第五阶段 · 战术窗口', '队长重掷 + 排出场顺序'],
-    BATTLE: ['第六阶段 · 六局对局', '6 局胜场制 · 逐局猜阵揭晓']
+    BATTLE: ['第六阶段 · 六局对局', '6 局胜场制 · 统一猜阵同屏揭晓']
   };
 
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
@@ -100,9 +100,8 @@
     var rounds = match.rounds || [];
     return '<div class="score-cells">' + [1, 2, 3, 4, 5, 6].map(function (n) {
       var entry = rounds.find(function (r) { return r.round === n; });
-      var current = match.phase === 'BATTLE' && match.round === n;
-      var cls = entry ? (entry.winner ? 'is-' + String(entry.winner).toLowerCase() : 'is-draw') : current ? 'is-current' : '';
-      return '<div class="score-cell ' + cls + '"><i>' + n + '</i><b>' + (entry ? (entry.winner ? esc((entry.winner === 'A' ? a : b).name) : '平') : current ? '…' : '') + '</b></div>';
+      var cls = entry ? (entry.winner ? 'is-' + String(entry.winner).toLowerCase() : 'is-draw') : '';
+      return '<div class="score-cell ' + cls + '"><i>' + n + '</i><b>' + (entry ? (entry.winner ? esc((entry.winner === 'A' ? a : b).name) : '平') : '') + '</b></div>';
     }).join('') + '</div>';
   }
 
@@ -137,7 +136,7 @@
     var done = match.status === 'done';
     var result = match.phase === 'RESULT';
     var pending = match.phase === 'OVERTIME_PENDING';
-    var headerText = done ? '已完赛' : pending ? '待加赛' : result ? '结果结算中' : match.phase === 'BATTLE' ? ('第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中')) : '等待开赛';
+    var headerText = done ? '已完赛' : pending ? '待加赛' : result ? '结果结算中' : match.phase === 'BATTLE' ? (match.roundPhase === 'REVEAL' ? '6 局结果揭晓中' : '6 局统一猜阵中') : '等待开赛';
     var winnerName = done && match.winner ? esc(team(state, match.winner).name) : '';
     var tieText = TournamentUI.tieBreakText(match, a.name, b.name);
     var tieLine = result || done || pending ? '<div class="feed-meta"><span>' + esc(tieText || ('判定依据：' + (match.tieBreak || '胜场'))) + '</span></div>' : '';

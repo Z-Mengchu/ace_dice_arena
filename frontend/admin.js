@@ -250,15 +250,14 @@
     if (match.status === 'done') detail = '胜者 · ' + esc((teams.find(function (t) { return t.id === match.winner; }) || {}).name || match.winner);
     else if (match.phase === 'OVERTIME_PENDING') detail = '三连环全平（胜场/总点数/GMV）· 待加赛';
     else if (match.phase === 'RESULT') detail = '本场结果结算中 · ' + esc(match.tieBreak || '胜场');
-    else if (match.phase === 'BATTLE') detail = '第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中');
+    else if (match.phase === 'BATTLE') detail = match.roundPhase === 'REVEAL' ? '6 局结果揭晓中' : '统一猜阵中';
     else detail = '等待开赛';
     var cells = [1, 2, 3, 4, 5, 6].map(function (n) {
       var entry = (match.rounds || []).find(function (r) { return r.round === n; });
-      var current = match.phase === 'BATTLE' && match.round === n;
-      var cls = entry ? (entry.winner ? 'is-' + String(entry.winner).toLowerCase() : 'is-draw') : current ? 'is-current' : '';
-      return '<div class="score-cell ' + cls + '"><i>' + n + '</i><b>' + (entry ? (entry.winner ? esc((entry.winner === 'A' ? a : b).name) : '平') : current ? '…' : '') + '</b></div>';
+      var cls = entry ? (entry.winner ? 'is-' + String(entry.winner).toLowerCase() : 'is-draw') : '';
+      return '<div class="score-cell ' + cls + '"><i>' + n + '</i><b>' + (entry ? (entry.winner ? esc((entry.winner === 'A' ? a : b).name) : '平') : '') + '</b></div>';
     }).join('');
-    return '<article class="watch-card tournament-card ' + (match.status === 'active' ? 'is-live' : 'is-history') + '"><small><span>' + esc(stage.label) + '</span><i>' + TournamentUI.status(match) + '</i></small><div><b>' + esc(a.name) + '</b><strong>' + Number(match.winsA || 0) + ' : ' + Number(match.winsB || 0) + '</strong><b>' + esc(b.name) + '</b></div><div class="score-cells admin-score-cells">' + cells + '</div><p>' + detail + '</p>' + (match.phase === 'OVERTIME_PENDING' ? '<button class="btn btn-primary" data-rematch-match="' + esc(match.id) + '">两队重赛（加赛）</button>' : '') + (match.status === 'active' && match.phase !== 'OVERTIME_PENDING' ? '<button class="btn btn-ghost btn-force" data-force-match="' + esc(match.id) + '">强制推进本局</button>' : '') + '</article>';
+    return '<article class="watch-card tournament-card ' + (match.status === 'active' ? 'is-live' : 'is-history') + '"><small><span>' + esc(stage.label) + '</span><i>' + TournamentUI.status(match) + '</i></small><div><b>' + esc(a.name) + '</b><strong>' + Number(match.winsA || 0) + ' : ' + Number(match.winsB || 0) + '</strong><b>' + esc(b.name) + '</b></div><div class="score-cells admin-score-cells">' + cells + '</div><p>' + detail + '</p>' + (match.phase === 'OVERTIME_PENDING' ? '<button class="btn btn-primary" data-rematch-match="' + esc(match.id) + '">两队重赛（加赛）</button>' : '') + (match.status === 'active' && match.phase !== 'OVERTIME_PENDING' ? '<button class="btn btn-ghost btn-force" data-force-match="' + esc(match.id) + '">强制推进</button>' : '') + '</article>';
   }
   function teamPlayerName(team, playerId) {
     var player = (team.players || []).find(function (candidate) { return candidate.id === playerId; });
@@ -299,16 +298,15 @@
     if (match.status === 'done') phaseText2 = '本场已结束';
     else if (match.phase === 'OVERTIME_PENDING') phaseText2 = '三连环全平 · 待加赛';
     else if (match.phase === 'RESULT') phaseText2 = '本场结果结算中';
-    else if (match.phase === 'BATTLE') phaseText2 = '第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '揭晓中' : '猜阵中');
+    else if (match.phase === 'BATTLE') phaseText2 = match.roundPhase === 'REVEAL' ? '结果揭晓中' : '统一猜阵中';
     else phaseText2 = '等待开赛';
     var flowTeams = (gameState && gameState.teams) || [];
     var flowA = flowTeams.find(function (t) { return t.id === match.a; }) || { name: match.a };
     var flowB = flowTeams.find(function (t) { return t.id === match.b; }) || { name: match.b };
     var cells = [1, 2, 3, 4, 5, 6].map(function (n) {
       var entry = (match.rounds || []).find(function (r) { return r.round === n; });
-      var current = match.phase === 'BATTLE' && match.round === n;
-      var cls = entry ? (entry.winner ? 'is-' + String(entry.winner).toLowerCase() : 'is-draw') : current ? 'is-current' : '';
-      return '<div class="score-cell ' + cls + '"><i>' + n + '</i><b>' + (entry ? (entry.winner ? esc((entry.winner === 'A' ? flowA : flowB).name) : '平') : current ? '…' : '') + '</b></div>';
+      var cls = entry ? (entry.winner ? 'is-' + String(entry.winner).toLowerCase() : 'is-draw') : '';
+      return '<div class="score-cell ' + cls + '"><i>' + n + '</i><b>' + (entry ? (entry.winner ? esc((entry.winner === 'A' ? flowA : flowB).name) : '平') : '') + '</b></div>';
     }).join('');
     return '<div class="flow-match-stage"><span>本队对局</span><b>' + esc(phaseText2) + '</b><small>比分 ' + Number(match.winsA || 0) + ' : ' + Number(match.winsB || 0) + (match.tieBreak ? ' · ' + esc(match.tieBreak) : '') + '</small></div>'
       + '<div class="score-cells admin-score-cells">' + cells + '</div>';

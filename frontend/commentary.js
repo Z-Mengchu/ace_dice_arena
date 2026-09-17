@@ -3,7 +3,7 @@
  * 纯原生 JS，挂 window.Commentary 全局（与 stage-panel.js 同一模式）。
  * Commentary.show(text, tone)：个人即时点评，tone ∈ 'good' | 'bad'。
  * Commentary.event({ kind, name, title, text })：场景事件气泡，kind 决定专属样式与图标：
- *   roll-big / roll-small / box-buff / box-debuff / reroll-up / reroll-down / guess-many / guess-few
+ *   roll-big / roll-small / box-buff / box-debuff / reroll-up / reroll-down
  * 队内频道展开时播报已在聊天列表里，气泡不再弹出；频道收起（或页面无频道）时气泡在小球上方弹出。
  * 气泡只是添头：内部全程 try/catch，任何异常都不影响主流程；容器 pointer-events:none，不遮挡居中卡片。
  */
@@ -22,8 +22,6 @@ import { icon } from './icons.js';
     'box-debuff':  { icon: 'gift',    title: '盲盒负面 debuff' },
     'reroll-up':   { icon: 'sparkle', title: '重掷点数上涨' },
     'reroll-down': { icon: 'warn',    title: '重掷点数下跌' },
-    'guess-many':  { icon: 'crystal', title: '猜阵命中多人' },
-    'guess-few':   { icon: 'crystal', title: '猜阵命中很少' },
     'good':        { icon: 'sparkle', title: '' },
     'bad':         { icon: 'warn',    title: '' }
   };

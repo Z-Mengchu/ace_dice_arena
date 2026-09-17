@@ -199,14 +199,14 @@ class DeadlockTimeoutTest {
         assertThat(root.has("stageDeadlineAt")).isFalse();
         ObjectNode match = match(root);
         assertThat(match.path("phase").asText()).isEqualTo("BATTLE");
-        assertThat(match.path("round").asInt()).isEqualTo(1);
+        assertThat(match.has("round")).isFalse();
         assertThat(match.path("roundPhase").asText()).isEqualTo("GUESS");
         assertThat(match.path("guessDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
         assertThat(match.path("rounds")).isEmpty();
     }
 
     @Test
-    void guessTimeoutRevealsTheRoundWithZeroHits() {
+    void guessTimeoutRevealsAllSixRoundsWithZeroHits() {
         ObjectNode root = battleState(1);
         ObjectNode match = match(root);
         match.put("guessDeadlineAt", System.currentTimeMillis() - 1);
@@ -216,6 +216,7 @@ class DeadlockTimeoutTest {
         assertThat(match.path("roundPhase").asText()).isEqualTo("REVEAL");
         assertThat(match.path("revealUntil").asLong()).isGreaterThan(System.currentTimeMillis());
         assertThat(match.has("guessDeadlineAt")).isFalse();
+        assertThat(match.path("rounds")).hasSize(6);
         JsonNode round = match.path("rounds").get(0);
         assertThat(round.path("round").asInt()).isEqualTo(1);
         assertThat(round.path("guessHitsA").asInt()).isZero();
@@ -225,7 +226,7 @@ class DeadlockTimeoutTest {
         assertThat(round.path("powerB").asDouble()).isEqualTo(5d);
         assertThat(round.path("critA").asBoolean()).isFalse();
         assertThat(round.path("winner").asText()).isEqualTo("A");
-        assertThat(match.path("winsA").asInt()).isEqualTo(1);
+        assertThat(match.path("winsA").asInt()).isEqualTo(6);
     }
 
     @Test
@@ -244,7 +245,7 @@ class DeadlockTimeoutTest {
             }
         });
 
-        service().revealRound(root, match);
+        service().revealAllRounds(root, match);
 
         JsonNode round = match.path("rounds").get(0);
         assertThat(round.path("critA").asBoolean()).isTrue();
@@ -254,24 +255,17 @@ class DeadlockTimeoutTest {
     }
 
     @Test
-    void revealTimeoutAdvancesToTheNextRoundAndTheSixthRevealProducesTheResult() {
+    void revealTimeoutProducesTheMatchResult() {
         ObjectNode root = battleState(1);
         ObjectNode match = match(root);
         match.put("roundPhase", "REVEAL");
         match.put("revealUntil", System.currentTimeMillis() - 1);
-
-        assertThat(service().completeRoundReveals(root, System.currentTimeMillis())).isTrue();
-        assertThat(match.path("round").asInt()).isEqualTo(2);
-        assertThat(match.path("roundPhase").asText()).isEqualTo("GUESS");
-        assertThat(match.path("guessDeadlineAt").asLong()).isGreaterThan(System.currentTimeMillis());
-
-        match.put("round", 6);
-        match.put("roundPhase", "REVEAL");
-        match.put("revealUntil", System.currentTimeMillis() - 1);
         match.put("winsA", 4).put("winsB", 1);
+
         assertThat(service().completeRoundReveals(root, System.currentTimeMillis())).isTrue();
         assertThat(match.path("phase").asText()).isEqualTo("RESULT");
         assertThat(match.path("winner").asText()).isEqualTo("t1");
+        assertThat(match.has("revealUntil")).isFalse();
         assertThat(match.path("resultReadyAt").asLong()).isGreaterThan(System.currentTimeMillis());
     }
 
@@ -417,7 +411,9 @@ class DeadlockTimeoutTest {
                 mock(com.acedicearena.repository.MatchReportRepository.class),
                 mock(com.acedicearena.repository.PlayerBlindBoxRepository.class),
                 mock(BlindBoxRoundService.class),
-                new GameStateSnapshotStore(states, mapper, mock(BlindBoxRoundService.class)),
+                mock(com.acedicearena.repository.PlayerGuessRepository.class),
+                new GameStateSnapshotStore(states, mapper, mock(BlindBoxRoundService.class),
+                        mock(GuessRoundService.class)),
                 mock(org.springframework.transaction.PlatformTransactionManager.class));
     }
 
@@ -439,22 +435,26 @@ class DeadlockTimeoutTest {
         }
         ObjectNode match = root.putObject("matches").putObject("g1");
         match.put("id", "g1"); match.put("a", "t1"); match.put("b", "t2");
-        match.put("winsA", 0); match.put("winsB", 0); match.put("round", 1);
+        match.put("winsA", 0); match.put("winsB", 0);
         match.put("status", "active"); match.put("phase", "PENDING");
         match.putArray("rounds");
         return root;
     }
 
-    /** BATTLE 阶段第 round 局：两队已分队且有掷骰数据（t1 全 6、t2 全 1，时刻都拉得很开不暴击）。 */
+    /** BATTLE 阶段统一猜阵窗口：两队已分队且有掷骰数据（t1 全 6、t2 全 1，时刻都拉得很开不暴击）。 */
     private ObjectNode battleState(int round) {
         ObjectNode root = state("BATTLE");
         root.path("teams").forEach(team -> formSquads((ObjectNode) team));
         giveDice(root);
         ObjectNode match = match(root);
-        match.put("phase", "BATTLE").put("round", round).put("roundPhase", "GUESS");
+        match.put("phase", "BATTLE").put("roundPhase", "GUESS");
         match.put("guessDeadlineAt", System.currentTimeMillis() + 30_000L);
-        match.putObject("guesses").putObject("A");
-        ((ObjectNode) match.path("guesses")).putObject("B");
+        ObjectNode guesses = match.putObject("guesses");
+        for (int r = 1; r <= 6; r++) {
+            ObjectNode bucket = guesses.putObject(String.valueOf(r));
+            bucket.putObject("A");
+            bucket.putObject("B");
+        }
         return root;
     }
 

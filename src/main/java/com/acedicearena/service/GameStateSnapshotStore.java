@@ -22,7 +22,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * 工作方式：
  * - 首个读者加载一次（双检锁），其余读者共享同一实例；
  * - 所有比赛/大厅事件的 afterCommit 先失效快照再广播（见 LobbyEventService）；
- * - 盲盒首开提交只推进运行态 revision：current() 逐请求做内存比较（不查库），
+ * - 盲盒首开/猜阵提交只推进各自的运行态 revision：current() 逐请求做内存比较（不查库），
  *   revision 变化即视为失效并重载注入；
  * - 每 5 秒低频 reconcile 查一次版本，作为人工改库/漏失效的兜底，不逐请求查库；
  * - 派生玩家/队伍视图（teamViews）挂在快照上，随主快照一起替换。
@@ -35,32 +35,38 @@ public class GameStateSnapshotStore {
     private final GameStateRepository gameStates;
     private final ObjectMapper mapper;
     private final BlindBoxRoundService blindBoxRounds;
+    private final GuessRoundService guessRounds;
     private final Object lock = new Object();
     private volatile Snapshot snapshot;
 
     public GameStateSnapshotStore(GameStateRepository gameStates, ObjectMapper mapper,
-                                  BlindBoxRoundService blindBoxRounds) {
+                                  BlindBoxRoundService blindBoxRounds, GuessRoundService guessRounds) {
         this.gameStates = gameStates;
         this.mapper = mapper;
         this.blindBoxRounds = blindBoxRounds;
+        this.guessRounds = guessRounds;
     }
 
-    /** 比赛状态快照：state 为行内 JSON 注入盲盒结果后的只读视图；teamViews 随快照整体替换。 */
-    public record Snapshot(boolean present, JsonNode state, long version, long blindRevision,
+    /** 比赛状态快照：state 为行内 JSON 注入盲盒/猜阵结果后的只读视图；teamViews 随快照整体替换。 */
+    public record Snapshot(boolean present, JsonNode state, long version, Revisions revisions,
                            Instant updatedAt, String updatedBy, long loadedAt,
                            ConcurrentHashMap<String, JsonNode> teamViews) {
     }
 
+    /** 运行态修订号（盲盒/猜阵写路径单调推进）：与快照一并保存，变化即视为失效并重载注入。 */
+    public record Revisions(long blind, long guess) {
+    }
+
     /**
-     * 读取当前快照：命中直接共享；失效（含盲盒 revision 变化）时双检锁内只重载一次。
+     * 读取当前快照：命中直接共享；失效（含盲盒/猜阵 revision 变化）时双检锁内只重载一次。
      * 命中路径只做内存比较，不访问数据库。
      */
     public Snapshot current() {
         Snapshot cached = snapshot;
-        if (cached != null && cached.blindRevision() == blindBoxRounds.revision()) return cached;
+        if (cached != null && cached.revisions().equals(currentRevisions())) return cached;
         synchronized (lock) {
             cached = snapshot;
-            if (cached != null && cached.blindRevision() == blindBoxRounds.revision()) return cached;
+            if (cached != null && cached.revisions().equals(currentRevisions())) return cached;
             Snapshot loaded = load();
             snapshot = loaded;
             return loaded;
@@ -107,18 +113,26 @@ public class GameStateSnapshotStore {
 
     private Snapshot load() {
         long loadedAt = System.currentTimeMillis();
-        long blindRevision = blindBoxRounds.revision();
+        Revisions revisions = currentRevisions();
         return gameStates.findById(STATE_ID)
                 .map(record -> {
                     JsonNode state = parse(record.getContent());
-                    // BLIND_BOX 阶段开盒结果在 player_blind_box 表/运行态，注入后再发布
-                    if (state instanceof ObjectNode root) blindBoxRounds.injectCommittedResults(root);
-                    return new Snapshot(true, state, record.getVersion(), blindRevision,
+                    if (state instanceof ObjectNode root) {
+                        // BLIND_BOX 阶段开盒结果在 player_blind_box 表/运行态，注入后再发布
+                        blindBoxRounds.injectCommittedResults(root);
+                        // BATTLE 统一猜阵窗口内的猜阵在 player_guess 表，同样注入
+                        guessRounds.injectCommittedGuesses(root);
+                    }
+                    return new Snapshot(true, state, record.getVersion(), revisions,
                             record.getUpdatedAt(), record.getUpdatedBy() == null ? "" : record.getUpdatedBy(),
                             loadedAt, new ConcurrentHashMap<>());
                 })
-                .orElseGet(() -> new Snapshot(false, mapper.createObjectNode(), 0, blindRevision,
+                .orElseGet(() -> new Snapshot(false, mapper.createObjectNode(), 0, revisions,
                         Instant.EPOCH, "", loadedAt, new ConcurrentHashMap<>()));
+    }
+
+    private Revisions currentRevisions() {
+        return new Revisions(blindBoxRounds.revision(), guessRounds.revision());
     }
 
     private JsonNode parse(String content) {

@@ -6,6 +6,7 @@ import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.UserAccountRepository;
 import com.acedicearena.service.BlindBoxRoundService;
 import com.acedicearena.service.GameStateSnapshotStore;
+import com.acedicearena.service.GuessRoundService;
 import com.acedicearena.service.LobbyEventService;
 import com.acedicearena.service.PlayerActionService;
 import com.acedicearena.service.ParallelTournamentService;
@@ -37,7 +38,8 @@ class PlayerActionServiceTest {
         BlindBoxRoundService blindBoxRounds = mock(BlindBoxRoundService.class);
         PlayerActionService service = new PlayerActionService(mock(GameStateRepository.class),
                 mock(UserAccountRepository.class), new ObjectMapper(), mock(LobbyEventService.class),
-                mock(ParallelTournamentService.class), blindBoxRounds, stubTransactions());
+                mock(ParallelTournamentService.class), blindBoxRounds, mock(GuessRoundService.class),
+                stubTransactions());
 
         assertThatThrownBy(() -> service.submit("player", "blind-box-open", List.of("x")))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -56,7 +58,7 @@ class PlayerActionServiceTest {
 
         PlayerActionService service = new PlayerActionService(states, users, new ObjectMapper(),
                 mock(LobbyEventService.class), mock(ParallelTournamentService.class),
-                mock(BlindBoxRoundService.class), stubTransactions());
+                mock(BlindBoxRoundService.class), mock(GuessRoundService.class), stubTransactions());
 
         assertThatThrownBy(() -> service.submit("afk_player", "role-vote", List.of("u1")))
                 .hasMessage("你当前处于挂机状态，请先取消挂机再操作");
@@ -64,12 +66,13 @@ class PlayerActionServiceTest {
     }
 
     @Test
-    void squadFormRerollSquadOrderRoundGuessDispatchAndBlindBoxGoesThroughRoundService() {
+    void squadFormRerollSquadOrderDispatchAndGuessAndBlindBoxGoThroughRoundServices() {
         GameStateRepository states = mock(GameStateRepository.class);
         UserAccountRepository users = mock(UserAccountRepository.class);
         LobbyEventService events = mock(LobbyEventService.class);
         ParallelTournamentService tournament = mock(ParallelTournamentService.class);
         BlindBoxRoundService blindBoxRounds = mock(BlindBoxRoundService.class);
+        GuessRoundService guessRounds = mock(GuessRoundService.class);
         ObjectMapper mapper = new ObjectMapper();
         UserAccount player = new UserAccount("player", "队员", "技术部", "USER", "hash", "salt");
         player.assignTeam("t1");
@@ -78,7 +81,7 @@ class PlayerActionServiceTest {
                 "{\"mode\":\"parallel\",\"stage\":\"TACTICS\",\"teams\":[{\"id\":\"t1\"}]}", "admin");
         when(states.findLockedById(1L)).thenReturn(Optional.of(record));
         PlayerActionService service = new PlayerActionService(states, users, mapper, events, tournament,
-                blindBoxRounds, stubTransactions());
+                blindBoxRounds, guessRounds, stubTransactions());
 
         service.submit("player", "squad-form", List.of("u1"));
         when(blindBoxRounds.open(eq("player"), isNull()))
@@ -91,7 +94,9 @@ class PlayerActionServiceTest {
         verify(tournament).dispatchPlayerAction(any(), eq(player), eq("squad-form"), eq(List.of("u1")));
         verify(tournament).dispatchPlayerAction(any(), eq(player), eq("reroll"), eq(List.of("u5")));
         verify(tournament).dispatchPlayerAction(any(), eq(player), eq("squad-order"), eq(List.of("3", "1", "2", "4", "5", "6")));
-        verify(tournament).dispatchPlayerAction(any(), eq(player), eq("round-guess"), eq(List.of("u101")));
+        // 猜阵直写 player_guess 表（不锁 game_state、不走动作分发表）
+        verify(guessRounds).submit("player", List.of("u101"));
+        verify(tournament, never()).dispatchPlayerAction(any(), any(), eq("round-guess"), any());
         // 开盲盒改走内存运行态模块，不再锁 game_state、不走动作分发表；未带序号时为 null
         verify(blindBoxRounds).open("player", null);
         verify(tournament, never()).dispatchPlayerAction(any(), any(), eq("blind-box-open"), any());
@@ -100,10 +105,10 @@ class PlayerActionServiceTest {
         assertThat(blindBody.get("blindBox")).isEqualTo(2);
         assertThat(blindBody.get("boxes")).isEqualTo(List.of(2, -1, 3));
         assertThat(blindBody.get("picked")).isEqualTo(0);
-        // blind 分支不触碰 game_state：锁行与保存只有其余 4 个动作
-        verify(states, times(4)).findLockedById(1L);
-        verify(states, times(4)).save(record);
-        verify(events, times(4)).gameChanged();
+        // blind/guess 分支不触碰 game_state：锁行与保存只有其余 3 个动作
+        verify(states, times(3)).findLockedById(1L);
+        verify(states, times(3)).save(record);
+        verify(events, times(3)).gameChanged();
     }
 
     @Test
@@ -119,7 +124,9 @@ class PlayerActionServiceTest {
                 mock(com.acedicearena.repository.MatchReportRepository.class),
                 mock(com.acedicearena.repository.PlayerBlindBoxRepository.class),
                 mock(BlindBoxRoundService.class),
-                new GameStateSnapshotStore(states, mapper, mock(BlindBoxRoundService.class)),
+                mock(com.acedicearena.repository.PlayerGuessRepository.class),
+                new GameStateSnapshotStore(states, mapper, mock(BlindBoxRoundService.class),
+                        mock(GuessRoundService.class)),
                 mock(PlatformTransactionManager.class));
         UserAccount player = new UserAccount("player", "队员", "技术部", "USER", "hash", "salt");
         player.assignTeam("t1");
@@ -129,7 +136,7 @@ class PlayerActionServiceTest {
         when(states.findLockedById(1L)).thenReturn(Optional.of(record));
         PlayerActionService service = new PlayerActionService(states, users, mapper,
                 mock(LobbyEventService.class), tournament,
-                mock(BlindBoxRoundService.class), stubTransactions());
+                mock(BlindBoxRoundService.class), mock(GuessRoundService.class), stubTransactions());
 
         for (String type : List.of("accumulation-roll", "prophet", "lineup", "pitcher-roll",
                 "attack-boost", "captain-command", "sandbox-ready", "sandbox-roll")) {
@@ -156,7 +163,7 @@ class PlayerActionServiceTest {
         when(states.findLockedById(1L)).thenReturn(Optional.of(record));
         PlayerActionService service = new PlayerActionService(states, users, mapper,
                 mock(LobbyEventService.class), tournament,
-                mock(BlindBoxRoundService.class), stubTransactions());
+                mock(BlindBoxRoundService.class), mock(GuessRoundService.class), stubTransactions());
 
         service.submit("sandbox_player", "role-vote", List.of("u1"));
 
@@ -178,7 +185,7 @@ class PlayerActionServiceTest {
         when(states.findLockedById(1L)).thenReturn(Optional.of(record));
 
         new PlayerActionService(states, users, new ObjectMapper(), events, tournament,
-                mock(BlindBoxRoundService.class), stubTransactions())
+                mock(BlindBoxRoundService.class), mock(GuessRoundService.class), stubTransactions())
                 .submit("voter", "role-vote", List.of("u1"));
 
         verify(events).adminGameChanged();
@@ -205,7 +212,7 @@ class PlayerActionServiceTest {
         }).when(tournament).dispatchPlayerAction(any(), same(player), eq("role-vote"), anyList());
 
         new PlayerActionService(states, users, new ObjectMapper(), events, tournament,
-                mock(BlindBoxRoundService.class), stubTransactions())
+                mock(BlindBoxRoundService.class), mock(GuessRoundService.class), stubTransactions())
                 .submit("last_voter", "role-vote", List.of("u1"));
 
         verify(events).teamGameChanged("t1");
@@ -233,7 +240,7 @@ class PlayerActionServiceTest {
         }).when(tournament).dispatchPlayerAction(any(), same(player), eq("role-vote"), anyList());
 
         new PlayerActionService(states, users, new ObjectMapper(), events, tournament,
-                mock(BlindBoxRoundService.class), stubTransactions())
+                mock(BlindBoxRoundService.class), mock(GuessRoundService.class), stubTransactions())
                 .submit("final_voter", "role-vote", List.of("u1"));
 
         verify(events).gameChangedNow();

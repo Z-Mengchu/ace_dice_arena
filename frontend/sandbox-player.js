@@ -35,7 +35,7 @@ import { icon } from './icons.js';
     if (match.status === 'done') detail = '胜者 · ' + (winner ? winner.name : match.winner) + (match.tieBreak && match.tieBreak !== '胜场' ? ' · 按' + match.tieBreak + '判定' : '');
     else if (match.phase === 'OVERTIME_PENDING') detail = '三连环全平 · 待加赛';
     else if (match.phase === 'RESULT') detail = '本场结果结算中 · ' + (match.tieBreak || '胜场');
-    else if (match.phase === 'BATTLE') detail = '第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中');
+    else if (match.phase === 'BATTLE') detail = match.roundPhase === 'REVEAL' ? '6 局结果揭晓中' : '6 局统一猜阵中';
     else detail = '等待开赛';
     return '<article class="watch-card tournament-card ' + (match.status === 'active' ? 'is-live' : 'is-history') + '"><small><span>' + esc(stage.label) + '</span><i>' + TournamentUI.status(match) + '</i></small><div><b>' + esc(teamName(match.a)) + '</b><strong>' + Number(match.winsA || 0) + ' : ' + Number(match.winsB || 0) + '</strong><b>' + esc(teamName(match.b)) + '</b></div><p>' + esc(detail) + '</p></article>';
   }
@@ -44,9 +44,8 @@ import { icon } from './icons.js';
     var rounds = match.rounds || [];
     return '<div class="score-cells">' + [1, 2, 3, 4, 5, 6].map(function (n) {
       var entry = rounds.find(function (r) { return r.round === n; });
-      var current = match.phase === 'BATTLE' && match.round === n;
-      var cls = entry ? (entry.winner ? (entry.winner === side ? 'is-win' : 'is-lose') : 'is-draw') : current ? 'is-current' : '';
-      return '<div class="score-cell ' + cls + '"><i>' + n + '</i><b>' + (entry ? (entry.winner ? (entry.winner === side ? '胜' : '负') : '平') : current ? '…' : '') + '</b></div>';
+      var cls = entry ? (entry.winner ? (entry.winner === side ? 'is-win' : 'is-lose') : 'is-draw') : '';
+      return '<div class="score-cell ' + cls + '"><i>' + n + '</i><b>' + (entry ? (entry.winner ? (entry.winner === side ? '胜' : '负') : '平') : '') + '</b></div>';
     }).join('') + '</div>';
   }
 
@@ -90,7 +89,7 @@ import { icon } from './icons.js';
     } else if (stage === 'BLIND_BOX') {
       var opened = (mine.players || []).filter(function (p) { return p.blindBox != null; }).length;
       body = '<div class="flow-detail"><span>已开</span><b>' + opened + ' / ' + (mine.players || []).length + '</b></div>';
-      copy = '每人手动选盲盒，档位随机、有惊喜也有减益，25 秒不点按 0 分，系统不会帮你开盒。';
+      copy = '每人手动选盲盒，档位随机、有惊喜也有减益，10 秒不点按 0 分，系统不会帮你开盒。';
     } else if (stage === 'TACTICS') {
       var limit = Math.min(mine.rerollQuota || 0, 5);
       body = '<div class="flow-detail"><span>重掷</span><b>' + Number(mine.rerollUsed || 0) + ' / ' + limit + '</b></div><div class="flow-detail"><span>出场顺序</span><b>' + (mine.squadOrderLocked ? '已锁定' : '待锁定') + '</b></div>';
@@ -104,7 +103,7 @@ import { icon } from './icons.js';
         if (match.status === 'done') detail = '胜者 · ' + esc(teamName(match.winner)) + (match.tieBreak && match.tieBreak !== '胜场' ? ' · 按' + match.tieBreak + '判定' : '');
         else if (match.phase === 'OVERTIME_PENDING') detail = '三连环全平 · 待加赛';
         else if (match.phase === 'RESULT') detail = '本场结果结算中 · ' + esc(match.tieBreak || '胜场');
-        else if (match.phase === 'BATTLE') detail = '第 ' + Number(match.round || 1) + ' 局 · ' + (match.roundPhase === 'REVEAL' ? '结果揭晓中' : '猜阵进行中');
+        else if (match.phase === 'BATTLE') detail = match.roundPhase === 'REVEAL' ? '6 局结果揭晓中' : '6 局统一猜阵中';
         else detail = '等待开赛';
         body = '<div class="sandbox-action-head"><div><b>' + esc(a.name) + ' ' + Number(match.winsA || 0) + ' : ' + Number(match.winsB || 0) + ' ' + esc(b.name) + '</b><span>' + esc(detail) + '</span></div></div>' + scoreCells(match, match.a === teamId ? 'A' : 'B') + roundsList(match, a, b);
         copy = '每局出战 5 人可以秘密猜敌方出战人员，猜中 1 人 +0.4 战力，单局上限 +10 分！田忌赛马，博弈拉满';

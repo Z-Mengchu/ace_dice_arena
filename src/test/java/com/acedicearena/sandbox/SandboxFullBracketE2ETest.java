@@ -227,7 +227,7 @@ class SandboxFullBracketE2ETest {
 
         sandbox.advance(admin);   // BLIND_BOX → TACTICS
         sandbox.advance(admin);   // TACTICS → BATTLE
-        sandbox.advance(admin);   // 第 1 局 GUESS → REVEAL
+        sandbox.advance(admin);   // 统一猜阵 → 6 局整批 REVEAL
         state = sandbox.fetchState(admin);
         JsonNode round = SandboxE2ESupport.matchOf(state, "g1").path("rounds").get(0);
         assertThat(round.path("critA").asBoolean()).as("5 真人 ≤500ms 连掷应触发同步暴击").isTrue();
@@ -252,7 +252,7 @@ class SandboxFullBracketE2ETest {
         sandbox.playerAction(opener, "blind-box-open", List.of());
         state = sandbox.fetchState(admin);
         JsonNode opened = playerOf(SandboxE2ESupport.teamOf(state, "t1"), openerId);
-        assertThat(opened.path("blindBox").asInt()).isBetween(-2, 3);
+        assertThat(opened.path("blindBox").asInt()).isBetween(-2, 5);
         assertThat(opened.path("blindBoxOpened").asBoolean()).isTrue();
         assertThat(opened.has("autoOpened")).isFalse();
 
@@ -304,15 +304,13 @@ class SandboxFullBracketE2ETest {
         List<String> enemySquadB = new ArrayList<>();
         team2.path("squads").get(0).forEach(id -> enemySquadB.add(id.asText()));
 
-        // 猜阵：非出战成员被拒；出战小队 5 人各猜中敌方出战 5 人 → 25 人次 ×0.4 触发单局上限 10
-        JsonNode outsider = null;
-        for (JsonNode p : team1.path("players")) {
-            if (!squadA.contains(p.path("id").asText())) { outsider = p; break; }
-        }
-        MockHttpSession notPlaying = sandbox.login(
-                SandboxE2ESupport.usernameOfPlayer(team1, outsider.path("id").asText()),
+        // 统一猜阵：每人提交本人所在局的猜测；2 号出战位小队成员的猜阵进入第 2 局分桶
+        String squad2MemberId = team1.path("squads").get(1).get(0).asText();
+        MockHttpSession squad2Session = sandbox.login(
+                SandboxE2ESupport.usernameOfPlayer(team1, squad2MemberId),
                 SandboxE2ESupport.PLAYER_PASSWORD);
-        playerActionRaw(notPlaying, "round-guess", enemySquadB, 409);
+        sandbox.playerAction(squad2Session, "round-guess", enemySquadB);
+        // 1 号出战位小队 5 人各猜中敌方 1 号小队 5 人 → 第 1 局 25 人次 ×0.4 触发单局上限 10
         for (String memberId : squadA) {
             MockHttpSession member = sandbox.login(SandboxE2ESupport.usernameOfPlayer(team1, memberId),
                     SandboxE2ESupport.PLAYER_PASSWORD);
@@ -321,9 +319,10 @@ class SandboxFullBracketE2ETest {
         state = sandbox.fetchState(admin);
         JsonNode match = SandboxE2ESupport.matchOf(state, "g1");
         assertThat(match.path("roundPhase").asText()).as("B 方未交齐，不应提前揭晓").isEqualTo("GUESS");
-        assertThat(match.at("/guesses/A").size()).isEqualTo(5);
+        assertThat(match.at("/guesses/1/A").size()).isEqualTo(5);
+        assertThat(match.at("/guesses/2/A").size()).isEqualTo(1);
 
-        sandbox.advance(admin);   // 第 1 局 GUESS → REVEAL
+        sandbox.advance(admin);   // 统一猜阵 → 6 局整批 REVEAL
         state = sandbox.fetchState(admin);
         JsonNode round = SandboxE2ESupport.matchOf(state, "g1").path("rounds").get(0);
         assertThat(round.path("guessHitsA").asInt()).isEqualTo(25);
@@ -344,7 +343,7 @@ class SandboxFullBracketE2ETest {
                     "{\"firstUsername\":\"e2e_view_a\",\"firstTeamId\":\"t1\",\"firstIdentity\":\"front\","
                             + "\"secondUsername\":\"e2e_view_b\",\"secondTeamId\":\"t2\",\"secondIdentity\":\"front\"}", 200);
 
-            // 双人沙盘禁用 advance()，直接驱动状态机到第 1 局 GUESS（指定玩家后阶段位置不确定，按状态循环推进）
+            // 双人沙盘禁用 advance()，直接驱动状态机到 BATTLE 统一猜阵（指定玩家后阶段位置不确定，按状态循环推进）
             for (int step = 0; step < 8; step++) {
                 JsonNode current = sandbox.fetchState(admin);
                 if ("BATTLE".equals(current.path("stage").asText())) break;
@@ -372,7 +371,7 @@ class SandboxFullBracketE2ETest {
             assertThat(viewA).as("指定沙盘玩家应能读取比赛状态").isNotNull();
             JsonNode viewMatch = SandboxE2ESupport.matchOf(viewA, "g1");
             assertThat(viewMatch.has("guesses")).isFalse();
-            assertThat(viewMatch.at("/guessStatus/A/" + submitterId).asBoolean()).isTrue();
+            assertThat(viewMatch.at("/guessStatus/1/A/" + submitterId).asBoolean()).isTrue();
             JsonNode viewOwn = SandboxE2ESupport.teamOf(viewA, "t1");
             assertThat(viewOwn.path("squads").size()).isEqualTo(6);
             assertThat(viewOwn.path("players").get(0).has("dice")).isTrue();

@@ -5,6 +5,7 @@ import com.acedicearena.domain.UserAccount;
 import com.acedicearena.repository.GameControlRepository;
 import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.PlayerBlindBoxRepository;
+import com.acedicearena.repository.PlayerGuessRepository;
 import com.acedicearena.repository.UserAccountRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
@@ -25,6 +26,7 @@ public class AdminTestModeService {
     private final GameControlRepository controls;
     private final GameStateRepository states;
     private final PlayerBlindBoxRepository blindBoxes;
+    private final PlayerGuessRepository guesses;
     private final LobbyService lobby;
     private final ParallelTournamentService tournament;
     private final LobbyEventService events;
@@ -34,6 +36,7 @@ public class AdminTestModeService {
     public AdminTestModeService(@Value("${app.test-mode.enabled:false}") boolean enabled,
                                 UserAccountRepository users, GameControlRepository controls,
                                 GameStateRepository states, PlayerBlindBoxRepository blindBoxes,
+                                PlayerGuessRepository guesses,
                                 LobbyService lobby,
                                 ParallelTournamentService tournament, LobbyEventService events,
                                 ObjectMapper mapper, BlindBoxRoundService blindBoxRounds) {
@@ -42,6 +45,7 @@ public class AdminTestModeService {
         this.controls = controls;
         this.states = states;
         this.blindBoxes = blindBoxes;
+        this.guesses = guesses;
         this.lobby = lobby;
         this.tournament = tournament;
         this.events = events;
@@ -214,6 +218,7 @@ public class AdminTestModeService {
         users.deleteAll(users.findAll().stream().filter(AdminTestModeService::isTestUser).toList());
         users.flush();
         blindBoxes.deleteAll();
+        guesses.deleteAll();
         if (record != null) states.delete(record);
         control().changePhase("PREPARING");
         // 数据库事务提交后才清空盲盒运行态；回滚时旧 context 仍可用

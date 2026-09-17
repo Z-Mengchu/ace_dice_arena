@@ -2,8 +2,8 @@
  * 骰子擂台 · 田忌赛马 —— 队员端（player.html）
  * 纯原生 JS，无模块。
  * 流程：查询掷骰资格 → 领取令牌 + NTP 式时钟校准（后台无感）→ 本地渲染 321 倒计时
- * → 30 秒窗口内点击【掷！】→ 展示个人点数并等待全队 → 开盲盒（每人一次）
- * → 对局阶段逐轮猜阵（本轮出战小队成员）→ 本队赛程结束后引导回队伍大厅。
+ * → 10 秒窗口内点击【掷！】→ 展示个人点数并等待全队 → 开盲盒（每人一次）
+ * → 对局阶段全员 30 秒统一猜阵（猜敌方本人局出战 5 人），6 局结果同屏揭晓 → 本队赛程结束后引导回队伍大厅。
  * 阶段倒计时与动态状态统一由右侧阶段面板（stage-panel.js）承载；队长重投结果以弹窗通知本队队员；
  * 顶部队名默认收起为按钮，点击才展开战队信息弹层（纯前端，不发请求）。
  */
@@ -124,8 +124,7 @@ import { icon } from './icons.js';
     notice: '',
     errText: '',
     guessSel: [],             // 猜阵已选中的敌方球员 id（最多 5 个）
-    guessKey: '',             // 当前猜阵所属 matchId:round 或 matchId:pre:round，变化时清空 guessSel
-    preEdit: false,           // 已提前提交猜阵后点"改投"进入的重选模式
+    guessKey: '',             // 当前猜阵所属 matchId，变化时清空 guessSel
     battleKey: ''             // 对局视图结构指纹：未变化时只就地刷新人数/倒计时，避免打断点选
   };
   var es = null;
@@ -137,18 +136,6 @@ import { icon } from './icons.js';
   var rerollBaseline = -1;      // 首次见到本队重掷日志时只建基线，不弹历史记录；日志重置（下一 bracket）时重建
   var rerollQueue = [];
   var rerollShowing = false;
-
-  /* ---------- 本人猜阵提交留痕：与 lobby.js 共用同一份 sessionStorage，跨页揭晓时大厅据此选用第一人称点评文案 ---------- */
-
-  var GUESS_LOG_KEY = 'dice-arena-guess-submitted-v1';
-  var guessSubmittedLog = loadJsonStore(GUESS_LOG_KEY);   // 本人猜阵提交标记（matchId:round），揭晓时 guessStatus 已清空，需本地留痕
-
-  function loadJsonStore(key) {
-    try { return JSON.parse(sessionStorage.getItem(key)) || {}; } catch (e) { return {}; }
-  }
-  function saveJsonStore(key, obj) {
-    try { sessionStorage.setItem(key, JSON.stringify(obj)); } catch (e) { }
-  }
 
   function loadMy() {
     try {
@@ -752,7 +739,7 @@ import { icon } from './icons.js';
     if (ui.sub === 'blindbox' && ui.boxAnimating) return;
     // 投骰动画播放中同理：立方体 DOM 由动画托管，落定后再切 rolled 结果卡
     if (ui.rollAnimating) return;
-    if (ui.sub !== 'battle') { ui.battleKey = ''; ui.preEdit = false; }
+    if (ui.sub !== 'battle') { ui.battleKey = ''; }
     var h = '';
     if (ui.sub === 'calibrating') {
       h = '<div class="pl-wait"><span class="big-ico">' + icon('loading') + '</span>正在校准设备时钟…<br><small>宝子啥都不用干</small></div>';
@@ -943,7 +930,7 @@ import { icon } from './icons.js';
         '<small>本队进度 ' + opened + ' / ' + players.length + ' · 全员开完进入队长战术环节</small></div>' +
         '<p class="pl-deadline-hint">剩余时间查看右侧面板</p>';
     } else {
-      h += '<div class="pl-sub">3 选 1！档位完全随机，惊喜与减益全拼手气，每人只能开 1 次！25 秒不选直接算放弃（计 0 分），系统不会代开！</div>' +
+      h += '<div class="pl-sub">3 选 1！档位完全随机，惊喜与减益全拼手气，每人只能开 1 次！10 秒不选直接算放弃（计 0 分），系统不会代开！</div>' +
         (ui.notice ? '<div class="pl-status warn">' + esc(ui.notice) + '</div>' : '') +
         window.BlindBoxUI.boxesHTML() +
         '<p class="pl-deadline-hint">剩余时间看右侧阶段面板</p>';
@@ -992,31 +979,30 @@ import { icon } from './icons.js';
     if (!team || !match) return null;
     var side = match.a === team.id ? 'A' : 'B';
     var enemy = findTeamById(side === 'A' ? match.b : match.a);
-    var round = match.round || 1;
     var squads = team.squads || [];
-    var squad = squads[round - 1] || [];
     var pid = myPlayerId();
-    var inSquad = false;
-    for (var i = 0; i < squad.length; i++) if (String(squad[i]) === pid) inSquad = true;
+    // 每位队员只属于一个 squad，squad 序号即本人局号（1~6），统一窗口内提交的就是本人局的猜阵
     var myRound = 0;
     for (var k = 0; k < squads.length && k < 6; k++) {
       if ((squads[k] || []).indexOf(pid) >= 0) { myRound = k + 1; break; }
     }
-    var sideStatus = (match.guessStatus && match.guessStatus[side]) || {};
-    var submitted = !!sideStatus[pid];
-    var preSide = myRound > round && match.preGuessStatus && match.preGuessStatus[myRound] && match.preGuessStatus[myRound][side];
-    var preSubmitted = !!(preSide && preSide[pid]);
-    var key = ['battle', match.id, match.status, match.phase, match.round, match.roundPhase, submitted, preSubmitted].join('|');
-    return { team: team, match: match, side: side, enemy: enemy, round: round,
-      squad: squad, inSquad: inSquad, myRound: myRound, submitted: submitted, preSubmitted: preSubmitted, key: key };
+    var submitted = !!(myRound && match.guessStatus && match.guessStatus[myRound] &&
+      match.guessStatus[myRound][side] && match.guessStatus[myRound][side][pid]);
+    var key = ['battle', match.id, match.status, match.phase, match.roundPhase, submitted].join('|');
+    return { team: team, match: match, side: side, enemy: enemy,
+      squads: squads, myRound: myRound, submitted: submitted, key: key };
   }
 
+  /** 猜阵进度聚合：guessStatus 按局分桶（{"1":{A:{...},B:{...}},...}），各侧为 6 个桶的键数之和 */
   function guessCounts(match) {
     var gs = match.guessStatus || {};
     var counts = { A: 0, B: 0 };
-    for (var side in counts) {
-      var s = gs[side] || {};
-      for (var k in s) counts[side]++;
+    for (var rk in gs) {
+      var bucket = gs[rk] || {};
+      for (var side in counts) {
+        var s = bucket[side] || {};
+        for (var k in s) counts[side]++;
+      }
     }
     return counts;
   }
@@ -1025,18 +1011,14 @@ import { icon } from './icons.js';
     var counts = guessCounts(battle.match);
     var mine = battle.side === 'A' ? counts.A : counts.B;
     var theirs = battle.side === 'A' ? counts.B : counts.A;
-    return '我方已交 ' + mine + ' / 5 · 对方已交 ' + theirs + ' / 5';
+    return '我方已交 ' + mine + ' / 30 · 对方已交 ' + theirs + ' / 30';
   }
 
-  /** 猜阵 5 秒下限提示：交齐后最快 5 秒揭晓；已交齐且未满 5 秒时提示"马上揭榜（最少等待 5 秒）" */
+  /** 交齐宽限提示：双方 30 人全部交齐后再等 5 秒揭晓；交齐时剩余不足 5 秒则按原倒计时到点揭晓 */
   function guessRevealLine(battle) {
     var counts = guessCounts(battle.match);
-    if (counts.A >= 5 && counts.B >= 5) {
-      var openedAt = Number(battle.match.guessOpenedAt || 0);
-      if (openedAt && serverNow() < openedAt + 5000) return '双方提交完毕，马上揭榜（最少等待 5 秒）';
-      return '双方提交完毕，马上揭榜';
-    }
-    return '两边全部交齐，最快 5 秒揭晓结果';
+    if (counts.A >= 30 && counts.B >= 30) return '双方提交完毕，即将揭榜（交齐后 5 秒，剩余不足 5 秒按原倒计时）';
+    return '两边全部交齐后 5 秒揭晓结果';
   }
 
   function updateGuessCounts(battle) {
@@ -1059,12 +1041,11 @@ import { icon } from './icons.js';
     for (var n = 1; n <= 6; n++) {
       var entry = null;
       for (var i = 0; i < rounds.length; i++) if (Number(rounds[i].round) === n) { entry = rounds[i]; break; }
-      var current = match.status === 'active' && match.phase === 'BATTLE' && Number(match.round) === n;
       var cls = '', mark = '';
       if (entry) {
         if (entry.winner) { cls = entry.winner === side ? 'is-win' : 'is-lose'; mark = cls === 'is-win' ? '胜' : '负'; }
         else { cls = 'is-draw'; mark = '平'; }
-      } else if (current) cls = 'is-current';
+      }
       cells += '<div class="arena-cell ' + cls + '"><i>第 ' + n + ' 局</i><b>' + mark + '</b></div>';
     }
     return '<div class="arena-cells pl-track">' + cells + '</div>';
@@ -1082,39 +1063,33 @@ import { icon } from './icons.js';
         '<small>下一轮掷骰倒计时，页面会自动跳转</small></div></div>';
     }
     var h = '<div id="pl-battle">' +
-      '<div class="pl-title" style="font-size:24px">' + icon('swords') + ' 第 ' + battle.round + ' / 6 局开战预警！</div>' +
+      '<div class="pl-title" style="font-size:24px">' + icon('swords') + ' 第六阶段 · 统一猜阵</div>' +
       battleScoreHTML(match, battle.side) + plTrackHtml(match, battle.side);
     if (match.roundPhase === 'REVEAL') return h + battleRevealHTML(battle) + '</div>';
-    // GUESS：密封猜阵，双方各 5 份
+    // GUESS：6 局统一 30 秒密封猜阵窗口，人人提交本人局（squad 序号）的猜阵，窗口内可改投 / 撤回
     h += '<div class="pl-guess-counts" id="pl-guess-counts">' + esc(guessCountsText(battle)) + '</div>' +
       '<p class="pl-guess-min" id="pl-guess-min">' + esc(guessRevealLine(battle)) + '</p>' +
       '<p class="pl-deadline-hint">剩余时间看右侧阶段面板</p>';
     if (battle.submitted) {
       h += '<div class="pl-wait"><span class="big-ico">' + icon('lock') + '</span>猜阵已经悄悄提交，坐等揭榜<br>' +
-        '<small>两边 5 份全部提交后最快 5 秒公布，倒计时结束强制揭晓，不等晚到的小伙伴</small></div>';
-    } else if (battle.inSquad) {
-      h += guessGridHTML(battle);
+        '<small>倒计时结束 6 局结果同屏揭晓；窗口内可随时撤回重选，不等晚到的小伙伴</small></div>' +
+        '<div class="pl-foot"><button id="pl-guess-retract" class="btn btn-ghost">撤回猜阵</button></div>';
     } else {
-      h += '<div class="pl-wait"><span class="big-ico">' + icon('eye') + '</span>本轮你的小队不上场，沉浸式观战！<br>' +
-        '<small>第 ' + battle.round + ' 局猜阵中，出战队友正在提交猜测</small></div>';
+      h += guessGridHTML(battle);
     }
-    // 提前猜阵：本人小队出战第 2~6 局且非本局时，可提前提交该局猜阵
-    if (!battle.inSquad && battle.myRound > battle.round && battle.myRound >= 2) h += preGuessHTML(battle);
     return h + '</div>';
   }
 
   /** 敌方 30 人花名册点选 5 人（敌方点数与小队编排按规则对玩家不可见）；
-   *  preRound 传入时渲染"提前猜阵"模式，guessKey 与当前轮区分开，避免点选状态串台 */
-  function guessGridHTML(battle, preRound) {
+   *  guessKey 以 matchId 为键，换场时清空点选状态，避免串台 */
+  function guessGridHTML(battle) {
     var enemyPlayers = (battle.enemy && battle.enemy.players) || [];
-    var guessKey = preRound ? battle.match.id + ':pre:' + preRound : battle.match.id + ':' + battle.round;
+    var guessKey = battle.match.id + ':guess';
     if (ui.guessKey !== guessKey) {
       ui.guessKey = guessKey;
       ui.guessSel = [];
     }
-    var h = '<div class="pl-sub">' + (preRound
-      ? '第 ' + preRound + ' 局你的战场！选出敌方该局出战 5 人'
-      : icon('crystal', 16) + ' 轮到你出战！猜一猜敌方本局上场 5 人') + '</div>' +
+    var h = '<div class="pl-sub">' + icon('crystal', 16) + ' 你出战第 ' + battle.myRound + ' 局！猜一猜敌方该局上场 5 人</div>' +
       (ui.notice ? '<div class="pl-status warn">' + esc(ui.notice) + '</div>' : '') +
       '<div class="pl-roster">';
     for (var i = 0; i < enemyPlayers.length; i++) {
@@ -1127,23 +1102,8 @@ import { icon } from './icons.js';
     h += '</div>' +
       '<div class="pl-guess-foot"><span id="pl-guess-n">已选 ' + ui.guessSel.length + ' / 5</span>' +
       '<button id="pl-guess-submit" class="btn btn-primary btn-xl"' + (ui.guessSel.length === 5 ? '' : ' disabled') + '>' +
-      (preRound ? '提前提交猜阵' : '密封提交猜阵') + '</button></div>';
+      '密封提交猜阵</button></div>';
     return h;
-  }
-
-  /** 提前猜阵区块：已提交显示撤回/改投，否则复用猜阵点选网格 */
-  function preGuessHTML(battle) {
-    if (battle.preSubmitted && !ui.preEdit) {
-      return '<div class="pl-preguess">' +
-        '<div class="pl-sub">第 ' + battle.myRound + ' 局出战 · 已提前提交，支持撤回 / 改投</div>' +
-        '<div class="pl-wait"><span class="big-ico">' + icon('lock') + '</span>提前猜阵已保密提交<br>' +
-        '<small>第 ' + battle.myRound + ' 局开局自动生效</small></div>' +
-        '<div class="pl-foot"><button id="pl-preguess-retract" class="btn btn-ghost">撤回提前猜阵</button>' +
-        '<button id="pl-preguess-edit" class="btn btn-primary">改投</button></div></div>';
-    }
-    return '<div class="pl-preguess">' +
-      '<div class="pl-sub">' + icon('crystal', 16) + ' 提前猜阵 · 你第 ' + battle.myRound + ' 局会上场，可以提前预判对手！</div>' +
-      guessGridHTML(battle, battle.myRound) + '</div>';
   }
 
   /** 点选只改按钮状态与计数，不触发整页重绘，避免被 SSE 刷新打断 */
@@ -1169,14 +1129,8 @@ import { icon } from './icons.js';
     }
     var submit = $('#pl-guess-submit');
     if (submit) submit.onclick = doGuessSubmit;
-    var preRetract = $('#pl-preguess-retract');
-    if (preRetract) preRetract.onclick = doPreGuessRetract;
-    var preEdit = $('#pl-preguess-edit');
-    if (preEdit) preEdit.onclick = function () {
-      ui.preEdit = true;
-      ui.battleKey = '';   // 强制重绘为可点选的网格
-      paintStage();
-    };
+    var retract = $('#pl-guess-retract');
+    if (retract) retract.onclick = doGuessRetract;
   }
 
   function doGuessSubmit() {
@@ -1184,14 +1138,7 @@ import { icon } from './icons.js';
     var submit = $('#pl-guess-submit');
     if (submit) submit.disabled = true;
     ui.notice = '';
-    var type = ui.guessKey.indexOf(':pre:') >= 0 ? 'pre-guess' : 'round-guess';
-    api('/api/lobby/player-action', { type: type, selections: ui.guessSel.slice() }).then(function () {
-      if (type === 'pre-guess') { ui.preEdit = false; ui.battleKey = ''; }
-      // 本地留痕本人提交过猜阵（揭晓时服务端 guessStatus 已清空，点评据此判断是否播放）
-      try {
-        var gk = String(ui.guessKey || '').replace(':pre:', ':');
-        if (gk) { guessSubmittedLog[gk] = 1; saveJsonStore(GUESS_LOG_KEY, guessSubmittedLog); }
-      } catch (e) { }
+    api('/api/lobby/player-action', { type: 'round-guess', selections: ui.guessSel.slice() }).then(function () {
       refreshAssignment();
     }).catch(function (err) {
       if (submit) submit.disabled = false;
@@ -1202,11 +1149,10 @@ import { icon } from './icons.js';
     });
   }
 
-  function doPreGuessRetract() {
-    var btn = $('#pl-preguess-retract');
+  function doGuessRetract() {
+    var btn = $('#pl-guess-retract');
     if (btn) btn.disabled = true;
     ui.notice = '';
-    ui.preEdit = false;
     api('/api/lobby/player-action', { type: 'retract-guess', selections: [] }).then(function () {
       ui.battleKey = '';
       refreshAssignment();
@@ -1219,32 +1165,35 @@ import { icon } from './icons.js';
     });
   }
 
-  /** REVEAL：刚揭晓一局的双方战力明细（按需加载的单场详情 rounds 末条） */
+  /** REVEAL：6 局结果同屏揭晓（摘要 rounds 只有局号与胜负，无 powerA 时按需拉单场详情显示加载中） */
   function battleRevealHTML(battle) {
     var match = battle.match;
     var detail = matchDetails[matchDetailKey(match)];
     var rounds = detail ? (detail.rounds || []) : (match.rounds || []);
-    var last = rounds[rounds.length - 1];
-    if (last && last.powerA == null) last = null;   // 摘要条目没有战力明细，等详情接口
-    if (!last) {
+    var full = rounds.length > 0 && rounds[0].powerA != null;
+    if (!full) {
       loadMatchDetail(match, function () { ui.battleKey = ''; paintStage(); });
-      return '<div class="pl-wait">本局结果加载中…</div>';
+      return '<div class="pl-wait">6 局结果加载中…</div>';
     }
     var nameA = teamNameOf(match.a);
     var nameB = teamNameOf(match.b);
-    var winSide = last.winner || null;
-    function sideHTML(side, name) {
-      var crit = last['crit' + side];
+    function sideHTML(entry, side, name, winSide) {
+      var crit = entry['crit' + side];
       return '<div class="pl-reveal-side' + (winSide === side ? ' win' : '') + '">' +
         '<h4>' + esc(name) + '</h4>' +
-        '<div class="pl-reveal-power">' + esc(last['power' + side]) + '</div>' +
-        '<small>基础 ' + esc(last['base' + side]) + (crit ? ' · ' + icon('sparkle', 16) + ' 暴击 ×1.5' : '') +
-        ' · 猜中 ' + esc(last['guessHits' + side]) + ' 人次 · 加成 +' + esc(last['guessBonus' + side]) + '</small></div>';
+        '<div class="pl-reveal-power">' + esc(entry['power' + side]) + '</div>' +
+        '<small>基础 ' + esc(entry['base' + side]) + (crit ? ' · ' + icon('sparkle', 16) + ' 暴击 ×1.5' : '') +
+        ' · 猜中 ' + esc(entry['guessHits' + side]) + ' 人次 · 加成 +' + esc(entry['guessBonus' + side]) + '</small></div>';
     }
-    return '<div class="pl-status' + (winSide ? '' : ' warn') + '" style="text-align:center">第 ' + esc(last.round) + ' 局 / ' +
-      (winSide ? esc(winSide === 'A' ? nameA : nameB) + ' 胜利' : '平局') + '</div>' +
-      '<div class="pl-reveal-sides">' + sideHTML('A', nameA) + sideHTML('B', nameB) + '</div>' +
-      '<p class="pl-deadline-hint">冲向下一局！</p>';
+    var h = '<div class="pl-sub">' + icon('crystal', 16) + ' 6 局结果同时揭晓</div>';
+    for (var i = 0; i < rounds.length; i++) {
+      var entry = rounds[i];
+      var winSide = entry.winner || null;
+      h += '<div class="pl-status' + (winSide ? '' : ' warn') + '" style="text-align:center">第 ' + esc(entry.round) + ' 局 / ' +
+        (winSide ? esc(winSide === 'A' ? nameA : nameB) + ' 胜利' : '平局') + '</div>' +
+        '<div class="pl-reveal-sides">' + sideHTML(entry, 'A', nameA, winSide) + sideHTML(entry, 'B', nameB, winSide) + '</div>';
+    }
+    return h + '<p class="pl-deadline-hint">即将进入结算</p>';
   }
 
   /** 本场打完（RESULT/FINISHED/OVERTIME_PENDING）：胜者、比分与平局链提示 */
@@ -1459,18 +1408,10 @@ import { icon } from './icons.js';
       if (match && match.status === 'active') {
         if (match.phase === 'RESULT') {
           deadline = Number(match.resultReadyAt || 0) || deadline;
-          extra = '本场比赛结果展示中';
+          extra = '本场结果展示中';
         } else if (match.phase === 'BATTLE') {
-          deadline = match.roundPhase === 'REVEAL' ? (Number(match.revealUntil || 0) || deadline) : (Number(match.guessDeadlineAt || 0) || deadline);
-          var roundNo = Number(match.round || 1);
-          if (match.roundPhase === 'REVEAL') {
-            extra = '第 ' + roundNo + '/6 局｜结果揭晓';
-          } else {
-            var battle = battleInfo();
-            extra = battle && !battle.inSquad
-              ? '第 ' + roundNo + '/6 局｜本轮不出战，观战中'
-              : '第 ' + roundNo + '/6 局｜猜阵 ing';
-          }
+          deadline = match.roundPhase === 'REVEAL' ? (Number(match.revealUntil || 0) || deadline) : (Number(match.guessRevealAt || match.guessDeadlineAt || 0) || deadline);
+          extra = match.roundPhase === 'REVEAL' ? '6 局结果揭晓中' : '6 局统一猜阵中';
         }
       }
     } else if (stage === 'BLIND_BOX') {

@@ -26,11 +26,20 @@ class GameDataControllerCacheTest {
     private GameDataController newController(GameStateRepository states, UserAccountRepository users,
                                           ParallelTournamentService tournament,
                                           com.acedicearena.service.BlindBoxRoundService blindBoxRounds) {
+        return newController(states, users, tournament, blindBoxRounds,
+                mock(com.acedicearena.service.GuessRoundService.class));
+    }
+
+    private GameDataController newController(GameStateRepository states, UserAccountRepository users,
+                                          ParallelTournamentService tournament,
+                                          com.acedicearena.service.BlindBoxRoundService blindBoxRounds,
+                                          com.acedicearena.service.GuessRoundService guessRounds) {
         return new GameDataController(new com.acedicearena.service.GameDataService(states,
                 mock(BattleReportRepository.class),
                 new ObjectMapper(), mock(LobbyEventService.class), users, tournament,
                 mock(MatchReportRepository.class),
-                new com.acedicearena.service.GameStateSnapshotStore(states, new ObjectMapper(), blindBoxRounds),
+                new com.acedicearena.service.GameStateSnapshotStore(states, new ObjectMapper(), blindBoxRounds,
+                        guessRounds),
                 1000));
     }
 
@@ -96,7 +105,7 @@ class GameDataControllerCacheTest {
         String etag = first.getHeaders().getETag();
         var unchanged = controller.getGameState(null, etag, admin);
 
-        assertThat(etag).isEqualTo("\"game-state-1-0-admin\"");
+        assertThat(etag).isEqualTo("\"game-state-1-0-0-admin\"");
         assertThat(unchanged.getStatusCode().value()).isEqualTo(304);
         assertThat(unchanged.getBody()).isNull();
         verify(states, times(1)).findById(1L);
@@ -118,22 +127,50 @@ class GameDataControllerCacheTest {
 
         var before = controller.getGameState(null, null, admin);
         String etagBefore = before.getHeaders().getETag();
-        assertThat(etagBefore).isEqualTo("\"game-state-1-0-admin\"");
+        assertThat(etagBefore).isEqualTo("\"game-state-1-0-0-admin\"");
         assertThat(controller.getGameState(null, etagBefore, admin).getStatusCode().value()).isEqualTo(304);
 
         // 首次开盒提交：blind revision +1，旧 ETag 回源得到 200 与新 ETag；body 的 version 仍是状态版本 long
         blindRevision.incrementAndGet();
         var after = controller.getGameState(null, etagBefore, admin);
         assertThat(after.getStatusCode().value()).isEqualTo(200);
-        assertThat(after.getHeaders().getETag()).isEqualTo("\"game-state-1-1-admin\"");
+        assertThat(after.getHeaders().getETag()).isEqualTo("\"game-state-1-1-0-admin\"");
         @SuppressWarnings("unchecked")
         Map<String, Object> body = (Map<String, Object>) after.getBody();
         assertThat(body).isNotNull();
         assertThat(body.get("version")).isEqualTo(1L);
 
         // 幂等重复不改变 revision：ETag 不变，条件请求继续 304
-        assertThat(controller.getGameState(null, "\"game-state-1-1-admin\"", admin)
+        assertThat(controller.getGameState(null, "\"game-state-1-1-0-admin\"", admin)
                 .getStatusCode().value()).isEqualTo(304);
+        verify(states, times(2)).findById(1L);
+    }
+
+    @Test
+    void guessSubmissionAdvancesTheGuessRevisionAndChangesTheEtag() {
+        GameStateRepository states = mock(GameStateRepository.class);
+        GameStateRecord record = new GameStateRecord(1L, "{\"stage\":\"BATTLE\",\"teams\":[]}", "test");
+        when(states.findById(1L)).thenReturn(Optional.of(record));
+        when(states.findVersionById(1L)).thenReturn(Optional.of(record.getVersion()));
+        java.util.concurrent.atomic.AtomicLong guessRevision = new java.util.concurrent.atomic.AtomicLong();
+        var guessRounds = mock(com.acedicearena.service.GuessRoundService.class);
+        when(guessRounds.revision()).thenAnswer(inv -> guessRevision.get());
+        GameDataController controller = newController(states, mock(UserAccountRepository.class),
+                mock(ParallelTournamentService.class),
+                mock(com.acedicearena.service.BlindBoxRoundService.class), guessRounds);
+        MockHttpSession admin = new MockHttpSession();
+        admin.setAttribute("role", "ADMIN");
+
+        var before = controller.getGameState(null, null, admin);
+        String etagBefore = before.getHeaders().getETag();
+        assertThat(etagBefore).isEqualTo("\"game-state-1-0-0-admin\"");
+        assertThat(controller.getGameState(null, etagBefore, admin).getStatusCode().value()).isEqualTo(304);
+
+        // 一次猜阵提交：guess revision +1，旧 ETag 回源得到 200 与新 ETag
+        guessRevision.incrementAndGet();
+        var after = controller.getGameState(null, etagBefore, admin);
+        assertThat(after.getStatusCode().value()).isEqualTo(200);
+        assertThat(after.getHeaders().getETag()).isEqualTo("\"game-state-1-0-1-admin\"");
         verify(states, times(2)).findById(1L);
     }
 }

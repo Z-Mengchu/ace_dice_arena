@@ -1,20 +1,16 @@
 import { icon } from './icons.js';
-(function(){'use strict';var data=null,es=null,chatCollapsed=false,refreshTimer=null,refreshLobby=false,refreshGame=false,lobbyLoading=false,lobbyReloadPending=false,readySubmitting=false,gameLoading=false,captainVotePick='',squadDraft=null,squadOrderDraft=null,rerollBusy=false,gsCache=null,firstLoad=true,squadViewOpen=false,teammateFoldOpen=null,opponentFoldOpen=false,expandedRounds={},matchDetails={},matchDetailPending={},preGuessKey='',preGuessSel=[],preGuessEdit=false,rollRepaintTimer=null,myLobbyBox=null,bbAnimating=false,myLobbyDie=null,lobbyRolling=false,lobbyRollAnimating=false,esRetryTimer=null;
+(function(){'use strict';var data=null,es=null,chatCollapsed=false,refreshTimer=null,refreshLobby=false,refreshGame=false,lobbyLoading=false,lobbyReloadPending=false,readySubmitting=false,gameLoading=false,captainVotePick='',squadDraft=null,squadOrderDraft=null,rerollBusy=false,gsCache=null,firstLoad=true,squadViewOpen=false,teammateFoldOpen=null,opponentFoldOpen=false,expandedRounds={},matchDetails={},matchDetailPending={},rollRepaintTimer=null,myLobbyBox=null,bbAnimating=false,myLobbyDie=null,lobbyRolling=false,lobbyRollAnimating=false,esRetryTimer=null;
   function fetchWithTimeout(path,options){var controller=typeof AbortController==='function'?new AbortController():null,timer=controller?setTimeout(function(){controller.abort();},10000):null,requestOptions=options||{};if(controller)requestOptions.signal=controller.signal;return fetch(path,requestOptions).catch(function(error){if(error&&error.name==='AbortError')throw new Error('请求超时，请检查网络后重试');throw error;}).finally(function(){if(timer)clearTimeout(timer);});}
   function api(path,method,body){return fetchWithTimeout(path,{method:method||'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined}).then(function(r){return r.json().catch(function(){return{}}).then(function(d){if(r.status===401)location.replace('/login');if(!r.ok)throw new Error(d.error||'操作失败');return d;});});}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 /* ---------- 赛况解说：指纹存 sessionStorage，轮询/刷新重渲染同一状态不重复播；异常静默跳过 ---------- */
 var CMT_KEY='dice-arena-commentary-v1',cmtSeen={};
 try{cmtSeen=JSON.parse(sessionStorage.getItem(CMT_KEY))||{};}catch(e){cmtSeen={};}
-/* 本人猜阵提交留痕：与 player.js 共用同一份 sessionStorage，跨页揭晓时据此判断播报文案用第一人称还是中性口径 */
-var GUESS_LOG_KEY='dice-arena-guess-submitted-v1',guessSubmittedLog={};
-try{guessSubmittedLog=JSON.parse(sessionStorage.getItem(GUESS_LOG_KEY))||{};}catch(e){guessSubmittedLog={};}
-function markGuessSubmitted(key){try{if(!key)return;guessSubmittedLog[key]=1;sessionStorage.setItem(GUESS_LOG_KEY,JSON.stringify(guessSubmittedLog));}catch(e){}}
 /** 场景事件弹幕：指纹防重（刷新/轮询不重复播）+ 侧边流气泡；kind 专属样式见 commentary.js */
 function markCmtSeen(fp){try{if(!fp||cmtSeen[fp])return false;cmtSeen[fp]=1;try{sessionStorage.setItem(CMT_KEY,JSON.stringify(cmtSeen));}catch(e){}return true;}catch(e){return false;}}
 function feedOnce(fp,kind,name,text){try{if(!markCmtSeen(fp))return;if(!window.Commentary||!window.Commentary.event)return;window.Commentary.event({kind:kind,name:name,text:text});}catch(e){}}
 function feedMatchKey(gs,mine){var match=heroMatchFor(gs,mine&&mine.id);return match&&match.id?match.id:String((gs&&gs.stage)||'')+':'+(mine?mine.id:'');}
-/* 弹幕口径：掷骰/盲盒/重掷/猜阵揭晓都是全队播报，只要登录就播，与本人是否参与无关；
+/* 弹幕口径：掷骰/盲盒/重掷都是全队播报，只要登录就播，与本人是否参与无关；
    频道展开时同样内容已在聊天列表，气泡被 chatExpanded() 抑制（指纹照留，不双播）；
    单批超过 FEED_BURST_LIMIT 条时合并成一条汇总，避免刷屏 */
 var FEED_BURST_LIMIT=5;
@@ -25,8 +21,6 @@ function feedLobbyBoxes(gs,mine){try{var mk=feedMatchKey(gs,mine),fresh=[];(mine
 /** 重掷弹幕：队长每重掷一次全队播一条，与本人身份无关；首次只见基线，不补播历史记录 */
 var lobbyRerollBaseline=-1;
 function commentLobbyReroll(gs,mine){try{var log=(mine&&mine.rerollLog)||[];if(lobbyRerollBaseline<0||log.length<lobbyRerollBaseline){lobbyRerollBaseline=log.length;return;}var mk=feedMatchKey(gs,mine);for(var i=lobbyRerollBaseline;i<log.length;i++){var item=log[i],from=Number(item.from),to=Number(item.to);if(!isFinite(from)||!isFinite(to)||from===to)continue;if(to>from)feedOnce('reroll:'+mk+':'+i,'reroll-up',item.playerName,'队长这波赌对啦！');else feedOnce('reroll:'+mk+':'+i,'reroll-down',item.playerName,'这下血压上来咯');}lobbyRerollBaseline=log.length;}catch(e){}}
-/** 猜阵揭晓弹幕：全队每局揭晓都播；本人提交过该局用第一人称点评文案，未提交用中性播报文案；按本方猜中人次分档，同一 match+round 只播一次 */
-function commentLobbyGuess(match,entry,side){try{if(!match||!entry)return;var key=match.id+':'+entry.round;var hits=Number(entry['guessHits'+side]);if(!isFinite(hits))return;var many=hits>=2;if(guessSubmittedLog[key]){var myName=data&&data.me?data.me.displayName:'';feedOnce('guess:'+key,many?'guess-many':'guess-few',myName,many?'对手套路全被看透！':'猜了个寂寞');}else feedOnce('guess:'+key,many?'guess-many':'guess-few','本队播报',many?'本队预判拉满，命中 '+hits+' 人次！':'本队这局猜阵只命中 '+hits+' 人次');}catch(e){}}
 function renderAfkState(){if(!data)return;var me=data.me,team=data.teams.find(function(item){return item.id===me.teamId;}),box=document.getElementById('afk-notice');if(!box){box=document.createElement('section');box.id='afk-notice';var room=document.getElementById('my-team');room.parentNode.insertBefore(box,room);}var afkMembers=team?team.members.filter(function(member){return member.afk;}):[];if(!afkMembers.length){box.className='afk-notice hidden';box.innerHTML='';return;}var names=afkMembers.map(function(member){return esc(member.originalDisplayName||member.displayName);}).join('、');box.className='afk-notice '+(me.afk?'is-self':'is-team');box.innerHTML=me.afk?'<div><small>AFK MODE · 已由系统托管</small><b>'+icon('warn')+' 你被标记挂机啦</b><p>挂机状态不能投票、掷骰、猜阵，全部交给系统托管。回来记得点按钮解除挂机！</p></div><button id="cancel-afk" class="btn btn-primary">取消挂机，恢复参与游戏</button>':'<div><small>TEAM AVAILABILITY</small><b>本队挂机小伙伴：'+names+'</b><p>挂机成员全部系统代操作；<b>挂机所在小队无法触发默契暴击</b></p></div>';document.querySelectorAll('#my-team .teammate').forEach(function(node,index){var member=team.members[index];if(!member||!member.afk)return;node.classList.add('afk');var name=node.querySelector('b');if(name&&!name.querySelector('.teammate-afk-tag'))name.insertAdjacentHTML('beforeend','<em class="teammate-afk-tag">挂机</em>');var status=node.lastElementChild;if(status)status.textContent='AFK';});var cancel=document.getElementById('cancel-afk');if(cancel)cancel.onclick=function(){cancel.disabled=true;cancel.textContent='正在恢复…';api('/api/lobby/afk/cancel','POST',{}).then(function(){queueRefresh('lobby');}).catch(function(error){cancel.disabled=false;cancel.textContent='取消挂机，恢复参与游戏';window.alert(error.message);});};}
 /* 队长身份常驻展示：名单里给队长加"队长"标记（render 重绘后需重建），并在操作台上方显示队长横幅，队长本人看到"你是本队队长" */
 function syncCaptainUi(gs){
@@ -64,12 +58,11 @@ function arenaTrackHtml(match,side){
   var cells=[1,2,3,4,5,6].map(function(n){
     var entry=null;
     for(var i=0;i<rounds.length;i++)if(Number(rounds[i].round)===n){entry=rounds[i];break;}
-    var current=match.status==='active'&&match.phase==='BATTLE'&&Number(match.round)===n;
     var cls='',mark='';
     if(entry){
       if(entry.winner){cls=entry.winner===side?'is-win':'is-lose';mark=cls==='is-win'?'胜':'负';}
       else{cls='is-draw';mark='平';}
-    }else if(current)cls='is-current';
+    }
     return'<div class="arena-cell '+cls+'"><i>第 '+n+' 局</i><b>'+mark+'</b></div>';
   }).join('');
   return'<div class="arena-cells">'+cells+'</div>';
@@ -78,7 +71,7 @@ function arenaStatusLine(match){
   if(match.status==='done')return'本场已结束';
   if(match.phase==='RESULT')return'展示战报';
   if(match.phase==='OVERTIME_PENDING')return'三项全平等待加赛';
-  if(match.phase==='BATTLE')return'第 '+Number(match.round||1)+' / 6 局 · '+(match.roundPhase==='REVEAL'?'结果揭晓':'猜阵进行中');
+  if(match.phase==='BATTLE')return match.roundPhase==='REVEAL'?'6 局结果揭晓中':'6 局统一猜阵中';
   return'等待开赛';
 }
 function renderHero(){
@@ -142,11 +135,11 @@ function updateFloatCountdown(){
   if(floatStage==='BATTLE'&&data&&data.me&&gsCache){
     var mine=findMine(gsCache),match=mine&&myActiveMatchFor(gsCache,mine.id);
     if(match){
-      var ts=match.phase==='RESULT'?match.resultReadyAt:match.roundPhase==='REVEAL'?match.revealUntil:match.guessDeadlineAt;
+      var ts=match.phase==='RESULT'?match.resultReadyAt:match.roundPhase==='REVEAL'?match.revealUntil:(match.guessRevealAt||match.guessDeadlineAt);
       if(match.phase==='OVERTIME_PENDING')ts=null;
       if(ts!=null&&isFinite(Number(ts))){
         deadline=Number(ts);
-        extra=match.phase==='RESULT'?'本场比赛结果展示中':'第 '+Number(match.round||1)+' 局 · '+(match.roundPhase==='REVEAL'?'结果揭晓':'猜阵 ing');
+        extra=match.phase==='RESULT'?'本场结果展示中':(match.roundPhase==='REVEAL'?'6 局结果揭晓中':'6 局统一猜阵中');
       }
     }
   }
@@ -167,7 +160,7 @@ function blindBoxText(p){if(p.blindBox==null)return'未开';var v=Number(p.blind
 /* bracket 场次元信息：g1..g4 为 1/4 决赛，s1/s2 半决赛，f1 决赛 */
 function bracketStage(match){var id=String(match&&match.id||'').toLowerCase(),prefix=id.charAt(0),index=Math.max(1,Number(id.slice(1))||1);if(prefix==='f')return{rank:3,index:index,label:'总决赛',shortLabel:'决赛'};if(prefix==='s')return{rank:2,index:index,label:'半决赛 · 第 '+index+' 场',shortLabel:'半决赛'};return{rank:1,index:index,label:'1/4决赛 · 第 '+index+' 场',shortLabel:'1/4决赛'};}
 function bracketMatches(gs){var values=Object.keys(gs.matches||{}).map(function(k){return gs.matches[k];});values.sort(function(x,y){var active=(x.status==='active'?0:1)-(y.status==='active'?0:1);if(active)return active;var sx=bracketStage(x),sy=bracketStage(y);return sy.rank-sx.rank||sx.index-sy.index;});return values;}
-function tournamentWatchCard(gs,match,myTeamId){var stage=bracketStage(match),a=gs.teams.find(function(team){return team.id===match.a;}),b=gs.teams.find(function(team){return team.id===match.b;}),winner=gs.teams.find(function(team){return team.id===match.winner;});var detail;if(match.status==='done')detail='胜者 · '+(winner?winner.name:match.winner)+(match.tieBreak&&match.tieBreak!=='胜场'?' · 按'+match.tieBreak+'判定':'');else if(match.phase==='OVERTIME_PENDING')detail='三连环全平 · 待加赛';else if(match.phase==='RESULT')detail='本场结果展示中';else if(match.phase==='BATTLE')detail='第 '+Number(match.round||1)+' 局 · '+(match.roundPhase==='REVEAL'?'结果揭晓中':'猜阵进行中');else detail='等待开赛';var mine=myTeamId&&(match.a===myTeamId||match.b===myTeamId);return '<article class="watch-card tournament-card '+(match.status==='active'?'is-live':'is-history')+(mine?' is-mine':'')+'"><small><span>'+esc(stage.label)+'</span><i>'+(match.status==='done'?'已结束':match.status==='active'?'进行中':'未开始')+'</i></small>'+(mine?'<em class="watch-mine-badge">本队出战</em>':'')+'<div><b>'+esc(a?a.name:match.a)+'</b><strong>'+Number(match.winsA||0)+' : '+Number(match.winsB||0)+'</strong><b>'+esc(b?b.name:match.b)+'</b></div><p>'+esc(detail)+'</p></article>';}
+function tournamentWatchCard(gs,match,myTeamId){var stage=bracketStage(match),a=gs.teams.find(function(team){return team.id===match.a;}),b=gs.teams.find(function(team){return team.id===match.b;}),winner=gs.teams.find(function(team){return team.id===match.winner;});var detail;if(match.status==='done')detail='胜者 · '+(winner?winner.name:match.winner)+(match.tieBreak&&match.tieBreak!=='胜场'?' · 按'+match.tieBreak+'判定':'');else if(match.phase==='OVERTIME_PENDING')detail='三连环全平 · 待加赛';else if(match.phase==='RESULT')detail='本场结果展示中';else if(match.phase==='BATTLE')detail=match.roundPhase==='REVEAL'?'6 局结果揭晓中':'6 局统一猜阵中';else detail='等待开赛';var mine=myTeamId&&(match.a===myTeamId||match.b===myTeamId);return '<article class="watch-card tournament-card '+(match.status==='active'?'is-live':'is-history')+(mine?' is-mine':'')+'"><small><span>'+esc(stage.label)+'</span><i>'+(match.status==='done'?'已结束':match.status==='active'?'进行中':'未开始')+'</i></small>'+(mine?'<em class="watch-mine-badge">本队出战</em>':'')+'<div><b>'+esc(a?a.name:match.a)+'</b><strong>'+Number(match.winsA||0)+' : '+Number(match.winsB||0)+'</strong><b>'+esc(b?b.name:match.b)+'</b></div><p>'+esc(detail)+'</p></article>';}
 /* 观战区：单败对阵图，按 1/4决赛 → 半决赛 → 总决赛 分列，本队参与的场次高亮 */
 function spectateBracketHtml(gs,matches){
   if(!matches.length)return'<p class="spectate-empty">对阵尚未生成，等待管理员开启比赛。</p>';
@@ -351,15 +344,15 @@ function lobbyRoll(box){
 function blindBoxPanel(box,gs,mine){
   if(bbAnimating)return;   // 开盒动画播放中：回源重绘会冲掉动画 DOM，动画结束后统一渲染结果卡
   var players=mine.players||[],opened=players.filter(function(p){return p.blindBoxOpened||p.blindBox!=null;}).length,me=players.find(function(p){return p.id===myPlayerId();}),mineHtml;
-  // 开盒窗口只有 25 秒，跳转掷骰端来不及：在大厅原地开盒（player-action 只需登录会话，无需掷骰令牌）
+  // 开盒窗口只有 10 秒，跳转掷骰端来不及：在大厅原地开盒（player-action 只需登录会话，无需掷骰令牌）
   var myActive=Object.keys(gs.matches||{}).some(function(k){var m=gs.matches[k];return m&&m.status==='active'&&(m.a===mine.id||m.b===mine.id);});
   var meOpened=me&&(me.blindBoxOpened||me.blindBox!=null);
   if(me&&myLobbyBox!=null&&!meOpened)opened++;   // 自己刚开、回源未至：本地先计入进度
   feedLobbyBoxes(gs,mine);
   if(me&&(meOpened||myLobbyBox!=null)){var meView=myLobbyBox!=null&&me.blindBox==null?Object.assign({},me,{blindBox:myLobbyBox,blindBoxOpened:true}):me;mineHtml='<div class="blindbox-result"><div><small>'+icon('gift',16)+' 我的盲盒档位</small><b>'+blindBoxText(meView)+'</b></div><div><small>我的最终点数（骰子 + 盲盒）</small><strong>'+(meView.diceFinal!=null?finalPoints(meView)+' 点':'等待结算')+'</strong></div></div>';}
   else if(!myActive){mineHtml='<p>本队本轮无对局，不用开盲盒。</p>';}
-  else{mineHtml='<p>三选一开启盲盒！档位完全随机，有加分惊喜也有减益，每人仅有一次机会；25 秒不点 = 放弃，按 0 计算，<b>系统不会帮你开盒！</b></p>'+window.BlindBoxUI.boxesHTML();}
-  box.innerHTML='<div class="role-ribbon">'+icon('gift')+' 第四阶段 · 盲盒 '+voteCountdown(gs.stageDeadlineAt,'开盲盒')+'</div><div class="hub-section-title"><div><small>BLIND BOX · 限时 25 秒！</small><h2>全员拆盲盒时间</h2></div><span>'+opened+' / '+players.length+'</span></div>'+mineHtml;
+  else{mineHtml='<p>三选一开启盲盒！档位完全随机，有加分惊喜也有减益，每人仅有一次机会；10 秒不点 = 放弃，按 0 计算，<b>系统不会帮你开盒！</b></p>'+window.BlindBoxUI.boxesHTML();}
+  box.innerHTML='<div class="role-ribbon">'+icon('gift')+' 第四阶段 · 盲盒 '+voteCountdown(gs.stageDeadlineAt,'开盲盒')+'</div><div class="hub-section-title"><div><small>BLIND BOX · 限时 10 秒！</small><h2>全员拆盲盒时间</h2></div><span>'+opened+' / '+players.length+'</span></div>'+mineHtml;
   Array.prototype.slice.call(box.querySelectorAll('.bb-box')).forEach(function(boxBtn){boxBtn.onclick=function(){openLobbyBox(Number(boxBtn.getAttribute('data-idx')));};});
 }
 /** 大厅原地三选一开盒：响应带三盒内容时播放开盒动画，播完再渲染结果卡 */
@@ -405,13 +398,13 @@ function tacticsPanel(box,gs,mine){
       +(locked?'<p class="squad-order-locked-note">出场顺序已经锁死，对局就按这个顺序开打。</p>':'<div class="action-footer"><button id="lock-squad-order" class="btn btn-primary" '+(mine.squads&&!confirmed?'':'disabled')+'>锁定出场顺序</button></div>')
       +'<div class="tactics-confirm-bar">'+(confirmed
         ?'<span class="tactics-confirm-state is-done">'+icon('check',16)+' 战术布置搞定！重掷 &amp; 排序已锁定</span><button id="tactics-cancel-confirm" class="btn btn-ghost">取消确认</button>'
-        :'<span class="tactics-confirm-state">确认之后重掷和排阵全部锁定；全部队伍就绪马上开战 '+icon('swords',16)+'</span><button id="tactics-confirm" class="btn btn-primary">完成战术布置</button>')+'</div>';
+        :'<span class="tactics-confirm-state">确认将按当前排阵锁定出场顺序，同时冻结重掷；全部队伍就绪马上开战 '+icon('swords',16)+'</span><button id="tactics-confirm" class="btn btn-primary">完成战术布置</button>')+'</div>';
     box.querySelectorAll('[data-reroll]').forEach(function(btn){btn.onclick=function(){var p=players.find(function(x){return x.id===btn.dataset.reroll;});if(!window.confirm('确定给 '+(p?p.name:'该队员')+' 重新掷骰子吗？重掷之后骰子点数会随机刷新哦！'))return;rerollBusy=true;btn.disabled=true;playerAction('reroll',[btn.dataset.reroll]).then(function(){rerollBusy=false;}).catch(function(error){rerollBusy=false;showActionError(error);});};});
     box.querySelectorAll('[data-order-move]').forEach(function(btn){btn.onclick=function(){var pos=Number(btn.dataset.orderIndex),target=btn.dataset.orderMove==='up'?pos-1:pos+1;if(target<0||target>=squadOrderDraft.length)return;var tmp=squadOrderDraft[pos];squadOrderDraft[pos]=squadOrderDraft[target];squadOrderDraft[target]=tmp;draw();};});
     var lock=document.getElementById('lock-squad-order');
     if(lock)lock.onclick=function(){if(!window.confirm('锁定之后再也不能调整出场顺序啦，确认提交？'))return;lock.disabled=true;playerAction('squad-order',squadOrderDraft.map(function(n){return String(n);})).then(function(){squadOrderDraft=null;}).catch(function(error){lock.disabled=false;showActionError(error);});};
     var confirmBtn=document.getElementById('tactics-confirm');
-    if(confirmBtn)confirmBtn.onclick=function(){confirmBtn.disabled=true;playerAction('tactics-confirm',[]).catch(function(error){confirmBtn.disabled=false;showActionError(error);});};
+    if(confirmBtn)confirmBtn.onclick=function(){confirmBtn.disabled=true;var order=(!locked&&squadOrderDraft&&squadOrderDraft.length===6)?squadOrderDraft.map(function(n){return String(n);}):[];playerAction('tactics-confirm',order).catch(function(error){confirmBtn.disabled=false;showActionError(error);});};
     var cancelConfirmBtn=document.getElementById('tactics-cancel-confirm');
     if(cancelConfirmBtn)cancelConfirmBtn.onclick=function(){cancelConfirmBtn.disabled=true;playerAction('tactics-cancel',[]).catch(function(error){cancelConfirmBtn.disabled=false;showActionError(error);});};
   }
@@ -420,7 +413,7 @@ function tacticsPanel(box,gs,mine){
 /* ---------- 第六阶段：对局 ---------- */
 function battleScoreboard(match,a,b,side){
   var rounds=match.rounds||[];
-  var cells=[1,2,3,4,5,6].map(function(n){var entry=rounds.find(function(r){return r.round===n;}),current=match.phase==='BATTLE'&&match.round===n,cls=entry?(entry.winner?(entry.winner===side?'is-win':'is-lose'):'is-draw'):current?'is-current':'';return'<div class="score-cell '+cls+'"><i>'+n+'</i><b>'+(entry?(entry.winner?(entry.winner===side?'胜':'负'):'平'):current?'…':'')+'</b></div>';}).join('');
+  var cells=[1,2,3,4,5,6].map(function(n){var entry=rounds.find(function(r){return r.round===n;}),cls=entry?(entry.winner?(entry.winner===side?'is-win':'is-lose'):'is-draw'):'';return'<div class="score-cell '+cls+'"><i>'+n+'</i><b>'+(entry?(entry.winner?(entry.winner===side?'胜':'负'):'平'):'')+'</b></div>';}).join('');
   return'<div class="battle-scoreboard"><div class="battle-score-team"><b>'+esc(a.name)+'</b><strong>'+Number(match.winsA||0)+'</strong></div><div class="score-cells">'+cells+'</div><div class="battle-score-team is-right"><strong>'+Number(match.winsB||0)+'</strong><b>'+esc(b.name)+'</b></div></div>';
 }
 function roundSideHtml(name,entry,side,won){var crit=entry['crit'+side];return'<div class="round-side'+(won?' is-winner':'')+'"><b>'+esc(name)+'</b><span>基础 '+Number(entry['base'+side]||0)+(crit?' <em>'+icon('sparkle',16)+' 暴击 ×1.5</em>':'')+'</span><span>猜中 '+Number(entry['guessHits'+side]||0)+' 人次 · 加成 +'+Number(entry['guessBonus'+side]||0)+'</span><strong>'+Number(entry['power'+side]||0)+'</strong></div>';}
@@ -433,29 +426,8 @@ function loadMatchDetail(match,onDone){var key=detailKey(match),cached=matchDeta
 function repaint(){if(gsCache)renderPlayerActions(gsCache);}
 function roundsSectionHtml(match,a,b){var rounds=match.rounds||[];if(!rounds.length)return'';if(expandedRounds[match.id]){var detail=detailFor(match);return'<div class="rounds-toggle"><button type="button" class="btn btn-ghost rounds-toggle-btn" data-rounds-match="'+esc(match.id)+'">收起战报</button><div class="rounds-detail">'+(detail?roundsListHtml(detail,a,b):'<p class="rounds-loading">战况加载中…</p>')+'</div></div>';}return'<div class="rounds-toggle"><button type="button" class="btn btn-ghost rounds-toggle-btn" data-rounds-match="'+esc(match.id)+'">查看完整对局战报（'+rounds.length+' 局）</button></div>';}
 function bindRoundsSection(box,match,a,b){var btn=box.querySelector('[data-rounds-match]');if(!btn)return;btn.onclick=function(){expandedRounds[match.id]=!expandedRounds[match.id];if(expandedRounds[match.id]&&!detailFor(match))loadMatchDetail(match,repaint);repaint();};}
-/* ---------- 提前猜阵：排队小队在大厅直接提交，无需跳转掷骰端 ---------- */
+/* 本人所在小队序号（= 本人局号 1~6）：统一猜阵窗口内每位队员只提交本人局的猜阵 */
 function mySquadRound(mine,myId){var squads=mine.squads||[];for(var i=0;i<squads.length&&i<6;i++){if((squads[i]||[]).indexOf(myId)>=0)return i+1;}return 0;}
-function preGuessHtml(match,mine,a,b,side){
-  var myId=myPlayerId(),myRound=mySquadRound(mine,myId);
-  if(!myRound||myRound<=match.round||myRound<2)return'';
-  var key=match.id+':pre:'+myRound;
-  if(key!==preGuessKey){preGuessKey=key;preGuessSel=[];preGuessEdit=false;}
-  var status=match.preGuessStatus&&match.preGuessStatus[myRound]&&match.preGuessStatus[myRound][side],submitted=!!(status&&status[myId]);
-  if(submitted&&!preGuessEdit)return'<div class="pl-preguess"><div class="hub-section-title"><div><small>PRE-GUESS · 后面第 '+myRound+' 局你会上场 '+icon('sparkle',16)+'</small><h2>'+icon('check')+' 提前猜阵提交成功</h2></div></div><p>第 '+myRound+' 局开打自动生效，结果揭晓前随时撤回 / 改选！</p><div class="action-footer"><button type="button" class="btn btn-ghost" id="preguess-retract">撤回提前猜阵</button><button type="button" class="btn btn-primary" id="preguess-edit">改投</button></div></div>';
-  var enemy=side==='A'?b:a,grid=((enemy&&enemy.players)||[]).map(function(p){var pid=String(p.id),sel=preGuessSel.indexOf(pid)>=0;return'<button type="button" class="pl-roster-item'+(sel?' selected':'')+'" data-pre-pick="'+esc(pid)+'"><b>'+esc(p.name)+'</b><span>'+esc(p.department||'')+'</span></button>';}).join('');
-  return'<div class="pl-preguess"><div class="hub-section-title"><div><small>PRE-GUESS · 后面第 '+myRound+' 局你会上场 '+icon('sparkle',16)+'</small><h2>提前预判对手阵容！</h2></div></div><p>趁排队，猜敌方第 '+myRound+' 局派出哪 5 位队员；猜中加战力！对局自动生效，揭晓前可以撤回重选。</p><div class="pl-roster">'+grid+'</div><div class="action-footer"><span id="preguess-n">已选 '+preGuessSel.length+' / 5</span><button type="button" class="btn btn-primary" id="preguess-submit"'+(preGuessSel.length===5?'':' disabled')+'>提前提交猜阵</button></div></div>';
-}
-function bindPreGuess(box,match,mine){
-  var myRound=mySquadRound(mine,myPlayerId());
-  if(!myRound||myRound<=match.round||myRound<2)return;
-  box.querySelectorAll('[data-pre-pick]').forEach(function(btn){btn.onclick=function(){var pid=btn.dataset.prePick,i=preGuessSel.indexOf(pid);if(i>=0)preGuessSel.splice(i,1);else{if(preGuessSel.length>=5)return;preGuessSel.push(pid);}repaint();};});
-  var submit=document.getElementById('preguess-submit');
-  if(submit)submit.onclick=function(){if(preGuessSel.length!==5)return;submit.disabled=true;playerAction('pre-guess',preGuessSel.slice()).then(function(){preGuessEdit=false;markGuessSubmitted(match.id+':'+myRound);}).catch(function(error){submit.disabled=false;showActionError(error);});};
-  var retract=document.getElementById('preguess-retract');
-  if(retract)retract.onclick=function(){retract.disabled=true;playerAction('retract-guess',[]).catch(function(error){retract.disabled=false;showActionError(error);});};
-  var edit=document.getElementById('preguess-edit');
-  if(edit)edit.onclick=function(){preGuessEdit=true;repaint();};
-}
 function battlePanel(box,gs,mine){
   var teamId=data.me.teamId,mineMatches=bracketMatches(gs).filter(function(m){return m.a===teamId||m.b===teamId;});
   var match=mineMatches.find(function(m){return m.status==='active';})||mineMatches[0];
@@ -467,21 +439,20 @@ function battlePanel(box,gs,mine){
   if(match.phase==='RESULT'){var winnerTeam=match.winner===match.a?a:match.winner===match.b?b:null,won=match.winner===teamId,resultCls=winnerTeam?(won?' is-win':' is-defeat'):'',resultTitle=!winnerTeam?'结算中':won?icon('trophy')+' 咱们队拿下本场胜利':'惜败 · '+esc(winnerTeam.name)+' 队晋级',tieText=TournamentUI.tieBreakText(match,a.name,b.name);box.innerHTML=head+'<div class="match-result-banner'+resultCls+'"><small>'+(winnerTeam?(won?'VICTORY':'DEFEAT'):'MATCH RESULT')+'</small><h2>'+resultTitle+'</h2><strong>6 局对战比分 '+Number(match.winsA||0)+' : '+Number(match.winsB||0)+'</strong><p>'+esc(tieText||('判定规则：'+(match.tieBreak||'胜场')))+'</p>'+(match.resultReadyAt?'<p>结果展示结束后，自动进入下一轮赛程'+voteCountdown(match.resultReadyAt,'结果展示')+'</p>':'')+'</div>'+roundsSectionHtml(match,a,b);bindRoundsSection(box,match,a,b);return;}
   if(match.phase==='OVERTIME_PENDING'){box.innerHTML=head+'<div class="match-result-banner"><small>OVERTIME</small><h2>'+icon('warn')+' 三项全部打平｜等待加赛！</h2><strong>6 局对战比分 '+Number(match.winsA||0)+' : '+Number(match.winsB||0)+'</strong><p>胜场、总点数、GMV 全部持平，等待管理员安排加赛一决高下。</p></div>'+roundsSectionHtml(match,a,b);bindRoundsSection(box,match,a,b);return;}
   if(match.phase!=='BATTLE'){box.innerHTML=head+'<p>对阵还没开打，等待系统开局~</p>';return;}
-  var myId=myPlayerId(),inSquad=!!(mine.squads&&mine.squads[match.round-1]&&mine.squads[match.round-1].indexOf(myId)>=0);
+  var myId=myPlayerId(),myRound=mySquadRound(mine,myId);
   if(match.roundPhase==='REVEAL'){
-    var detail=detailFor(match),last=detail?(detail.rounds||[]).slice(-1)[0]:null;
+    var detail=detailFor(match);
     if(!detail)loadMatchDetail(match,repaint);
-    if(last)commentLobbyGuess(match,last,side);
-    box.innerHTML=head+'<div class="guess-panel is-reveal"><div class="hub-section-title"><div><small>ROUND '+Number(match.round)+' / 6 · REVEAL</small><h2>第 '+Number(match.round)+' 局结果大揭晓</h2></div></div>'+(last?roundEntryHtml(last,a,b)+'<p>冲向下一局！</p>':'<p>本局结果加载中…</p>')+'</div>'+preGuessHtml(match,mine,a,b,side)+roundsSectionHtml(match,a,b);
+    box.innerHTML=head+'<div class="guess-panel is-reveal"><div class="hub-section-title"><div><small>BATTLE · REVEAL</small><h2>'+icon('crystal')+' 6 局结果同时揭晓</h2></div></div>'+(detail?roundsListHtml(detail,a,b):'<p>6 局结果加载中…</p>')+'</div>'+roundsSectionHtml(match,a,b);
     bindRoundsSection(box,match,a,b);
-    bindPreGuess(box,match,mine);
     return;
   }
-  var status=match.guessStatus||{},mySubmitted=Object.keys(status[side]||{}).length,oppSubmitted=Object.keys(status[side==='A'?'B':'A']||{}).length;
-  var pre=preGuessHtml(match,mine,a,b,side);
-  box.innerHTML=head+'<div class="guess-panel"><div class="hub-section-title"><div><small>ROUND '+Number(match.round)+' / 6 · GUESS</small><h2>'+icon('crystal')+' 第 '+Number(match.round)+' 局 · 猜阵进行中</h2></div>'+voteCountdown(match.guessDeadlineAt,'第 '+Number(match.round)+' 局 · 猜阵')+'</div><p>本局双方 '+Number(match.round)+' 号小队 battle！出战宝子猜猜对面会上哪 5 个人，猜中直接给小队加战力！</p><div class="guess-status"><span>我方出战小队已提交 <b>'+mySubmitted+' / 5</b></span><span>对方已提交 <b>'+oppSubmitted+' / 5</b></span></div>'+(inSquad?'<div class="action-footer"><a class="btn btn-primary" href="/player">前往提交猜阵</a></div>':(pre||'<p class="timing-spectator-note">你不在本局出战，安心看大家提交进度就好。</p>'))+'</div>'+roundsSectionHtml(match,a,b);
+  /* 统一猜阵窗口：guessStatus 按局分桶（{"1":{A:{...},B:{...}},...}），进度聚合 6 局各桶键数 */
+  var status=match.guessStatus||{},oppSide=side==='A'?'B':'A',mySubmitted=0,oppSubmitted=0;
+  Object.keys(status).forEach(function(rk){var bucket=status[rk]||{};mySubmitted+=Object.keys(bucket[side]||{}).length;oppSubmitted+=Object.keys(bucket[oppSide]||{}).length;});
+  var myGuessIn=!!(myRound&&status[myRound]&&status[myRound][side]&&status[myRound][side][myId]);
+  box.innerHTML=head+'<div class="guess-panel"><div class="hub-section-title"><div><small>BATTLE · GUESS</small><h2>'+icon('crystal')+' 第六阶段 · 统一猜阵</h2></div>'+voteCountdown(match.guessRevealAt||match.guessDeadlineAt,'统一猜阵')+'</div><p>6 局统一 30 秒猜阵窗口！猜猜对面你所在局会上哪 5 个人，猜中直接给小队加战力；窗口内可重复改投或撤回。双方全部交齐后 5 秒揭晓（剩余不足 5 秒则按原倒计时）。</p><div class="guess-status"><span>我方已交 <b>'+mySubmitted+' / 30</b></span><span>对方已交 <b>'+oppSubmitted+' / 30</b></span></div>'+(myGuessIn?'<p class="timing-spectator-note">✅ 你的猜阵已密封提交，可在掷骰端撤回或改投</p>':'<div class="action-footer"><a class="btn btn-primary" href="/player">前往提交猜阵</a></div>')+'</div>'+roundsSectionHtml(match,a,b);
   bindRoundsSection(box,match,a,b);
-  bindPreGuess(box,match,mine);
 }
 function renderParallel(gs,box){
   var matches=bracketMatches(gs);
@@ -495,7 +466,6 @@ function renderParallel(gs,box){
   if(gs.stage!=='CAPTAIN_VOTE')captainVotePick='';
   if(gs.stage!=='SQUAD_FORM')squadDraft=null;
   if(gs.stage!=='TACTICS'){squadOrderDraft=null;rerollBusy=false;}
-  if(gs.stage!=='BATTLE'){preGuessKey='';preGuessSel=[];preGuessEdit=false;}
   if(gs.stage==='CAPTAIN_VOTE'){captainVotePanel(box,gs,mine);return;}
   if(gs.stage==='SQUAD_FORM'){squadFormPanel(box,gs,mine);return;}
   /* 已被淘汰的队伍不再展示掷骰/盲盒/战术等参与型面板，统一转入观战态 */
@@ -519,7 +489,7 @@ function renderChampionAnnouncement(gs){var box=document.getElementById('champio
 function loadGameState(){if(gameLoading)return;gameLoading=true;fetch('/api/game-state').then(function(r){return r.status===204?null:r.json();}).then(function(d){var gs=d&&d.state;gsCache=gs;if(gs&&gs.stage==='ROLL')myLobbyBox=null;if(gs&&gs.stage!=='ROLL')myLobbyDie=null;renderChampionAnnouncement(gs);renderHero();renderPlayerActions(gs);}).catch(function(){}).finally(function(){gameLoading=false;});}
 function queueRefresh(type){if(type==='lobby')refreshLobby=true;else refreshGame=true;if(refreshTimer)return;refreshTimer=setTimeout(function(){var doLobby=refreshLobby,doGame=refreshGame;refreshTimer=null;refreshLobby=false;refreshGame=false;if(doLobby)load();if(doGame)loadGameState();},150+Math.floor(Math.random()*450));}
 /* 赛况播报（服务端 feed 事件）在队内频道的展示：kind → 图标与语气，样式走 .chat-feed */
-var FEED_META={'roll-big':['dice',1],'roll-small':['dice',0],'box-buff':['gift',1],'box-debuff':['gift',0],'reroll-up':['sparkle',1],'reroll-down':['warn',0],'guess-many':['crystal',1],'guess-few':['crystal',0]};
+var FEED_META={'roll-big':['dice',1],'roll-small':['dice',0],'box-buff':['gift',1],'box-debuff':['gift',0],'reroll-up':['sparkle',1],'reroll-down':['warn',0]};
 function appendChat(html){var l=document.getElementById('chat-list');if(!l)return;l.insertAdjacentHTML('beforeend',html);l.scrollTop=l.scrollHeight;}
 function appendFeed(m){var meta=FEED_META[m.type.slice(5)];if(!meta)return;appendChat('<div class="chat-msg chat-feed '+(meta[1]?'is-good':'is-bad')+'"><b>'+icon(meta[0],14)+' '+esc(m.sender)+'</b><p>'+esc(m.content)+'</p></div>');}
 function sseTabId(){try{var t=sessionStorage.getItem('sse-tab');if(!t){t=Date.now().toString(36)+Math.random().toString(36).slice(2);sessionStorage.setItem('sse-tab',t);}return t;}catch(e){return '';}}

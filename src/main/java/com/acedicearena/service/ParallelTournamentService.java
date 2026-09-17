@@ -5,12 +5,14 @@ import com.acedicearena.domain.UserAccount;
 import com.acedicearena.domain.BattleReport;
 import com.acedicearena.domain.MatchReport;
 import com.acedicearena.domain.PlayerBlindBox;
+import com.acedicearena.domain.PlayerGuess;
 import com.acedicearena.repository.BattleReportRepository;
 import com.acedicearena.repository.GameControlRepository;
 import com.acedicearena.repository.GameStateRepository;
 import com.acedicearena.repository.MatchReportRepository;
 import com.acedicearena.repository.PerformanceRecordRepository;
 import com.acedicearena.repository.PlayerBlindBoxRepository;
+import com.acedicearena.repository.PlayerGuessRepository;
 import com.acedicearena.repository.UserAccountRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -30,6 +32,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.Comparator;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.LinkedHashMap;
@@ -46,11 +49,11 @@ public class ParallelTournamentService {
     /**
      * 队长投票时限；超时按已投票计票，无人投票按名单顺序取先。
      */
-    private static final long VOTE_DURATION_MS = 19_500L;
+    private static final long VOTE_DURATION_MS = 24_500L;
     /**
      * 队长分 6×5 小队的时限；超时由系统随机均分。
      */
-    private static final long SQUAD_FORM_DURATION_MS = 90_000L;
+    private static final long SQUAD_FORM_DURATION_MS = 45_000L;
     /**
      * 全员掷骰总窗口：最后一个小队的开掷时刻加小队窗口；超时未掷者由系统代掷。
      */
@@ -64,7 +67,7 @@ public class ParallelTournamentService {
     /**
      * 最后一个小队的掷骰窗口时长：全局截止 = 最后开掷时刻 + 窗口，早开掷的小队窗口相应更长。
      */
-    static final long SQUAD_ROLL_WINDOW_MS = 25_000L;
+    static final long SQUAD_ROLL_WINDOW_MS = 10_000L;
     /**
      * 真人掷骰时刻允许早于服务端收包时刻的最大值：覆盖真实网络单程延迟，同时限制伪造空间。
      */
@@ -72,21 +75,19 @@ public class ParallelTournamentService {
     /**
      * 开盲盒窗口；超时未开视为放弃（按 0 计），系统不再代开。
      */
-    private static final long BLIND_BOX_DURATION_MS = 25_000L;
+    private static final long BLIND_BOX_DURATION_MS = 10_000L;
     /**
-     * 每轮出战小队的猜阵时限；超时视为放弃，命中记 0。
+     * 整场 6 局统一的猜阵窗口；超时未交按放弃（命中记 0）。
      */
     private static final long GUESS_DURATION_MS = 30_000L;
     /**
-     * 每局猜阵的最短时长：双方都交齐后也要满此时长才揭晓。
+     * 双方 30 份猜阵全部交齐后揭晓前再等的宽限时长；交齐时剩余不足此时长按原倒计时到点揭晓。
      */
-    static final long GUESS_MIN_DURATION_MS = 5_000L;
+    static final long GUESS_COMPLETE_GRACE_MS = 5_000L;
     /**
-     * 每局揭晓展示时长，到期自动进入下一局。
+     * 6 局结果同屏揭晓的展示时长，到期进入比赛结算。
      */
-    private static final long REVEAL_DURATION_MS = 10_000L;
-    static final int SQUAD_COUNT = 6;
-    static final int SQUAD_SIZE = 5;
+    private static final long REVEAL_DURATION_MS = 20_000L;
     static final int REROLL_LIMIT_PER_MATCH = 5;
     static final double GUESS_BONUS_PER_HIT = 0.4d;
     static final double GUESS_BONUS_CAP = 10d;
@@ -107,20 +108,22 @@ public class ParallelTournamentService {
     private final MatchReportRepository matchReports;
     private final PlayerBlindBoxRepository blindBoxes;
     private final BlindBoxRoundService blindBoxRounds;
+    private final PlayerGuessRepository guesses;
     private final GameStateSnapshotStore snapshotStore;
     private final TransactionTemplate transactions;
 
     /** ROLL 阶段截止时间 = 最后一队开掷时间 + 单队掷骰窗口。 */
     private static long rollDurationMs() {
-        return (SQUAD_COUNT - 1) * SQUAD_ROLL_STAGGER_MS + SQUAD_ROLL_WINDOW_MS;
+        return (TournamentLayout.SQUAD_COUNT - 1) * SQUAD_ROLL_STAGGER_MS + SQUAD_ROLL_WINDOW_MS;
     }
 
     public ParallelTournamentService(GameStateRepository states, UserAccountRepository users,
                                      PerformanceRecordRepository performances,
                                      GameControlRepository controls, ObjectMapper mapper, LobbyEventService events,
-                                     @Value("${app.game.result-display-ms:16000}") long resultDisplayMs,
+                                     @Value("${app.game.result-display-ms:8000}") long resultDisplayMs,
                                      BattleReportRepository reports, MatchReportRepository matchReports,
                                      PlayerBlindBoxRepository blindBoxes, BlindBoxRoundService blindBoxRounds,
+                                     PlayerGuessRepository guesses,
                                      GameStateSnapshotStore snapshotStore,
                                      PlatformTransactionManager transactionManager) {
         this.states = states;
@@ -134,6 +137,7 @@ public class ParallelTournamentService {
         this.matchReports = matchReports;
         this.blindBoxes = blindBoxes;
         this.blindBoxRounds = blindBoxRounds;
+        this.guesses = guesses;
         this.snapshotStore = snapshotStore;
         this.transactions = new TransactionTemplate(transactionManager);
     }
@@ -316,7 +320,7 @@ public class ParallelTournamentService {
                 entry.put("teamId", assignment.teamId());
                 entry.put("playerId", "u" + player.getId());
                 entry.put("identity", assignment.identity());
-                ObjectNode team = findTeam(root, assignment.teamId());
+                ObjectNode team = TournamentLayout.findTeam(root, assignment.teamId());
                 ArrayNode players = (ArrayNode) team.path("players");
                 String replacedId = "u" + assignment.replaced().getId();
                 JsonNode replacedNode = null;
@@ -451,18 +455,15 @@ public class ParallelTournamentService {
         }
     }
 
-    /** 正式玩家和沙盘玩家共用同一张动作表。 */
+    /** 正式玩家和沙盘玩家共用同一张动作表（猜阵类动作由 GuessRoundService 独立接管，不走这里）。 */
     public void dispatchPlayerAction(ObjectNode root, UserAccount player, String type, List<String> values) {
         switch (type == null ? "" : type) {
             case "role-vote" -> submitRoleVote(root, player, values);
             case "squad-form" -> submitSquadForm(root, player, values);
             case "reroll" -> submitReroll(root, player, values);
             case "squad-order" -> submitSquadOrder(root, player, values);
-            case "tactics-confirm" -> submitTacticsConfirm(root, player, true);
-            case "tactics-cancel" -> submitTacticsConfirm(root, player, false);
-            case "round-guess" -> submitRoundGuess(root, player, values);
-            case "pre-guess" -> submitPreGuess(root, player, values);
-            case "retract-guess" -> retractGuess(root, player);
+            case "tactics-confirm" -> submitTacticsConfirm(root, player, values, true);
+            case "tactics-cancel" -> submitTacticsConfirm(root, player, values, false);
             default -> throw new IllegalArgumentException("未知的玩家操作");
         }
     }
@@ -473,7 +474,7 @@ public class ParallelTournamentService {
         if (!"CAPTAIN_VOTE".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在队长投票阶段");
         if (values.size() != 1) throw new IllegalArgumentException("每次只能选择一名队长候选人");
-        ObjectNode team = findTeam(root, voter.getTeamId());
+        ObjectNode team = TournamentLayout.findTeam(root, voter.getTeamId());
         if (hasCaptain(team)) throw new IllegalStateException("本队队长投票已经完成");
         if (team.path("roleVoteDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
             throw new IllegalStateException("队长投票时间已经结束");
@@ -507,7 +508,7 @@ public class ParallelTournamentService {
             if (!"CAPTAIN_VOTE".equals(root.path("stage").asText()))
                 throw new IllegalStateException("当前不在队长投票阶段");
             if (!"captain".equals(role)) throw new IllegalArgumentException("新规则只需选出队长");
-            ObjectNode team = findTeam(root, teamId);
+            ObjectNode team = TournamentLayout.findTeam(root, teamId);
             if (hasCaptain(team)) throw new IllegalStateException("本队队长投票已经完成");
             boolean found = false;
             for (JsonNode player : team.path("players")) {
@@ -534,7 +535,7 @@ public class ParallelTournamentService {
     }
 
     private void requireRole(ObjectNode root, UserAccount user, String role, String message) {
-        ObjectNode team = findTeam(root, user.getTeamId());
+        ObjectNode team = TournamentLayout.findTeam(root, user.getTeamId());
         if (!team.path("roles").hasNonNull(role)) throw new IllegalStateException("请等待全队完成队长投票");
         if (!("u" + user.getId()).equals(team.path("roles").path(role).asText()))
             throw new IllegalStateException(message);
@@ -625,11 +626,11 @@ public class ParallelTournamentService {
         if (!"SQUAD_FORM".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在分队阶段");
         requireRole(root, captain, "captain", "只有当选队长可以分队");
-        ObjectNode team = findTeam(root, captain.getTeamId());
+        ObjectNode team = TournamentLayout.findTeam(root, captain.getTeamId());
         if (team.has("squads")) throw new IllegalStateException("本队分队已经锁定");
         Set<String> roster = new HashSet<>();
         team.path("players").forEach(player -> roster.add(player.path("id").asText()));
-        if (values.size() != SQUAD_COUNT * SQUAD_SIZE
+        if (values.size() != TournamentLayout.SQUAD_COUNT * TournamentLayout.SQUAD_SIZE
                 || new HashSet<>(values).size() != values.size()
                 || !roster.equals(new HashSet<>(values)))
             throw new IllegalArgumentException("分队必须包含本队全部 30 名队员且不重复");
@@ -639,9 +640,9 @@ public class ParallelTournamentService {
 
     private void writeSquads(ObjectNode team, List<String> orderedIds) {
         ArrayNode squads = team.putArray("squads");
-        for (int squad = 0; squad < SQUAD_COUNT; squad++) {
+        for (int squad = 0; squad < TournamentLayout.SQUAD_COUNT; squad++) {
             ArrayNode members = squads.addArray();
-            for (int index = squad * SQUAD_SIZE; index < (squad + 1) * SQUAD_SIZE; index++)
+            for (int index = squad * TournamentLayout.SQUAD_SIZE; index < (squad + 1) * TournamentLayout.SQUAD_SIZE; index++)
                 members.add(orderedIds.get(index));
         }
     }
@@ -689,15 +690,19 @@ public class ParallelTournamentService {
         root.put("stage", "ROLL");
         root.put("rollGoAt", goAt);
         ArrayNode rollOpenAts = root.putArray("rollOpenAts");
-        for (int k = 0; k < SQUAD_COUNT; k++) rollOpenAts.add(goAt + k * SQUAD_ROLL_STAGGER_MS);
+        for (int k = 0; k < TournamentLayout.SQUAD_COUNT; k++) rollOpenAts.add(goAt + k * SQUAD_ROLL_STAGGER_MS);
         root.put("stageDeadlineAt", goAt + ROLL_DURATION_MS);
         Set<String> activeTeams = activeTeamIds(root);
         // 同一 day/round 重赛会复用 player_blind_box 唯一键：开始新 ROLL 前定向清掉当前在赛玩家的旧结果，
         // 与新 ROLL 状态在同一事务；普通首轮通常删除 0 行，不动其他历史比赛的行
         Set<String> activePlayers = activePlayerIds(root);
-        if (!activePlayers.isEmpty())
+        if (!activePlayers.isEmpty()) {
             blindBoxes.deleteByGameDayAndBracketRoundAndPlayerIdIn(
                     root.path("day").asInt(1), bracketRoundOf(root), activePlayers);
+            // 猜阵行同理：(day, matchId, playerId) 唯一键在重赛/新一轮会被复用
+            guesses.deleteByGameDayAndBracketRoundAndPlayerIdIn(
+                    root.path("day").asInt(1), bracketRoundOf(root), activePlayers);
+        }
         for (JsonNode teamNode : root.path("teams")) {
             ObjectNode team = (ObjectNode) teamNode;
             if (!activeTeams.contains(team.path("id").asText())) continue;
@@ -722,18 +727,6 @@ public class ParallelTournamentService {
         if (root.hasNonNull("rollGoAt"))
             return root.path("rollGoAt").asLong() + squadIndex * SQUAD_ROLL_STAGGER_MS;
         return Long.MIN_VALUE;
-    }
-
-    /**
-     * 成员所在小队下标（0 起）；查不到（手工构造状态）按 0 号小队兜底。
-     */
-    private int squadIndexOf(ObjectNode team, String playerId) {
-        JsonNode squads = team.path("squads");
-        if (squads.isArray()) {
-            for (int k = 0; k < squads.size(); k++)
-                if (contains(squads.get(k), playerId)) return k;
-        }
-        return 0;
     }
 
     /**
@@ -773,7 +766,7 @@ public class ParallelTournamentService {
                 int die = ThreadLocalRandom.current().nextInt(1, 7);
                 player.put("dice", die);
                 player.put("diceFinal", die);
-                player.put("rollTs", rollOpenAt(root, squadIndexOf(team, player.path("id").asText()))
+                player.put("rollTs", rollOpenAt(root, TournamentLayout.squadIndexOf(team, player.path("id").asText()))
                         + AUTO_ROLL_OFFSET_MS);
                 player.put("autoRolled", true);
                 events.feedAfterCommit(team.path("id").asText(), die >= 4 ? "roll-big" : "roll-small",
@@ -840,7 +833,7 @@ public class ParallelTournamentService {
             String teamId = user.getTeamId();
             if (teamId == null || !activeTeamIds(root).contains(teamId))
                 throw new IllegalStateException("本队本轮没有比赛");
-            ObjectNode team = findTeam(root, teamId);
+            ObjectNode team = TournamentLayout.findTeam(root, teamId);
             ObjectNode player = findPlayer(team, "u" + user.getId());
             if (player == null) throw new IllegalStateException("当前账号不在本队参赛名单中");
             long now = System.currentTimeMillis();
@@ -848,7 +841,7 @@ public class ParallelTournamentService {
             if (now < goAt) throw new IllegalStateException("掷骰还未开始，请等待倒计时结束");
             if (now > root.path("stageDeadlineAt").asLong(Long.MIN_VALUE))
                 throw new IllegalStateException("本轮掷骰已截止");
-            long openAt = rollOpenAt(root, squadIndexOf(team, player.path("id").asText()));
+            long openAt = rollOpenAt(root, TournamentLayout.squadIndexOf(team, player.path("id").asText()));
             if (now < openAt) throw new IllegalStateException("还没轮到你们小队掷骰");
             // 开掷时刻按小队错开，但截止时刻全员统一为 stageDeadlineAt
             if (player.has("dice")) throw new IllegalStateException("你本轮已经掷过骰子");
@@ -898,11 +891,11 @@ public class ParallelTournamentService {
             Long rollDeadlineAt = null;
             if ("ROLL".equals(stage) && teamId != null && activeTeamIds(root).contains(teamId)) {
                 eligible = true;
-                ObjectNode team = findTeam(root, teamId);
+                ObjectNode team = TournamentLayout.findTeam(root, teamId);
                 ObjectNode player = user == null ? null : findPlayer(team, "u" + user.getId());
                 alreadyRolled = player != null && player.has("dice");
                 if (player != null) {
-                    squadIndex = squadIndexOf(team, player.path("id").asText());
+                    squadIndex = TournamentLayout.squadIndexOf(team, player.path("id").asText());
                     long openAt = rollOpenAt(root, squadIndex);
                     if (openAt != Long.MIN_VALUE) rollOpenAt = openAt;
                     // 截止时刻全员统一为全局 stageDeadlineAt，不再按小队截断
@@ -1042,28 +1035,20 @@ public class ParallelTournamentService {
     }
 
     /**
-     * 猜阵密封：内容不可见，只能看到提交状态；提前猜阵同样密封为 preGuessStatus。
+     * 猜阵密封：内容不可见，只能看到提交状态；guessStatus 按局分桶 {round:{side:{pid:true}}}。
      */
     private void sealGuesses(ObjectNode match) {
         JsonNode guesses = match.path("guesses");
         ObjectNode status = mapper.createObjectNode();
-        for (String side : List.of("A", "B")) {
-            ObjectNode sideStatus = status.putObject(side);
-            guesses.path(side).fieldNames().forEachRemaining(id -> sideStatus.put(id, true));
-        }
-        match.set("guessStatus", status);
-        match.remove("guesses");
-        JsonNode preGuesses = match.path("preGuesses");
-        ObjectNode preStatus = mapper.createObjectNode();
-        preGuesses.fields().forEachRemaining(roundEntry -> {
-            ObjectNode roundStatus = preStatus.putObject(roundEntry.getKey());
+        guesses.fields().forEachRemaining(roundEntry -> {
+            ObjectNode roundStatus = status.putObject(roundEntry.getKey());
             for (String side : List.of("A", "B")) {
                 ObjectNode sideStatus = roundStatus.putObject(side);
                 roundEntry.getValue().path(side).fieldNames().forEachRemaining(id -> sideStatus.put(id, true));
             }
         });
-        match.set("preGuessStatus", preStatus);
-        match.remove("preGuesses");
+        match.set("guessStatus", status);
+        match.remove("guesses");
     }
 
     /**
@@ -1083,13 +1068,12 @@ public class ParallelTournamentService {
     /* ---------- 开盲盒（内存运行态接管生产路径） ---------- */
 
     /**
-     * 当天第几个 bracket 轮次：按进行中场次 id 前缀推导（g=1/4 决赛、s=半决赛、f=决赛/加赛）。
+     * 当天第几个 bracket 轮次：按进行中场次 id 前缀推导；无进行中场次时按首轮计。
      */
     private int bracketRoundOf(ObjectNode root) {
         for (JsonNode match : root.path("matches")) {
             if (!"active".equals(match.path("status").asText())) continue;
-            String id = match.path("id").asText();
-            return id.startsWith("g") ? 1 : id.startsWith("s") ? 2 : 3;
+            return TournamentLayout.bracketRoundOf(match.path("id").asText());
         }
         return 1;
     }
@@ -1115,7 +1099,7 @@ public class ParallelTournamentService {
         if (root.path("stageDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
             throw new IllegalStateException("战术阶段时间已经结束");
         requireRole(root, captain, "captain", "只有当选队长可以重掷");
-        ObjectNode team = findTeam(root, captain.getTeamId());
+        ObjectNode team = TournamentLayout.findTeam(root, captain.getTeamId());
         if (!activeTeamIds(root).contains(team.path("id").asText()))
             throw new IllegalStateException("本队本轮没有比赛");
         if (team.path("tacticsConfirmed").asBoolean(false))
@@ -1152,7 +1136,7 @@ public class ParallelTournamentService {
         if (root.path("stageDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
             throw new IllegalStateException("战术阶段时间已经结束");
         requireRole(root, captain, "captain", "只有当选队长可以调整出场顺序");
-        ObjectNode team = findTeam(root, captain.getTeamId());
+        ObjectNode team = TournamentLayout.findTeam(root, captain.getTeamId());
         if (!activeTeamIds(root).contains(team.path("id").asText()))
             throw new IllegalStateException("本队本轮没有比赛");
         if (team.path("tacticsConfirmed").asBoolean(false))
@@ -1160,19 +1144,25 @@ public class ParallelTournamentService {
         if (team.path("squadOrderLocked").asBoolean(false))
             throw new IllegalStateException("本队出场顺序已经锁定");
         JsonNode squads = team.path("squads");
-        if (!squads.isArray() || squads.size() != SQUAD_COUNT)
+        if (!squads.isArray() || squads.size() != TournamentLayout.SQUAD_COUNT)
             throw new IllegalStateException("本队尚未完成分队");
-        if (values.size() != SQUAD_COUNT) throw new IllegalArgumentException("必须提交 6 个小队的出场顺序");
+        applySquadOrder(team, values);
+    }
+
+    /** 校验出场顺序载荷（恰好 6 个、1~6 不重复），按载荷物理重排 squads 并锁定。 */
+    private void applySquadOrder(ObjectNode team, List<String> values) {
+        JsonNode squads = team.path("squads");
+        if (values.size() != TournamentLayout.SQUAD_COUNT) throw new IllegalArgumentException("必须提交 6 个小队的出场顺序");
         Set<Integer> seen = new HashSet<>();
-        int[] order = new int[SQUAD_COUNT];
-        for (int i = 0; i < SQUAD_COUNT; i++) {
+        int[] order = new int[TournamentLayout.SQUAD_COUNT];
+        for (int i = 0; i < TournamentLayout.SQUAD_COUNT; i++) {
             int squadNo;
             try {
                 squadNo = Integer.parseInt(values.get(i));
             } catch (NumberFormatException e) {
                 throw new IllegalArgumentException("小队编号必须是 1~6");
             }
-            if (squadNo < 1 || squadNo > SQUAD_COUNT || !seen.add(squadNo))
+            if (squadNo < 1 || squadNo > TournamentLayout.SQUAD_COUNT || !seen.add(squadNo))
                 throw new IllegalArgumentException("小队编号必须是 1~6 且不重复");
             order[i] = squadNo;
         }
@@ -1183,17 +1173,24 @@ public class ParallelTournamentService {
     }
 
     /**
-     * 队长确认战术布置完成；取消确认可继续调整。所有在赛队伍都确认后立即进入对局。
+     * 队长确认战术布置完成；取消确认可继续重掷，但出场顺序一经锁定不可再改。
+     * 确认时可顺带带上出场顺序载荷（同 squad-order），在一次请求内原子完成重排、锁定与确认；
+     * 确认一律锁定出场顺序；已锁定则忽略载荷。所有在赛队伍都确认后立即进入对局。
      */
-    void submitTacticsConfirm(ObjectNode root, UserAccount captain, boolean confirmed) {
+    void submitTacticsConfirm(ObjectNode root, UserAccount captain, List<String> values, boolean confirmed) {
         if (!"TACTICS".equals(root.path("stage").asText()))
             throw new IllegalStateException("当前不在战术阶段");
         if (root.path("stageDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
             throw new IllegalStateException("战术阶段时间已经结束");
         requireRole(root, captain, "captain", "只有当选队长可以确认战术布置");
-        ObjectNode team = findTeam(root, captain.getTeamId());
+        ObjectNode team = TournamentLayout.findTeam(root, captain.getTeamId());
         if (!activeTeamIds(root).contains(team.path("id").asText()))
             throw new IllegalStateException("本队本轮没有比赛");
+        if (confirmed) {
+            if (!team.path("squadOrderLocked").asBoolean(false) && values != null && !values.isEmpty())
+                applySquadOrder(team, values);
+            team.put("squadOrderLocked", true);
+        }
         team.put("tacticsConfirmed", confirmed);
         if (confirmed && allActiveTeamsConfirmed(root)) startBattle(root);
     }
@@ -1227,13 +1224,11 @@ public class ParallelTournamentService {
             ObjectNode match = (ObjectNode) matchNode;
             if (!"active".equals(match.path("status").asText())) continue;
             match.put("phase", "BATTLE");
-            match.put("round", 1);
             match.put("roundPhase", "GUESS");
             match.put("winsA", 0);
             match.put("winsB", 0);
             match.set("rounds", mapper.createArrayNode());
-            match.set("guesses", mapper.createObjectNode());
-            match.set("preGuesses", mapper.createObjectNode());
+            // 6 局共用一个猜阵窗口：猜阵内容落 player_guess 表（GuessRoundService），不写进行内 JSON
             match.put("guessDeadlineAt", now + GUESS_DURATION_MS);
             match.put("guessOpenedAt", now);
         }
@@ -1242,97 +1237,10 @@ public class ParallelTournamentService {
     /* ---------- BATTLE：6 轮对局 ---------- */
 
     /**
-     * 本轮出战小队成员各提交一份对敌方出战 5 人的猜测，密封；双方都齐 5 份时提前揭晓。
+     * 统一猜阵的提交/撤回由 GuessRoundService 直写 player_guess 表（不锁 game_state）；
+     * 这里只负责窗口收口：双方 30 份全部交齐后再等 5 秒揭晓（交齐时剩余不足 5 秒则
+     * 按原 30 秒倒计时到点揭晓），未交齐则到点强制揭晓。
      */
-    void submitRoundGuess(ObjectNode root, UserAccount user, List<String> values) {
-        if (!"BATTLE".equals(root.path("stage").asText()))
-            throw new IllegalStateException("当前不在对局阶段");
-        ObjectNode match = activeMatchFor(root, user.getTeamId());
-        if (!"BATTLE".equals(match.path("phase").asText())
-                || !"GUESS".equals(match.path("roundPhase").asText()))
-            throw new IllegalStateException("当前不接受猜阵");
-        if (match.path("guessDeadlineAt").asLong(Long.MAX_VALUE) <= System.currentTimeMillis())
-            throw new IllegalStateException("本轮猜阵已截止");
-        String side = user.getTeamId().equals(match.path("a").asText()) ? "A" : "B";
-        ObjectNode team = findTeam(root, user.getTeamId());
-        String playerId = "u" + user.getId();
-        if (!contains(team.path("squads").path(match.path("round").asInt(1) - 1), playerId))
-            throw new IllegalStateException("只有本轮出战小队成员可以提交猜阵");
-        if (values.size() != SQUAD_SIZE || new HashSet<>(values).size() != values.size())
-            throw new IllegalArgumentException("猜阵必须选择 5 名敌方队员");
-        ObjectNode enemy = findTeam(root, teamForSide(match, "A".equals(side) ? "B" : "A"));
-        Set<String> enemyRoster = new HashSet<>();
-        enemy.path("players").forEach(player -> enemyRoster.add(player.path("id").asText()));
-        if (!enemyRoster.containsAll(values)) throw new IllegalArgumentException("猜阵目标必须是敌方队员");
-        ObjectNode sideGuesses = match.withObject("/guesses").withObject("/" + side);
-        if (sideGuesses.has(playerId)) throw new IllegalStateException("你已经提交过本轮猜阵");
-        ArrayNode guess = mapper.createArrayNode();
-        values.forEach(guess::add);
-        sideGuesses.set(playerId, guess);
-        // 双方交齐也要满每局最短时长才揭晓
-        if (sideGuesses.size() >= SQUAD_SIZE
-                && match.at("/guesses/" + ("A".equals(side) ? "B" : "A")).size() >= SQUAD_SIZE
-                && System.currentTimeMillis() >= match.path("guessOpenedAt").asLong(0L) + GUESS_MIN_DURATION_MS)
-            revealRound(root, match);
-    }
-
-    /**
-     * 提前猜阵：本人小队出战的轮次在当前轮之后时，可预交对敌方出战 5 人的猜测，开窗时自动生效；
-     * 重复提交覆盖旧值（改投），当前轮请走普通猜阵通道。
-     */
-    void submitPreGuess(ObjectNode root, UserAccount user, List<String> values) {
-        if (!"BATTLE".equals(root.path("stage").asText()))
-            throw new IllegalStateException("当前不在对局阶段");
-        ObjectNode match = activeMatchFor(root, user.getTeamId());
-        if (!"BATTLE".equals(match.path("phase").asText()))
-            throw new IllegalStateException("当前不接受猜阵");
-        String side = user.getTeamId().equals(match.path("a").asText()) ? "A" : "B";
-        ObjectNode team = findTeam(root, user.getTeamId());
-        String playerId = "u" + user.getId();
-        int round = squadIndexOf(team, playerId) + 1;
-        int currentRound = match.path("round").asInt(1);
-        if (round == currentRound) throw new IllegalStateException("当前轮次请直接提交猜阵");
-        if (round < currentRound) throw new IllegalStateException("你们小队的轮次已经结束");
-        if (values.size() != SQUAD_SIZE || new HashSet<>(values).size() != values.size())
-            throw new IllegalArgumentException("猜阵必须选择 5 名敌方队员");
-        ObjectNode enemy = findTeam(root, teamForSide(match, "A".equals(side) ? "B" : "A"));
-        Set<String> enemyRoster = new HashSet<>();
-        enemy.path("players").forEach(player -> enemyRoster.add(player.path("id").asText()));
-        if (!enemyRoster.containsAll(values)) throw new IllegalArgumentException("猜阵目标必须是敌方队员");
-        ArrayNode guess = mapper.createArrayNode();
-        values.forEach(guess::add);
-        match.withObject("/preGuesses").withObject("/" + round).withObject("/" + side).set(playerId, guess);
-    }
-
-    /**
-     * 撤回猜阵：先撤当前轮未揭晓的 live 猜阵（撤回后可重投），再撤本人后续轮次的提前猜阵。
-     */
-    void retractGuess(ObjectNode root, UserAccount user) {
-        if (!"BATTLE".equals(root.path("stage").asText()))
-            throw new IllegalStateException("当前不在对局阶段");
-        ObjectNode match = activeMatchFor(root, user.getTeamId());
-        if (!"BATTLE".equals(match.path("phase").asText()))
-            throw new IllegalStateException("当前不接受猜阵");
-        String side = user.getTeamId().equals(match.path("a").asText()) ? "A" : "B";
-        String playerId = "u" + user.getId();
-        boolean removed = false;
-        if ("GUESS".equals(match.path("roundPhase").asText())) {
-            ObjectNode sideGuesses = (ObjectNode) match.path("guesses").path(side);
-            if (sideGuesses.has(playerId)) {
-                sideGuesses.remove(playerId);
-                removed = true;
-            }
-        }
-        for (JsonNode roundNode : match.path("preGuesses")) {
-            ObjectNode sideNode = (ObjectNode) roundNode.path(side);
-            if (sideNode.has(playerId)) {
-                sideNode.remove(playerId);
-                removed = true;
-            }
-        }
-        if (!removed) throw new IllegalStateException("你没有可撤回的猜阵");
-    }
-
     boolean expireGuesses(ObjectNode root, long now) {
         if (!"BATTLE".equals(root.path("stage").asText())) return false;
         boolean changed = false;
@@ -1341,56 +1249,89 @@ public class ParallelTournamentService {
             if (!"active".equals(match.path("status").asText())
                     || !"BATTLE".equals(match.path("phase").asText())
                     || !"GUESS".equals(match.path("roundPhase").asText())) continue;
-            // 双方交齐（含整轮靠提前猜阵交齐）且满最短时长即揭晓
-            boolean bothComplete = match.at("/guesses/A").size() >= SQUAD_SIZE
-                    && match.at("/guesses/B").size() >= SQUAD_SIZE;
-            boolean minElapsed = now >= match.path("guessOpenedAt").asLong(0L) + GUESS_MIN_DURATION_MS;
-            if (bothComplete && minElapsed) {
-                revealRound(root, match);
+            List<PlayerGuess> rows = guessRowsOf(root, match);
+            long deadline = match.path("guessDeadlineAt").asLong(Long.MAX_VALUE);
+            if (!match.has("guessRevealAt") && allGuessesComplete(match, rows)) {
+                // 交齐时刻剩余 >5s 则倒计时跳到 5s，否则沿用原倒计时
+                match.put("guessRevealAt", Math.min(deadline, now + GUESS_COMPLETE_GRACE_MS));
                 changed = true;
-                continue;
             }
-            if (match.path("guessDeadlineAt").asLong(Long.MAX_VALUE) > now) continue;
-            revealRound(root, match);
+            long dueAt = Math.min(match.path("guessRevealAt").asLong(Long.MAX_VALUE), deadline);
+            if (dueAt > now) continue;
+            revealAllRounds(root, match, rows);
             changed = true;
         }
         return changed;
     }
 
-    /**
-     * 结算一局：双方出战小队战力（基础 × 同步暴击 + 猜阵加成），高者胜，相等记平局。
-     */
-    void revealRound(ObjectNode root, ObjectNode match) {
-        int round = match.path("round").asInt(1);
-        ObjectNode entry = match.withArray("rounds").addObject();
-        entry.put("round", round);
-        double powerA = settleSide(root, match, entry, round, "A");
-        double powerB = settleSide(root, match, entry, round, "B");
-        String winner = powerA > powerB ? "A" : powerB > powerA ? "B" : null;
-        if (winner == null) entry.putNull("winner");
-        else {
-            entry.put("winner", winner);
-            match.put("wins" + winner, match.path("wins" + winner).asInt() + 1);
+    /** 双方在赛队员（各 6 队 × 5 人）是否全部交齐；截止后的迟到行不计入。 */
+    private boolean allGuessesComplete(ObjectNode match, List<PlayerGuess> rows) {
+        long deadline = match.path("guessDeadlineAt").asLong(Long.MAX_VALUE);
+        int a = 0, b = 0;
+        for (PlayerGuess row : rows) {
+            if (row.getUpdatedAt().toEpochMilli() > deadline) continue;
+            if ("A".equals(row.getSide())) a++;
+            else b++;
         }
-        feedGuessReveal(match, round, "A", entry.path("guessHitsA").asInt());
-        feedGuessReveal(match, round, "B", entry.path("guessHitsB").asInt());
+        return a >= TournamentLayout.SQUAD_COUNT * TournamentLayout.SQUAD_SIZE && b >= TournamentLayout.SQUAD_COUNT * TournamentLayout.SQUAD_SIZE;
+    }
+
+    private List<PlayerGuess> guessRowsOf(ObjectNode root, ObjectNode match) {
+        return guesses.findByGameDayAndMatchId(root.path("day").asInt(1), match.path("id").asText());
+    }
+
+    /** 沙盘/强制推进入口：按需现取猜阵行。 */
+    void revealAllRounds(ObjectNode root, ObjectNode match) {
+        revealAllRounds(root, match, guessRowsOf(root, match));
+    }
+
+    /**
+     * 整批结算 6 局：双方各局出战小队战力（基础 × 同步暴击 + 猜阵加成），高者胜，相等记平局；
+     * 6 局结果同屏展示，到期进入比赛结算。截止后的迟到猜阵不参与命中。
+     */
+    void revealAllRounds(ObjectNode root, ObjectNode match, List<PlayerGuess> rows) {
+        long deadline = match.path("guessDeadlineAt").asLong(Long.MAX_VALUE);
+        // 每行只解析一次：round|side → 目标名单列表
+        Map<String, List<Set<String>>> targetsByRoundSide = new HashMap<>();
+        int lateRows = 0;
+        for (PlayerGuess row : rows) {
+            if (row.getUpdatedAt().toEpochMilli() > deadline) {
+                lateRows++;
+                continue;
+            }
+            try {
+                Set<String> targets = new HashSet<>();
+                for (JsonNode id : mapper.readTree(row.getTargetsJson())) targets.add(id.asText());
+                targetsByRoundSide.computeIfAbsent(row.getRoundNo() + "|" + row.getSide(),
+                        key -> new ArrayList<>()).add(targets);
+            } catch (Exception e) {
+                log.warn("猜阵行解析失败，按未命中处理 match={} player={}", match.path("id").asText(), row.getPlayerId());
+            }
+        }
+        if (lateRows > 0)
+            log.warn("猜阵结算排除 {} 条截止后写入的行 match={}", lateRows, match.path("id").asText());
+        for (int round = 1; round <= TournamentLayout.SQUAD_COUNT; round++) {
+            ObjectNode entry = match.withArray("rounds").addObject();
+            entry.put("round", round);
+            double powerA = settleSide(root, match, entry, round, "A", targetsByRoundSide);
+            double powerB = settleSide(root, match, entry, round, "B", targetsByRoundSide);
+            String winner = powerA > powerB ? "A" : powerB > powerA ? "B" : null;
+            if (winner == null) entry.putNull("winner");
+            else {
+                entry.put("winner", winner);
+                match.put("wins" + winner, match.path("wins" + winner).asInt() + 1);
+            }
+        }
         match.put("roundPhase", "REVEAL");
         match.put("revealUntil", System.currentTimeMillis() + REVEAL_DURATION_MS);
         match.remove("guessDeadlineAt");
-        match.set("guesses", mapper.createObjectNode());
+        match.remove("guessRevealAt");
+        match.remove("guesses");
     }
 
-    /** 猜阵揭晓播报：只推给本方队伍频道，按命中人次分档 */
-    private void feedGuessReveal(ObjectNode match, int round, String side, int hits) {
-        String copy = hits >= 2
-                ? "第 " + round + " 局猜阵命中 " + hits + " 人次 · 对手套路全被看透！"
-                : "第 " + round + " 局猜阵仅命中 " + hits + " 人次 · 猜了个寂寞";
-        events.feedAfterCommit(teamForSide(match, side), hits >= 2 ? "guess-many" : "guess-few",
-                "猜阵揭晓", copy);
-    }
-
-    private double settleSide(ObjectNode root, ObjectNode match, ObjectNode entry, int round, String side) {
-        ObjectNode team = findTeam(root, teamForSide(match, side));
+    private double settleSide(ObjectNode root, ObjectNode match, ObjectNode entry, int round, String side,
+                              Map<String, List<Set<String>>> targetsByRoundSide) {
+        ObjectNode team = TournamentLayout.findTeam(root, teamForSide(match, side));
         JsonNode squad = team.path("squads").path(round - 1);
         int base = 0;
         List<Long> rollTimestamps = new ArrayList<>();
@@ -1403,7 +1344,7 @@ public class ParallelTournamentService {
             if (player.path("autoRolled").asBoolean()) anyAuto = true;
         }
         boolean crit = syncCrit(rollTimestamps, anyAuto);
-        int hits = guessHits(root, match, side, round);
+        int hits = guessHits(root, match, side, round, targetsByRoundSide);
         double bonus = guessBonus(hits);
         double power = squadPower(base, crit, hits);
         entry.put("base" + side, base);
@@ -1422,7 +1363,7 @@ public class ParallelTournamentService {
      * 同步暴击：小队 5 人掷骰时刻首尾差 ≤500ms；含系统代掷队员的小队不能暴击。
      */
     static boolean syncCrit(List<Long> rollTimestamps, boolean anyAutoRolled) {
-        if (anyAutoRolled || rollTimestamps.size() < SQUAD_SIZE) return false;
+        if (anyAutoRolled || rollTimestamps.size() < TournamentLayout.SQUAD_SIZE) return false;
         long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
         for (long ts : rollTimestamps) {
             min = Math.min(min, ts);
@@ -1440,18 +1381,18 @@ public class ParallelTournamentService {
     }
 
     /**
-     * 命中人次：本方出战 5 人提交的猜测中，猜中敌方本轮出战队员的总次数。
+     * 命中人次：本方该小队 5 人提交的猜测（player_guess 行，已预解析）中，
+     * 猜中敌方该局出战队员的总次数。
      */
-    private int guessHits(ObjectNode root, ObjectNode match, String side, int round) {
-        ObjectNode enemy = findTeam(root, teamForSide(match, "A".equals(side) ? "B" : "A"));
+    private int guessHits(ObjectNode root, ObjectNode match, String side, int round,
+                          Map<String, List<Set<String>>> targetsByRoundSide) {
+        ObjectNode enemy = TournamentLayout.findTeam(root, teamForSide(match, "A".equals(side) ? "B" : "A"));
         Set<String> enemySquad = new HashSet<>();
         enemy.path("squads").path(round - 1).forEach(id -> enemySquad.add(id.asText()));
         int hits = 0;
-        var guesses = match.at("/guesses/" + side).fields();
-        while (guesses.hasNext()) {
-            for (JsonNode guessed : guesses.next().getValue())
-                if (enemySquad.contains(guessed.asText())) hits++;
-        }
+        for (Set<String> targets : targetsByRoundSide.getOrDefault(round + "|" + side, List.of()))
+            for (String guessed : targets)
+                if (enemySquad.contains(guessed)) hits++;
         return hits;
     }
 
@@ -1464,50 +1405,11 @@ public class ParallelTournamentService {
                     || !"BATTLE".equals(match.path("phase").asText())
                     || !"REVEAL".equals(match.path("roundPhase").asText())) continue;
             if (match.path("revealUntil").asLong(Long.MAX_VALUE) > now) continue;
-            advanceMatchRound(root, match);
+            match.remove("revealUntil");
+            enterResult(root, match);
             changed = true;
         }
         return changed;
-    }
-
-    private void advanceMatchRound(ObjectNode root, ObjectNode match) {
-        int round = match.path("round").asInt(1);
-        match.remove("revealUntil");
-        if (round >= SQUAD_COUNT) {
-            enterResult(root, match);
-            return;
-        }
-        int newRound = round + 1;
-        match.put("round", newRound);
-        match.put("roundPhase", "GUESS");
-        long now = System.currentTimeMillis();
-        match.put("guessDeadlineAt", now + GUESS_DURATION_MS);
-        match.put("guessOpenedAt", now);
-        mergePreGuesses(root, match, newRound);
-    }
-
-    /**
-     * 开窗合并：把该轮的提前猜阵并入正式猜阵，按当前敌方花名册过滤失效目标，合并后删除该轮条目。
-     */
-    private void mergePreGuesses(ObjectNode root, ObjectNode match, int round) {
-        JsonNode roundNode = match.path("preGuesses").path(String.valueOf(round));
-        if (!roundNode.isObject()) return;
-        ObjectNode guesses = match.withObject("/guesses");
-        for (String side : List.of("A", "B")) {
-            JsonNode sideNode = roundNode.path(side);
-            if (!sideNode.isObject()) continue;
-            ObjectNode enemy = findTeam(root, teamForSide(match, "A".equals(side) ? "B" : "A"));
-            Set<String> enemyRoster = new HashSet<>();
-            enemy.path("players").forEach(player -> enemyRoster.add(player.path("id").asText()));
-            ObjectNode target = guesses.withObject("/" + side);
-            sideNode.fields().forEachRemaining(entry -> {
-                ArrayNode filtered = mapper.createArrayNode();
-                for (JsonNode id : entry.getValue())
-                    if (enemyRoster.contains(id.asText())) filtered.add(id.asText());
-                target.set(entry.getKey(), filtered);
-            });
-        }
-        ((ObjectNode) match.path("preGuesses")).remove(String.valueOf(round));
     }
 
     /* ---------- 比赛结算与平局链 ---------- */
@@ -1546,8 +1448,8 @@ public class ParallelTournamentService {
         double pointsA = totalPersonalPoints(root, a), pointsB = totalPersonalPoints(root, b);
         match.put("totalPointsA", pointsA);
         match.put("totalPointsB", pointsB);
-        BigDecimal gmvA = findTeam(root, a).path("gmv").decimalValue();
-        BigDecimal gmvB = findTeam(root, b).path("gmv").decimalValue();
+        BigDecimal gmvA = TournamentLayout.findTeam(root, a).path("gmv").decimalValue();
+        BigDecimal gmvB = TournamentLayout.findTeam(root, b).path("gmv").decimalValue();
         match.put("gmvA", gmvA);
         match.put("gmvB", gmvB);
         int comparison = compareMatchTieBreak(pointsA, pointsB, gmvA, gmvB);
@@ -1570,7 +1472,7 @@ public class ParallelTournamentService {
 
     private double totalPersonalPoints(ObjectNode root, String teamId) {
         int total = 0;
-        for (JsonNode player : findTeam(root, teamId).path("players")) total += personalPoints(player);
+        for (JsonNode player : TournamentLayout.findTeam(root, teamId).path("players")) total += personalPoints(player);
         return total;
     }
 
@@ -1629,7 +1531,7 @@ public class ParallelTournamentService {
     private String rerollSummary(ObjectNode root, ObjectNode match) {
         List<String> entries = new ArrayList<>();
         for (String side : List.of("A", "B")) {
-            ObjectNode team = findTeam(root, teamForSide(match, side));
+            ObjectNode team = TournamentLayout.findTeam(root, teamForSide(match, side));
             for (JsonNode log : team.path("rerollLog")) {
                 entries.add(teamName(root, team.path("id").asText()) + "·" + log.path("playerName").asText()
                         + " " + log.path("from").asInt() + "→" + log.path("to").asInt());
@@ -1990,8 +1892,11 @@ public class ParallelTournamentService {
                         if (!"active".equals(match.path("status").asText())) continue;
                         switch (match.path("phase").asText()) {
                             case "BATTLE" -> {
-                                if ("GUESS".equals(match.path("roundPhase").asText())) revealRound(root, match);
-                                else advanceMatchRound(root, match);
+                                if ("GUESS".equals(match.path("roundPhase").asText())) revealAllRounds(root, match);
+                                else {
+                                    match.remove("revealUntil");
+                                    enterResult(root, match);
+                                }
                                 progressed++;
                             }
                             case "RESULT" -> {
@@ -2084,10 +1989,10 @@ public class ParallelTournamentService {
             case "BATTLE" -> {
                 if ("BATTLE".equals(phase) && "GUESS".equals(match.path("roundPhase").asText())) {
                     match.put("guessDeadlineAt", past);
-                    forced.add("第 " + match.path("round").asInt() + " 局猜阵");
+                    forced.add("统一猜阵");
                 } else if ("BATTLE".equals(phase) && "REVEAL".equals(match.path("roundPhase").asText())) {
                     match.put("revealUntil", past);
-                    forced.add("第 " + match.path("round").asInt() + " 局揭晓");
+                    forced.add("6 局结果揭晓");
                 } else if ("RESULT".equals(phase)) {
                     match.put("resultReadyAt", past);
                     forced.add("比赛结果展示");
@@ -2136,10 +2041,9 @@ public class ParallelTournamentService {
 
     private void prepareRematch(ObjectNode root, ObjectNode match) {
         match.remove(List.of("winner", "tieBreak", "totalPointsA", "totalPointsB", "gmvA", "gmvB",
-                "resultReadyAt", "guesses", "preGuesses", "guessDeadlineAt", "guessOpenedAt", "revealUntil"));
+                "resultReadyAt", "guesses", "guessDeadlineAt", "guessRevealAt", "guessOpenedAt", "revealUntil"));
         match.put("winsA", 0);
         match.put("winsB", 0);
-        match.put("round", 1);
         match.set("rounds", mapper.createArrayNode());
         match.put("phase", "PENDING");
         startRoundFlow(root);
@@ -2149,6 +2053,7 @@ public class ParallelTournamentService {
     public void resetTwoDayTournament() {
         GameStateRecord record = states.findLockedById(1L).orElse(null);
         blindBoxes.deleteAll();
+        guesses.deleteAll();
         if (record != null) states.delete(record);
         users.deleteAll(users.findAll().stream().filter(LobbyService::isStandIn).toList());
         List<UserAccount> accounts = users.findAll().stream().filter(u -> "USER".equals(u.getRole())).toList();
@@ -2188,22 +2093,10 @@ public class ParallelTournamentService {
         return ids;
     }
 
-    private ObjectNode findTeam(ObjectNode root, String teamId) {
-        for (JsonNode candidate : root.path("teams"))
-            if (teamId.equals(candidate.path("id").asText())) return (ObjectNode) candidate;
-        throw new IllegalStateException("队伍资料不存在");
-    }
-
     private ObjectNode findPlayer(ObjectNode team, String playerId) {
         for (JsonNode candidate : team.path("players"))
             if (playerId.equals(candidate.path("id").asText())) return (ObjectNode) candidate;
         return null;
-    }
-
-    private boolean contains(JsonNode values, String expected) {
-        if (!values.isArray()) return false;
-        for (JsonNode value : values) if (expected.equals(value.asText())) return true;
-        return false;
     }
 
     private ObjectNode createMatch(ObjectNode matches, String id, String a, String b) {
@@ -2213,7 +2106,6 @@ public class ParallelTournamentService {
         match.put("b", b);
         match.put("winsA", 0);
         match.put("winsB", 0);
-        match.put("round", 1);
         match.put("status", "active");
         match.put("phase", "PENDING");
         match.putArray("rounds");
