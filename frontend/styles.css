@@ -1586,6 +1586,15 @@ body.rules-open { overflow:hidden; }
 .arena-cell.is-draw { border-color: rgba(255, 255, 255, .3); }
 .arena-cell.is-draw b { color: var(--text-dim); }
 .arena-cell.is-current { border-color: rgba(246, 196, 83, .85); animation: arenaCellPulse 1.2s ease-in-out infinite; }
+/* 「你的局」：猜阵窗口点亮本人局号格（赛道/记分格共用），提交后停脉冲留金框 */
+.arena-cell.is-mine, .score-cell.is-mine { border-color: rgba(246, 196, 83, .85); background: rgba(246, 196, 83, .12); animation: arenaCellPulse 1.2s ease-in-out infinite; }
+.arena-cell.is-mine b, .score-cell.is-mine b, .arena-cell.is-mine-done b, .score-cell.is-mine-done b { color: var(--gold); }
+.arena-cell.is-mine-done, .score-cell.is-mine-done { border-color: rgba(246, 196, 83, .55); background: rgba(246, 196, 83, .07); }
+/* 猜阵局号芯片：点选网格上方的大号局号锚点，与「你的局」高亮同色系 */
+.guess-round-chip-row { text-align: center; margin-bottom: 4px; }
+.guess-round-chip { display: inline-flex; align-items: baseline; gap: 10px; padding: 6px 16px; border: 1px solid rgba(246, 196, 83, .6); border-radius: 999px; background: rgba(246, 196, 83, .1); }
+.guess-round-chip b { color: var(--gold); font: 900 20px/1.2 Consolas, monospace; }
+.guess-round-chip small { color: var(--text-dim); font-size: 12px; letter-spacing: .08em; }
 @keyframes arenaCellPulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(246, 196, 83, .0); }
   50% { box-shadow: 0 0 18px 3px rgba(246, 196, 83, .35); }
@@ -1646,7 +1655,7 @@ body.rules-open { overflow:hidden; }
 
 /* 低动效偏好：关掉赛道脉冲 */
 @media (prefers-reduced-motion: reduce) {
-  .arena-cell.is-current { animation: none; }
+  .arena-cell.is-current, .arena-cell.is-mine, .score-cell.is-mine { animation: none; }
 }
 
 /* 窄屏：记分牌缩小，赛道格收紧 */

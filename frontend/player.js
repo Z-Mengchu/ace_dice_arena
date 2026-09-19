@@ -1034,9 +1034,11 @@ import { icon } from './icons.js';
       (match.winsA || 0) + ' : ' + (match.winsB || 0) + '</b><span class="' + (side === 'A' ? 'is-foe' : 'is-me') + '">' + esc(teamNameOf(match.b)) + '</span></div>';
   }
 
-  /** 6 局赛道：与大厅 hero 共用 .arena-cells 样式 */
-  function plTrackHtml(match, side) {
+  /** 6 局赛道：与大厅 hero 共用 .arena-cells 样式；猜阵窗口内点亮本人局号格（「你的局」），提交后停脉冲留金框 */
+  function plTrackHtml(match, side, battle) {
     var rounds = match.rounds || [];
+    var guessing = match.status === 'active' && match.phase === 'BATTLE' && match.roundPhase !== 'REVEAL';
+    var myRound = battle && battle.myRound, submitted = battle && battle.submitted;
     var cells = '';
     for (var n = 1; n <= 6; n++) {
       var entry = null;
@@ -1045,6 +1047,9 @@ import { icon } from './icons.js';
       if (entry) {
         if (entry.winner) { cls = entry.winner === side ? 'is-win' : 'is-lose'; mark = cls === 'is-win' ? '胜' : '负'; }
         else { cls = 'is-draw'; mark = '平'; }
+      } else if (guessing && myRound === n) {
+        cls = submitted ? 'is-mine-done' : 'is-mine';
+        mark = '你';
       }
       cells += '<div class="arena-cell ' + cls + '"><i>第 ' + n + ' 局</i><b>' + mark + '</b></div>';
     }
@@ -1064,7 +1069,7 @@ import { icon } from './icons.js';
     }
     var h = '<div id="pl-battle">' +
       '<div class="pl-title" style="font-size:24px">' + icon('swords') + ' 第六阶段 · 统一猜阵</div>' +
-      battleScoreHTML(match, battle.side) + plTrackHtml(match, battle.side);
+      battleScoreHTML(match, battle.side) + plTrackHtml(match, battle.side, battle);
     if (match.roundPhase === 'REVEAL') return h + battleRevealHTML(battle) + '</div>';
     // GUESS：6 局统一 30 秒密封猜阵窗口，人人提交本人局（squad 序号）的猜阵，窗口内可改投 / 撤回
     h += '<div class="pl-guess-counts" id="pl-guess-counts">' + esc(guessCountsText(battle)) + '</div>' +
@@ -1089,7 +1094,8 @@ import { icon } from './icons.js';
       ui.guessKey = guessKey;
       ui.guessSel = [];
     }
-    var h = '<div class="pl-sub">' + icon('crystal', 16) + ' 你出战第 ' + battle.myRound + ' 局！猜一猜敌方该局上场 5 人</div>' +
+    var h = '<div class="guess-round-chip-row"><span class="guess-round-chip"><b>第 ' + battle.myRound + ' 局</b><small>你猜这局</small></span></div>' +
+      '<p class="pl-sub">点选敌方该局上场 5 人</p>' +
       (ui.notice ? '<div class="pl-status warn">' + esc(ui.notice) + '</div>' : '') +
       '<div class="pl-roster">';
     for (var i = 0; i < enemyPlayers.length; i++) {
